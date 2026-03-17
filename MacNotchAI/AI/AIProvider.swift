@@ -57,13 +57,13 @@ extension AIProviderType {
     var pricingSubtitle: String {
         switch self {
         case .groq:
-            return "~10,000 standard analyses / $5 · Best for lightweight tasks • free tier limits apply"
+            return "$5 ~10,000 average document interactions\nBest for lightweight tasks · free tier limits apply"
         case .anthropic:
-            return "~385 standard analyses / $5 · Best for premium answers, coding, long context"
+            return "$5 ~385 average document interactions\nBest for premium answers, coding, long context"
         case .openai:
-            return "~2,800 standard analyses / $5 · Best balance of cost, quality, and image support"
+            return "$5 ~2,800 average document interactions\nBest balance of cost, quality, and image support"
         case .ollama:
-            return "Unlimited local analyses · No API bill • speed and quality depend on your hardware"
+            return "Unlimited average document interactions\nNo API bill · speed and quality depend on your hardware"
         }
     }
 
