@@ -150,32 +150,59 @@ struct OnboardingView: View {
 
 // MARK: - Provider row
 
-private struct ProviderRow: View {
+struct ProviderRow: View {
     let type: AIProviderType
     let isSelected: Bool
     let onTap: () -> Void
 
     var body: some View {
         Button(action: onTap) {
-            HStack(spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                // Selection indicator
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .foregroundColor(isSelected ? .accentColor : .secondary)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(type.rawValue)
-                        .font(.subheadline.weight(isSelected ? .semibold : .regular))
-                    if type == .groq {
-                        Text("Free tier • recommended for new users")
-                            .font(.caption).foregroundColor(.secondary)
-                    } else if type == .ollama {
-                        Text("100% local • no API key needed")
-                            .font(.caption).foregroundColor(.secondary)
+                    .font(.system(size: 16))
+                    .padding(.top, 1)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    // Name + model badge
+                    HStack(spacing: 8) {
+                        Text(type.displayName)
+                            .font(.subheadline.weight(isSelected ? .semibold : .medium))
+
+                        Text(type.modelLabel)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(type.isFree ? .green : .secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                (type.isFree ? Color.green : Color.secondary).opacity(0.10)
+                            )
+                            .clipShape(Capsule())
+
+                        Spacer()
                     }
+
+                    // Pricing subtitle
+                    Text(type.pricingSubtitle)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-                Spacer()
             }
-            .padding(.vertical, 6)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 10)
+            .background(isSelected ? Color.accentColor.opacity(0.07) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(
+                        isSelected ? Color.accentColor.opacity(0.25) : Color.secondary.opacity(0.12),
+                        lineWidth: 1
+                    )
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .animation(.easeInOut(duration: 0.12), value: isSelected)
     }
 }

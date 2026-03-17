@@ -13,16 +13,21 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("AI Provider") {
-                Picker("Provider", selection: $selectedProvider) {
+                VStack(spacing: 6) {
                     ForEach(AIProviderType.allCases, id: \.rawValue) { type in
-                        Text(type.rawValue).tag(type.rawValue)
+                        ProviderRow(
+                            type: type,
+                            isSelected: selectedProvider == type.rawValue
+                        ) {
+                            selectedProvider = type.rawValue
+                            apiKey = KeychainManager.shared.load(
+                                service: keychainService(for: selectedType)
+                            ) ?? ""
+                            saved = false
+                        }
                     }
                 }
-                .pickerStyle(.radioGroup)
-                .onChange(of: selectedProvider) { _ in
-                    apiKey = KeychainManager.shared.load(service: keychainService(for: selectedType)) ?? ""
-                    saved = false
-                }
+                .padding(.vertical, 4)
             }
 
             if selectedType != .ollama {
