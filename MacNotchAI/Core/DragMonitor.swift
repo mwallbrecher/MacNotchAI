@@ -86,6 +86,11 @@ class DragMonitor: ObservableObject {
     }
 
     private func handleMouseUp() {
+        // Guard: if a successful drop already called dragCompleted() the state is
+        // already clean. Firing again would publish a redundant isDraggingFile=false
+        // which — during the 0.14 s dismissAnimated window — could race against a
+        // freshly created WaitingPillView and its jellyTask. Skip if already idle.
+        guard isDraggingFile else { return }
         isDraggingFile = false
         stopPolling()
     }

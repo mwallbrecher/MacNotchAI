@@ -97,16 +97,25 @@ struct OverlayView: View {
         // ── Entry sequence ─────────────────────────────────────────────────
         // Phase 1 — notch mouth opens (X spreads, Y barely visible)
         // Phase 2 — liquid drop with low-damping bounce (detach effect)
+        //
+        // IMPORTANT: use try/catch, never try?.  If the view is dismissed
+        // during the 35 ms sleep (e.g. the user releases the drag before the
+        // pill finishes dropping), the task is cancelled and CancellationError
+        // is thrown.  try? swallows that error and lets execution continue to
+        // the second withAnimation — which then races against the identical
+        // withAnimation in the newly-created OverlayView → crash.
         .task {
-            withAnimation(.spring(response: 0.12, dampingFraction: 0.70)) {
-                dropX = 1.06
-                dropY = 0.42
-            }
-            try? await Task.sleep(nanoseconds: 35_000_000)
-            withAnimation(.spring(response: 0.32, dampingFraction: 0.56)) {
-                dropX = 1.0
-                dropY = 1.0
-            }
+            do {
+                withAnimation(.spring(response: 0.12, dampingFraction: 0.70)) {
+                    dropX = 1.06
+                    dropY = 0.42
+                }
+                try await Task.sleep(nanoseconds: 35_000_000)
+                withAnimation(.spring(response: 0.32, dampingFraction: 0.56)) {
+                    dropX = 1.0
+                    dropY = 1.0
+                }
+            } catch { }
         }
     }
 }
