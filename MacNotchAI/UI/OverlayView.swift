@@ -181,7 +181,6 @@ private struct ChipsColumnView: View {
     }
 
     private func runAction(_ action: AIAction) {
-        let vm = OverlayViewModel.shared
         setStage(.loading(url: fileURL, action: action))
         Task {
             do {
@@ -340,12 +339,7 @@ private struct TwoColumnView: View {
 
         case .result(_, _, let text):
             ScrollView(.vertical, showsIndicators: true) {
-                Text(text)
-                    .font(.system(size: 12.5))
-                    .foregroundColor(.white.opacity(0.88))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                MarkdownText(source: text)
                     .padding(12)
             }
             .frame(maxHeight: 200)
