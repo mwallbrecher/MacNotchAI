@@ -21,6 +21,14 @@ class DragMonitor: ObservableObject {
     // modalPanel) and polls the drag pasteboard — when it empties the drag ended.
     private var pollTimer: Timer?
 
+    // ── Stale-pasteboard guard ────────────────────────────────────────────────
+    // NSPasteboard(name: .drag) retains its content between drag sessions.
+    // Any leftMouseDragged (even with no file) would find the old file URLs and
+    // falsely trigger the pill.  We only react when the changeCount increments —
+    // which happens exactly once per new drag session (when the source app writes
+    // fresh items to the drag pasteboard).
+    private var lastDragChangeCount: Int = NSPasteboard(name: .drag).changeCount
+
     private init() {}
 
     func startMonitoring() {
@@ -57,10 +65,20 @@ class DragMonitor: ObservableObject {
     // MARK: - Private – event handlers
 
     private func handleDrag(_ event: NSEvent) {
-        let hasDrag = hasFile(on: NSPasteboard(name: .drag))
+        let pb    = NSPasteboard(name: .drag)
+        let count = pb.changeCount
+
+        // Skip events where the pasteboard hasn't changed — these are either
+        // continued drag-move events for an already-detected drag (isDraggingFile
+        // is already true, polling handles cleanup) or plain mouse moves after a
+        // previous drag whose stale contents are still in the pasteboard.
+        guard count != lastDragChangeCount else { return }
+        lastDragChangeCount = count
+
+        let hasDrag = hasFile(on: pb)
         if hasDrag, !isDraggingFile {
             isDraggingFile = true
-            startPolling()      // begin pasteboard-polling so we detect drag-end
+            startPolling()
         } else if !hasDrag {
             isDraggingFile = false
             stopPolling()
@@ -96,6 +114,9 @@ class DragMonitor: ObservableObject {
     private func stopPolling() {
         pollTimer?.invalidate()
         pollTimer = nil
+        // Snapshot the current changeCount so the next identical pasteboard state
+        // (stale data from this drag) doesn't re-trigger handleDrag.
+        lastDragChangeCount = NSPasteboard(name: .drag).changeCount
     }
 
     // MARK: - Private – pasteboard inspection

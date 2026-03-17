@@ -6,95 +6,105 @@ struct OverlayView: View {
     @ObservedObject private var vm = OverlayViewModel.shared
     let provider: any AIProvider
 
-    // ── Liquid drop-from-notch entry animation ─────────────────────────────
-    // Start compressed (notch-width, near-zero height) anchored at the top.
-    // Phase 1 spreads width first (notch opening), phase 2 drops the body
-    // with a low-damping spring so it bounces like a liquid drop detaching.
-    @State private var dropX: CGFloat = 0.72   // ≈ notch width / pill width
-    @State private var dropY: CGFloat = 0.02   // almost invisible (flat at notch)
+    // ── Entry animation state ───────────────────────────────────────────────
+    // Two-phase liquid-drop entry: phase 1 spreads the pill horizontally (notch
+    // mouth opens), phase 2 drops the body with a low-damping spring bounce.
+    // Applied OUTSIDE clipShape so neither the scale nor the jelly wobble can
+    // be clipped by the SwiftUI shape.
+    // The window is 288×96 (vs the 240×68 pill content), providing a 24 pt
+    // transparent border horizontally and 28 pt below — the wobble scaleEffect
+    // overflows into this transparent canvas without hitting the NSHostingView
+    // clip boundary. WaitingPillView is top-aligned so its top edge stays flush
+    // with the notch bottom regardless of the extra canvas height.
+    // ≈ notch width / pill width — spreads to 1.0 in phase 1
+    @State private var dropX: CGFloat = 0.78
+    // near-zero → springs to 1.0 in phase 2, anchored at .top so the pill
+    // grows downward from the notch edge (not from a centred origin)
+    @State private var dropY: CGFloat = 0.02
 
-    // Corner radius: pill-shaped when waiting, card-shaped when content shows.
-    private var cornerRadius: CGFloat {
-        switch vm.stage {
-        case .waitingForDrop: return 34
-        default:              return 20
-        }
-    }
+    // Card corner radius (stage 1 pill owns its own clip inside WaitingPillView)
+    private var cornerRadius: CGFloat { 20 }
 
     var body: some View {
-        ZStack(alignment: .topTrailing) {
-            // ── Stage content ────────────────────────────────────────────
-            Group {
-                switch vm.stage {
-                case .waitingForDrop:
-                    WaitingPillView()
-                        .transition(.identity)
+        // ── Stage routing ─────────────────────────────────────────────────────
+        // Stage 1 owns its own black background + clipShape so the outer ZStack
+        // stays transparent in the 288×96 canvas, giving the wobble scaleEffect
+        // room to overflow without hitting the window boundary.
+        // Stages 2/3 share a card ZStack that applies background + clip itself.
+        Group {
+            switch vm.stage {
+            case .waitingForDrop:
+                // Pin pill to the TOP of the 288×96 canvas so its top edge stays
+                // flush with the notch bottom — matching the pre-canvas-expansion
+                // position. The 28 pt transparent gap below gives vertical wobble
+                // headroom (jellyY 1.09 → +3 pt, well within the extra space).
+                WaitingPillView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .transition(.identity)
 
-                case .chips(let url, let actions):
-                    ChipsColumnView(fileURL: url, actions: actions, provider: provider)
-                        .transition(.asymmetric(
-                            insertion: .scale(scale: 0.88, anchor: .top)
-                                .combined(with: .opacity),
-                            removal: .scale(scale: 0.92, anchor: .top)
-                                .combined(with: .opacity)
-                        ))
-
-                case .loading(let url, _), .result(let url, _, _), .error(let url, _):
-                    TwoColumnView(fileURL: url, provider: provider)
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .trailing).combined(with: .opacity),
-                            removal: .opacity
-                        ))
+            default:
+                ZStack(alignment: .topTrailing) {
+                    Group {
+                        switch vm.stage {
+                        case .chips(let url, let actions):
+                            ChipsColumnView(fileURL: url, actions: actions, provider: provider)
+                                .transition(.asymmetric(
+                                    insertion: .scale(scale: 0.88, anchor: .top)
+                                        .combined(with: .opacity),
+                                    removal: .scale(scale: 0.92, anchor: .top)
+                                        .combined(with: .opacity)
+                                ))
+                        case .loading(let url, _), .result(let url, _, _), .error(let url, _):
+                            TwoColumnView(fileURL: url, provider: provider)
+                                .transition(.asymmetric(
+                                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                                    removal: .opacity
+                                ))
+                        default:
+                            EmptyView()
+                        }
+                    }
+                    CloseButton()
+                        .padding(10)
+                        .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                 }
-            }
-
-            // ── Close button (shelf stages only) ─────────────────────────
-            if case .waitingForDrop = vm.stage { } else {
-                CloseButton()
-                    .padding(10)
-                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+                .background(Color.black)
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .transition(.identity)
             }
         }
-        .background(Color.black)
-        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        // compositingGroup() rasterises the clipped shape into a bitmap BEFORE
-        // the shadow is computed, so the shadow traces the rounded pill/card
-        // outline rather than the rectangular bounding box of the view.
         .compositingGroup()
-        // Stage 1 (pill) lives right under the dark notch — no shadow needed,
-        // and any shadow there creates a visible dark rectangle around the pill.
-        // Stages 2/3 (card) need a gentle lift shadow against the screen content.
+        // No shadow on the pill — it sits in the dark notch area and any shadow
+        // bleeds as a visible rectangle. Card stages get a gentle lift shadow.
         .shadow(
             color:  vm.stage.tag == 0 ? .clear : .black.opacity(0.45),
             radius: vm.stage.tag == 0 ? 0      : 18,
             x: 0,
             y:      vm.stage.tag == 0 ? 0      : 8
         )
-        // Liquid entry scale (shrinks to ~0 height at notch, then drops down)
+        // ── Entry: notch-mouth spread (phase 1) then liquid drop (phase 2) ──
+        // Pill is pinned to window top (= notch bottom) via .top alignment above,
+        // so .anchor: .top here means "grow downward from the notch edge".
+        // Both scaleEffects are outside clipShape → no overflow clipping possible.
         .scaleEffect(x: dropX, y: dropY, anchor: .top)
-        // Jelly wobble — applied here (outside clipShape) so the pill can
-        // bulge beyond its layout frame without hitting a clip boundary.
-        // Only active during stage 1; resets to 1.0 for all other stages.
+        // ── Jelly wobble (stage 1 only, outside all clips) ─────────────────
+        // anchor: .top keeps all Y expansion downward — eliminates the upward
+        // overflow that was clipped by the window boundary when jellyY > 1.0.
         .scaleEffect(
             x: vm.stage.tag == 0 ? vm.jellyX : 1.0,
-            y: vm.stage.tag == 0 ? vm.jellyY : 1.0
+            y: vm.stage.tag == 0 ? vm.jellyY : 1.0,
+            anchor: .top
         )
-        // Drive corner-radius morph and stage content transitions with same spring
-        .animation(.spring(response: 0.38, dampingFraction: 0.60), value: cornerRadius)
         .animation(.spring(response: 0.38, dampingFraction: 0.60), value: vm.stage.tag)
         // ── Entry sequence ─────────────────────────────────────────────────
-        // Two phases but compressed so the pill is VISUALLY PRESENT within ~80 ms.
-        // The window is always ready to accept drops from the moment show() fires;
-        // this animation is purely cosmetic, not a gating concern.
+        // Phase 1 — notch mouth opens (X spreads, Y barely visible)
+        // Phase 2 — liquid drop with low-damping bounce (detach effect)
         .task {
-            // Phase 1 — horizontal spread (notch mouth opening), very fast
             withAnimation(.spring(response: 0.12, dampingFraction: 0.70)) {
                 dropX = 1.06
                 dropY = 0.42
             }
-            try? await Task.sleep(nanoseconds: 35_000_000)  // 35 ms (was 90 ms)
-
-            // Phase 2 — liquid drop with gentle bounce; faster response than before
+            try? await Task.sleep(nanoseconds: 35_000_000)
             withAnimation(.spring(response: 0.32, dampingFraction: 0.56)) {
                 dropX = 1.0
                 dropY = 1.0
@@ -124,43 +134,63 @@ private struct WaitingPillView: View {
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 18)
-        .frame(width: 240)
-        // NOTE: jelly scaleEffect is intentionally NOT applied here.
-        // It lives on OverlayView (outside clipShape) so the pill can overflow
-        // its layout frame during the squash/rebound without being clipped.
-        // ── Hover jelly sequence ──────────────────────────────────────────
-        // Cancelled & restarted automatically when isDragHovering flips.
+        // Explicit 68 pt height so cornerRadius 34 = height/2 → perfect pill/
+        // stadium shape. Content (icon + label, ~22 pt) is centred in the 68 pt
+        // with 18 pt padding on each side. This also keeps the pill flush with
+        // the notch bottom: the 288×96 canvas is top-aligned, so pill top ==
+        // window top == notch bottom, with 28 pt transparent space below for
+        // the downward jelly wobble (jellyY 1.09 → +6 pt, well within 28 pt).
+        .frame(width: 240, height: 68)
+        // Background + clip live HERE (inside WaitingPillView), not on the outer
+        // canvas in OverlayView. The outer 288×96 canvas stays transparent so the
+        // wobble scaleEffect (applied after this clip in OverlayView) can overflow
+        // freely without hitting the window clip boundary.
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+        // ── Hover jelly sequence ──────────────────────────────────────────────
+        // CRASH FIX: use 'try await' (NOT 'try?') for every Task.sleep.
+        // 'try?' swallows CancellationError so a cancelled task keeps running past
+        // the sleep as a zombie — a second task fires for the new isDragHovering
+        // value, and both call withAnimation{} on the same @Published properties
+        // simultaneously → SwiftUI invariant violation → _crashOnException.
+        // With plain 'try await', cancellation immediately throws, the do/catch
+        // exits cleanly, and only the new task owns the animation state.
         .task(id: vm.isDragHovering) {
             if !vm.isDragHovering {
+                // File left — spring back to neutral immediately (no sleep needed).
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
                     vm.jellyX = 1.0; vm.jellyY = 1.0
                 }
                 return
             }
 
-            // File entered: squash horizontally, compress vertically
-            withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
-                vm.jellyX = 1.12; vm.jellyY = 0.86
-            }
-            try? await Task.sleep(nanoseconds: 130_000_000)
-            guard !Task.isCancelled else { return }
-
-            // Spring back — overshoot vertically (liquid rebound)
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
-                vm.jellyX = 0.94; vm.jellyY = 1.09
-            }
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            guard !Task.isCancelled else { return }
-
-            // Slow breathing oscillation while file hovers above
-            var phase = false
-            while !Task.isCancelled {
-                phase.toggle()
-                withAnimation(.spring(response: 0.60, dampingFraction: 0.68)) {
-                    vm.jellyX = phase ? 1.04 : 0.97
-                    vm.jellyY = phase ? 0.97 : 1.03
+            do {
+                // File entered — squash width, compress height (liquid impact)
+                withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
+                    vm.jellyX = 1.12; vm.jellyY = 0.86
                 }
-                try? await Task.sleep(nanoseconds: 520_000_000)
+                try await Task.sleep(nanoseconds: 130_000_000)
+
+                // Spring back — overshoot height downward (liquid rebound)
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
+                    vm.jellyX = 0.94; vm.jellyY = 1.09
+                }
+                try await Task.sleep(nanoseconds: 200_000_000)
+
+                // Slow breathing oscillation while file hovers above
+                var phase = false
+                while true {
+                    phase.toggle()
+                    withAnimation(.spring(response: 0.60, dampingFraction: 0.68)) {
+                        vm.jellyX = phase ? 1.04 : 0.97
+                        vm.jellyY = phase ? 0.97 : 1.03
+                    }
+                    try await Task.sleep(nanoseconds: 520_000_000)
+                }
+            } catch {
+                // Task cancelled — isDragHovering changed again.
+                // The sibling task that fired for the new value owns the next
+                // animation state; do nothing here so the two tasks don't fight.
             }
         }
     }

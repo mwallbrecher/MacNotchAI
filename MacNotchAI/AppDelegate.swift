@@ -103,7 +103,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Pre-position at the notch synchronously BEFORE ordering front.
         // Without this the window flashes at screen origin (0, 0) for one frame.
-        overlayWindow?.place(size: CGSize(width: 240, height: 68), anchorAtNotchCenter: false)
+        // 288×96 gives 24 pt transparent border on each side (horizontal) and 14 pt
+        // top/bottom — the wobble scaleEffect overflows into this transparent canvas
+        // without hitting the window clip boundary.
+        overlayWindow?.place(size: CGSize(width: 288, height: 96), anchorAtNotchCenter: false)
         overlayWindow?.show()
         startDismissMonitors()
     }
@@ -125,7 +128,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch stage {
         case .waitingForDrop:
-            size = CGSize(width: 240, height: 68)
+            size = CGSize(width: 288, height: 96)   // extra canvas for wobble overflow
             anchorLeft = false
 
         case .chips(_, let actions):
