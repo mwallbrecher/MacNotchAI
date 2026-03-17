@@ -1,0 +1,203 @@
+# AI Drop
+
+**Drag any file. Drop it. Get instant AI insights — without leaving your desktop.**
+
+AI Drop is a native macOS menu-bar app that turns your physical notch into an AI interface. While dragging a file, a pill emerges from the notch. Drop the file on it, pick an action, and the result appears inline — no browser, no chat window, no context switching.
+
+---
+
+## The Problem It Solves
+
+Opening a file → switching to a browser → uploading it to an AI chat → waiting → copying the result back — this workflow has been measured at **17–41 seconds of task completion overhead** per interaction (Kingston University HCI study, 2025). That overhead compounds every time you need a summary, a translation, or a key-date extraction.
+
+AI Drop eliminates every step except the one that matters: **what do you want to do with this file?**
+
+---
+
+## How It Works
+
+```
+Drag any file toward the top of your screen
+        ↓
+A pill drops from the notch  ←  liquid spring animation
+        ↓
+Drop the file onto the pill
+        ↓
+Instant AI action chips appear (Summarise · Translate · Extract Dates · …)
+        ↓
+Tap a chip  →  AI response renders inline with full Markdown formatting
+        ↓
+Done. Or continue the conversation in Claude / ChatGPT with one tap.
+```
+
+The entire flow happens in a floating black panel — no app switching, no typing, no prompts.
+
+---
+
+## Features
+
+### Core Interaction
+- **Drag detection** — monitors the system drag pasteboard; pill appears the moment a file drag is detected anywhere on screen
+- **Notch-origin animation** — pill emerges from the physical notch with a two-phase liquid spring (notch mouth opens → pill drops with low-damping bounce)
+- **Jelly hover** — single squash-rebound wobble on cursor enter; pill stays still for precise dropping
+- **Shelf behaviour** — overlay stays open after a file is placed; acts as a temporary workspace
+
+### AI Actions
+- Summarise (bullets / short)
+- Extract key dates
+- Translate to German
+- Rephrase (formal / casual)
+- Extract key points
+- Analyse image *(for image files)*
+- Custom free-text prompt
+
+### Result Panel
+- **Markdown rendering** — bold, italic, headings, bullet & numbered lists, fenced code blocks, dividers — no raw tokens
+- **Scrollable result** with text selection
+- **Follow-up action chips** based on what was just run
+- **"Continue in [Provider]"** — copies full context + image to clipboard and opens the provider's native app or web UI
+
+### File Support
+- PDF, DOCX, TXT, Markdown — full text extraction
+- PNG, JPEG, GIF, HEIC, WebP — image analysis via vision models
+- **Drag-out** — drag the file icon back out of the overlay to drop it anywhere in Finder
+
+### AI Providers
+| Provider | Model | Cost | Notes |
+|---|---|---|---|
+| **Groq** | Llama 3.1 8B | ~10,000 interactions / $5 | Free tier included; fastest |
+| **Claude** | Haiku 4.5 | ~385 interactions / $5 | Best quality, coding, long context |
+| **ChatGPT** | GPT-4o mini | ~2,800 interactions / $5 | Best balance; image support |
+| **Ollama** | Any local model | Unlimited, free | Runs 100% on your Mac; no API bill |
+
+All API keys are stored in **macOS Keychain** — never in files, never in the app bundle.
+
+### UX Details
+- Close (×) button integrated into the file header row — never obscured by scrollbars
+- Escape key or click-outside dismisses the pill (stages 2/3 stay open — shelf behaviour)
+- Pill hides reliably when drag is released without dropping (`.common`-mode polling timer works inside AppKit's drag session modal loop)
+
+---
+
+## Requirements
+
+- **macOS 13 Ventura** or later (macOS 14 Sonoma recommended)
+- A Mac with a **notch** (MacBook Pro 14″ / 16″, MacBook Air M2+) — works on non-notch Macs too, pill appears at the top-center of the screen
+- **Xcode 15** or later to build from source
+- **Accessibility permission** — required for global drag detection (`NSEvent.addGlobalMonitorForEvents`)
+
+---
+
+## Installation
+
+### Build from Source
+
+```bash
+git clone https://github.com/YOUR_USERNAME/MacNotchAI.git
+cd MacNotchAI
+open MacNotchAI.xcodeproj
+```
+
+1. Select the **MacNotchAI** scheme
+2. Choose **My Mac** as the run destination
+3. Press **⌘R** to build and run
+
+> The app is **not sandboxed** — this is required for `NSEvent` global mouse monitoring. You will see a prompt to grant Accessibility permission on first launch; the drag detection will not work without it.
+
+### First Launch
+
+1. The app lives in your **menu bar** (look for the sparkle icon ✦)
+2. On first launch the **provider setup sheet** opens automatically
+3. Pick your provider, paste your API key, click **Get Started**
+4. Drag any file toward the top of your screen
+
+### Provider API Keys
+
+| Provider | Where to get a key |
+|---|---|
+| Groq | [console.groq.com](https://console.groq.com) — free, takes ~60 seconds |
+| Claude | [console.anthropic.com](https://console.anthropic.com) |
+| ChatGPT | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| Ollama | [ollama.ai](https://ollama.ai) — no key needed, run `ollama pull llama3.1` |
+
+---
+
+## Architecture & Technical Approach
+
+### The Stack
+
+- **SwiftUI + AppKit hybrid** — `MenuBarExtra` for the menu bar icon, `NSPanel` (`OverlayWindow`) for the overlay, `NSHostingView` subclass (`DroppableHostingView`) for drag-and-drop reception
+- **Swift Concurrency** — `async/await` for AI calls and animation sequencing; `@MainActor` throughout
+- **Combine** — `@Published` stage changes flow through a Combine pipeline to resize the window
+- **No third-party dependencies** — pure Apple frameworks only
+
+### Key Engineering Decisions
+
+**Global drag detection without Accessibility API abuse**
+We monitor `NSPasteboard(name: .drag)` via `NSEvent.addGlobalMonitorForEvents(.leftMouseDragged)`. The drag pasteboard is written by the source app before the first drag event fires, so detecting a new drag is instant. A `changeCount` guard prevents stale pasteboard contents from triggering the pill on plain mouse moves.
+
+**Drag-end detection during AppKit modal loop**
+`NSEvent.addGlobalMonitorForEvents(.leftMouseUp)` is silenced during an active AppKit drag session because macOS enters `.eventTracking` runloop mode. We use a `Timer` added to `.common` mode (fires in every runloop mode) that polls the drag pasteboard — when it empties, the drag ended.
+
+**Window frame animation crash avoidance**
+`NSAnimationContext { animator().setFrame() }` drives the window through intermediate sizes at 60 fps. AppKit runs a full constraint-solving layout pass on each intermediate frame; when those sizes are inconsistent with SwiftUI's fixed-width subviews the solver cannot converge → recursive "Update Constraints in Window" → `abort()`. Solution: **instant `setFrame(_:display:)`** — the window resizes in one step, SwiftUI transitions and spring modifiers handle all visual animation.
+
+**Jelly wobble without clipping**
+`scaleEffect` inside a `clipShape` clips the overflow. The wobble `scaleEffect` is applied at the `OverlayView` root — outside all clipping — using a 288×96 transparent canvas around the 240×68 pill. `anchor: .top` ensures all vertical expansion goes downward, so the pill never overflows upward into the notch.
+
+**Animation task ownership**
+During the 0.14 s dismiss fade, both the old and new `WaitingPillView` are live simultaneously. If both own a `Task` for the jelly animation, two concurrent `withAnimation{}` blocks targeting the same `@Published` properties cause a SwiftUI invariant violation (`_crashOnException`). Solution: the jelly `Task` is stored on `OverlayViewModel` (singleton); `startJellyHover()` always cancels the previous task before creating a new one.
+
+**File content extraction**
+- PDF → `PDFKit.PDFDocument`
+- DOCX → `ZipArchive` + XML parsing of `word/document.xml`
+- Plain text → direct `String(contentsOf:)`
+- Images → passed as `URL` directly to vision-capable models
+
+**Privacy model**
+Files are read only when the user explicitly taps an action chip. Nothing is uploaded speculatively. The only network calls are the AI API completions. API keys never leave the device except in those API calls.
+
+---
+
+## Project Structure
+
+```
+MacNotchAI/
+├── AI/
+│   ├── AIProvider.swift          # Protocol + AIProviderType enum + display metadata
+│   ├── AnthropicProvider.swift   # Claude Haiku 4.5
+│   ├── GroqProvider.swift        # Llama 3.1 8B
+│   ├── OpenAIProvider.swift      # GPT-4o mini
+│   └── OllamaProvider.swift      # Local inference
+├── Core/
+│   ├── DragMonitor.swift         # Global drag detection + polling timer
+│   ├── FileContentExtractor.swift
+│   ├── FileInspector.swift       # File type → suggested actions
+│   ├── HandoffManager.swift      # "Continue in [Provider]" clipboard + URL open
+│   └── KeychainManager.swift
+├── Models/
+│   └── OverlayViewModel.swift    # Shared state + jelly animation task
+├── UI/
+│   ├── OverlayView.swift         # All overlay stages (pill / chips / result)
+│   ├── OverlayWindow.swift       # NSPanel subclass
+│   ├── DroppableHostingView.swift # NSHostingView + NSDraggingDestination
+│   ├── MarkdownText.swift        # Lightweight Markdown renderer
+│   ├── MenuBarView.swift
+│   ├── OnboardingView.swift
+│   └── SettingsView.swift
+└── AppDelegate.swift             # Lifecycle, window management, Combine wiring
+```
+
+---
+
+## Inspired By
+
+- Apple's **Dynamic Island** interaction philosophy — contextual, springy, alive
+- The HCI research finding that **task-switching overhead** is the primary friction in AI-assisted workflows
+- The idea that **the OS itself** is the best AI interface — not another app
+
+---
+
+## License
+
+MIT — do whatever you want with it.
