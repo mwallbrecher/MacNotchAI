@@ -76,28 +76,29 @@ class OverlayViewModel: ObservableObject {
         jellyTask?.cancel()
         jellyTask = Task { @MainActor in
             do {
+                // Phase 1 — impact: cursor enters, pill squashes outward
                 withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
                     self.jellyX = 1.12; self.jellyY = 0.86
                 }
-                try await Task.sleep(nanoseconds: 130_000_000)
+                try await Task.sleep(nanoseconds: 120_000_000)
 
+                // Phase 2 — rebound: liquid springs back through overshoot
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
                     self.jellyX = 0.94; self.jellyY = 1.09
                 }
-                try await Task.sleep(nanoseconds: 200_000_000)
+                try await Task.sleep(nanoseconds: 170_000_000)
 
-                var phase = false
-                while true {
-                    phase.toggle()
-                    withAnimation(.spring(response: 0.60, dampingFraction: 0.68)) {
-                        self.jellyX = phase ? 1.04 : 0.97
-                        self.jellyY = phase ? 0.97 : 1.03
-                    }
-                    try await Task.sleep(nanoseconds: 520_000_000)
+                // Phase 3 — settle: return to exact neutral and stay there.
+                // No looping — a moving pill makes it harder to aim the drop.
+                // The hitbox (NSView.bounds = 288×96) never changes with
+                // scaleEffect, but a still pill is easier to target visually.
+                withAnimation(.spring(response: 0.38, dampingFraction: 0.80)) {
+                    self.jellyX = 1.0; self.jellyY = 1.0
                 }
+                // Task ends — pill is perfectly still while cursor hovers.
             } catch {
-                // Cancelled — do nothing. stopJellyHover() or reset() handles
-                // the return-to-neutral animation when appropriate.
+                // Cancelled (cursor left mid-wobble). stopJellyHover() will
+                // snap back to neutral so the pill is never stuck mid-squash.
             }
         }
     }
@@ -105,7 +106,7 @@ class OverlayViewModel: ObservableObject {
     func stopJellyHover() {
         jellyTask?.cancel()
         jellyTask = nil
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
             jellyX = 1.0; jellyY = 1.0
         }
     }
