@@ -46,6 +46,9 @@ class OverlayViewModel: ObservableObject {
     @Published var stage: Stage = .waitingForDrop
     /// True while a file is physically dragged over the Stage-1 pill.
     @Published var isDragHovering = false
+    /// True from the moment a drag-OUT gesture starts until the drag ends.
+    /// AppDelegate watches this to close the session after the drop.
+    @Published var isDraggingOut = false
     /// Text typed into the custom-prompt field in the result column.
     @Published var customPrompt: String = ""
 
@@ -55,8 +58,9 @@ class OverlayViewModel: ObservableObject {
     }
 
     func reset() {
-        stage        = .waitingForDrop
+        stage          = .waitingForDrop
         isDragHovering = false
-        customPrompt = ""
+        isDraggingOut  = false
+        customPrompt   = ""
     }
 }

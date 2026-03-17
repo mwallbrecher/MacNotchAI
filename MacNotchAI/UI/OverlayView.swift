@@ -22,27 +22,37 @@ struct OverlayView: View {
     }
 
     var body: some View {
-        ZStack {
-            switch vm.stage {
-            case .waitingForDrop:
-                WaitingPillView()
-                    .transition(.identity)   // entry handled by scaleEffect below
+        ZStack(alignment: .topTrailing) {
+            // ── Stage content ────────────────────────────────────────────
+            Group {
+                switch vm.stage {
+                case .waitingForDrop:
+                    WaitingPillView()
+                        .transition(.identity)
 
-            case .chips(let url, let actions):
-                ChipsColumnView(fileURL: url, actions: actions, provider: provider)
-                    .transition(.asymmetric(
-                        insertion: .scale(scale: 0.88, anchor: .top)
-                            .combined(with: .opacity),
-                        removal: .scale(scale: 0.92, anchor: .top)
-                            .combined(with: .opacity)
-                    ))
+                case .chips(let url, let actions):
+                    ChipsColumnView(fileURL: url, actions: actions, provider: provider)
+                        .transition(.asymmetric(
+                            insertion: .scale(scale: 0.88, anchor: .top)
+                                .combined(with: .opacity),
+                            removal: .scale(scale: 0.92, anchor: .top)
+                                .combined(with: .opacity)
+                        ))
 
-            case .loading(let url, _), .result(let url, _, _), .error(let url, _):
-                TwoColumnView(fileURL: url, provider: provider)
-                    .transition(.asymmetric(
-                        insertion: .move(edge: .trailing).combined(with: .opacity),
-                        removal: .opacity
-                    ))
+                case .loading(let url, _), .result(let url, _, _), .error(let url, _):
+                    TwoColumnView(fileURL: url, provider: provider)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity
+                        ))
+                }
+            }
+
+            // ── Close button (shelf stages only) ─────────────────────────
+            if case .waitingForDrop = vm.stage { } else {
+                CloseButton()
+                    .padding(10)
+                    .transition(.opacity.animation(.easeInOut(duration: 0.15)))
             }
         }
         .background(Color.black)
@@ -376,20 +386,71 @@ private struct TwoColumnView: View {
 
 // MARK: - Shared subviews
 
+/// File header that doubles as a drag-source.
+/// Drag the icon or filename to move/copy the file out of the shelf.
 private struct FileHeaderView: View {
     let fileURL: URL
+    @State private var isHoveringIcon = false
 
     var body: some View {
         HStack(spacing: 9) {
             Image(nsImage: NSWorkspace.shared.icon(forFile: fileURL.path))
                 .resizable()
                 .frame(width: 26, height: 26)
+                // Drag-out: set flag so AppDelegate can close the session when drag ends
+                .onDrag {
+                    OverlayViewModel.shared.isDraggingOut = true
+                    return NSItemProvider(object: fileURL as NSURL)
+                }
+                .onHover { hovering in
+                    isHoveringIcon = hovering
+                    if hovering { NSCursor.openHand.push() } else { NSCursor.pop() }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    // Tiny grab-dot indicator — appears on hover
+                    if isHoveringIcon {
+                        Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                            .font(.system(size: 6, weight: .bold))
+                            .foregroundColor(.white.opacity(0.7))
+                            .padding(2)
+                            .background(Color.black.opacity(0.6))
+                            .clipShape(Circle())
+                            .offset(x: 3, y: 3)
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.12), value: isHoveringIcon)
+
             Text(fileURL.lastPathComponent)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.white)
                 .lineLimit(1)
             Spacer()
         }
+    }
+}
+
+// MARK: - Close button
+
+/// Small × button — closes the current shelf session.
+/// Posts a notification so AppDelegate can coordinate teardown.
+private struct CloseButton: View {
+    @State private var isHovered = false
+
+    var body: some View {
+        Button {
+            NotificationCenter.default.post(name: .hideOverlay, object: nil)
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 8, weight: .heavy))
+                .foregroundColor(.white.opacity(isHovered ? 0.9 : 0.45))
+                .frame(width: 22, height: 22)
+                .background(Color.white.opacity(isHovered ? 0.16 : 0.06))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.12), value: isHovered)
     }
 }
 

@@ -21,6 +21,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(handleShowOnboarding),
             name: .showOnboarding, object: nil
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleHideOverlay),
+            name: .hideOverlay, object: nil
+        )
 
         // Show onboarding on very first launch.
         if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
@@ -30,9 +34,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func handleShowOnboarding() {
-        showOnboarding()
-    }
+    @objc private func handleShowOnboarding() { showOnboarding() }
+    @objc private func handleHideOverlay()    { hideOverlay()    }
 
     // MARK: - Drag observation
     // Stage 1 → pill visible while any file is being dragged.
@@ -46,15 +49,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let vm = OverlayViewModel.shared
                 if isDragging {
                     // Only show the pill if we're not already in a later stage.
+                    // This also prevents re-triggering during a drag-OUT gesture.
                     if case .waitingForDrop = vm.stage {
                         self.ensureOverlayVisible()
                     }
                 } else {
-                    // Drag ended without dropping on our pill → dismiss.
                     if case .waitingForDrop = vm.stage {
+                        // Drag ended without dropping on our pill — dismiss pill.
+                        self.hideOverlay()
+                    } else if vm.isDraggingOut {
+                        // User dragged the file OUT of the shelf — close session.
+                        vm.isDraggingOut = false
                         self.hideOverlay()
                     }
-                    // Stage 2/3: keep the overlay visible.
+                    // Otherwise (stage 2/3, no drag-out): shelf stays open.
                 }
             }
             .store(in: &cancellables)
@@ -147,7 +155,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
             Task { @MainActor [weak self] in
                 guard let self, let window = self.overlayWindow else { return }
-                if !NSPointInRect(NSEvent.mouseLocation, window.frame) {
+                guard !NSPointInRect(NSEvent.mouseLocation, window.frame) else { return }
+                // Shelf behaviour: outside clicks only dismiss the Stage-1 pill.
+                // Once a file is placed (stages 2/3) the window acts as a desk —
+                // it stays open until the user clicks ×, drags the file out, or presses Esc.
+                if case .waitingForDrop = OverlayViewModel.shared.stage {
                     self.hideOverlay()
                 }
             }
@@ -205,6 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension Notification.Name {
     static let showOnboarding = Notification.Name("com.aidrop.showOnboarding")
+    static let hideOverlay    = Notification.Name("com.aidrop.hideOverlay")
 }
 
 // MARK: - Provider resolution
