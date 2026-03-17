@@ -51,6 +51,11 @@ class OverlayViewModel: ObservableObject {
     @Published var isDraggingOut = false
     /// Text typed into the custom-prompt field in the result column.
     @Published var customPrompt: String = ""
+    /// Jelly wobble scale driven by WaitingPillView, applied at OverlayView
+    /// level (outside clipShape) so the pill can overflow its layout frame
+    /// without being clipped.
+    @Published var jellyX: CGFloat = 1.0
+    @Published var jellyY: CGFloat = 1.0
 
     func setChips(url: URL) {
         stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
@@ -62,5 +67,7 @@ class OverlayViewModel: ObservableObject {
         isDragHovering = false
         isDraggingOut  = false
         customPrompt   = ""
+        jellyX         = 1.0
+        jellyY         = 1.0
     }
 }

@@ -72,6 +72,13 @@ struct OverlayView: View {
         )
         // Liquid entry scale (shrinks to ~0 height at notch, then drops down)
         .scaleEffect(x: dropX, y: dropY, anchor: .top)
+        // Jelly wobble — applied here (outside clipShape) so the pill can
+        // bulge beyond its layout frame without hitting a clip boundary.
+        // Only active during stage 1; resets to 1.0 for all other stages.
+        .scaleEffect(
+            x: vm.stage.tag == 0 ? vm.jellyX : 1.0,
+            y: vm.stage.tag == 0 ? vm.jellyY : 1.0
+        )
         // Drive corner-radius morph and stage content transitions with same spring
         .animation(.spring(response: 0.38, dampingFraction: 0.60), value: cornerRadius)
         .animation(.spring(response: 0.38, dampingFraction: 0.60), value: vm.stage.tag)
@@ -101,10 +108,6 @@ struct OverlayView: View {
 private struct WaitingPillView: View {
     @ObservedObject private var vm = OverlayViewModel.shared
 
-    // Liquid jelly state — driven by isDragHovering via .task(id:)
-    @State private var jellyX: CGFloat = 1.0
-    @State private var jellyY: CGFloat = 1.0
-
     var body: some View {
         HStack(spacing: 10) {
             // Icon morphs when file hovers
@@ -122,40 +125,40 @@ private struct WaitingPillView: View {
         .padding(.horizontal, 22)
         .padding(.vertical, 18)
         .frame(width: 240)
-        // Liquid jelly effect applied to pill content
-        .scaleEffect(x: jellyX, y: jellyY)
+        // NOTE: jelly scaleEffect is intentionally NOT applied here.
+        // It lives on OverlayView (outside clipShape) so the pill can overflow
+        // its layout frame during the squash/rebound without being clipped.
         // ── Hover jelly sequence ──────────────────────────────────────────
         // Cancelled & restarted automatically when isDragHovering flips.
         .task(id: vm.isDragHovering) {
             if !vm.isDragHovering {
-                // Snap back to rest with a little spring
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
-                    jellyX = 1.0; jellyY = 1.0
+                    vm.jellyX = 1.0; vm.jellyY = 1.0
                 }
                 return
             }
 
-            // File entered: squash from top (pressure coming down)
+            // File entered: squash horizontally, compress vertically
             withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
-                jellyX = 1.12; jellyY = 0.86
+                vm.jellyX = 1.12; vm.jellyY = 0.86
             }
             try? await Task.sleep(nanoseconds: 130_000_000)
             guard !Task.isCancelled else { return }
 
             // Spring back — overshoot vertically (liquid rebound)
             withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
-                jellyX = 0.94; jellyY = 1.09
+                vm.jellyX = 0.94; vm.jellyY = 1.09
             }
             try? await Task.sleep(nanoseconds: 200_000_000)
             guard !Task.isCancelled else { return }
 
-            // Slow breath oscillation while file hovers above
+            // Slow breathing oscillation while file hovers above
             var phase = false
             while !Task.isCancelled {
                 phase.toggle()
                 withAnimation(.spring(response: 0.60, dampingFraction: 0.68)) {
-                    jellyX = phase ? 1.04 : 0.97
-                    jellyY = phase ? 0.97 : 1.03
+                    vm.jellyX = phase ? 1.04 : 0.97
+                    vm.jellyY = phase ? 0.97 : 1.03
                 }
                 try? await Task.sleep(nanoseconds: 520_000_000)
             }
