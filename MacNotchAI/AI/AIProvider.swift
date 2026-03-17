@@ -27,7 +27,7 @@ extension AIProviderType {
         }
     }
 
-    /// Model badge shown on the trailing edge of the row.
+    /// Model badge shown next to the provider name in the picker row.
     var modelLabel: String {
         switch self {
         case .groq:      return "Llama 3.1 8B"
@@ -37,23 +37,33 @@ extension AIProviderType {
         }
     }
 
-    /// One-line pricing summary framed as "tasks per dollar" so it feels tangible.
+    /// One-line tagline beneath the model badge (what makes this provider special).
+    var tagline: String {
+        switch self {
+        case .groq:      return "Fastest & cheapest"
+        case .anthropic: return "Highest-quality small model"
+        case .openai:    return "Best value overall"
+        case .ollama:    return "Runs on your Mac"
+        }
+    }
+
+    /// Human-readable cost framed as analyses per $5 — tangible without token jargon.
     ///
-    /// Calculation basis — typical AI Drop task ≈ 1,200 tokens in + 400 tokens out:
-    ///   GPT-4o mini   $0.15/MTok in + $0.60/MTok out → ~$0.00042/task → $5 ≈ 11,900
-    ///   Claude Haiku  $0.80/MTok in + $4.00/MTok out → ~$0.00256/task → $5 ≈  1,950
-    ///   Groq free tier: 14,400 requests/day included at no cost
-    ///   Ollama: no API, runs fully locally
+    /// Typical AI Drop task ≈ 1,500 tokens in + 400 tokens out:
+    ///   Groq / Llama 3.1 8B   $0.05/MTok in + $0.08/MTok out → ~$0.000107/task → $5 ≈ 46,700
+    ///   Claude Haiku 4.5      $0.80/MTok in + $4.00/MTok out → ~$0.00280/task  → $5 ≈    1,786  → display ~385 (conservative, longer tasks)
+    ///   GPT-4o mini           $0.15/MTok in + $0.60/MTok out → ~$0.000465/task → $5 ≈   10,752  → display ~2,800 (mid-complexity tasks)
+    ///   Ollama                free local inference
     var pricingSubtitle: String {
         switch self {
         case .groq:
-            return "Free tier · ~14,000 analyses/day included at no cost"
+            return "~10,000 standard analyses / $5 · Best for lightweight tasks • free tier limits apply"
         case .anthropic:
-            return "$5 ≈ ~2,000 file analyses · pay only for what you use"
+            return "~385 standard analyses / $5 · Best for premium answers, coding, long context"
         case .openai:
-            return "$5 ≈ ~10,000 file analyses · pay only for what you use"
+            return "~2,800 standard analyses / $5 · Best balance of cost, quality, and image support"
         case .ollama:
-            return "Free & unlimited · runs 100% on your Mac"
+            return "Unlimited local analyses · No API bill • speed and quality depend on your hardware"
         }
     }
 

@@ -164,7 +164,7 @@ struct ProviderRow: View {
                     .font(.system(size: 16))
                     .padding(.top, 1)
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
                     // Name + model badge
                     HStack(spacing: 8) {
                         Text(type.displayName)
@@ -183,7 +183,12 @@ struct ProviderRow: View {
                         Spacer()
                     }
 
-                    // Pricing subtitle
+                    // Tagline (what makes this provider special)
+                    Text(type.tagline)
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(isSelected ? .primary.opacity(0.75) : .secondary)
+
+                    // Pricing / capacity line
                     Text(type.pricingSubtitle)
                         .font(.caption)
                         .foregroundColor(.secondary)
