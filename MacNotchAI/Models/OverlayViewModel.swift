@@ -1,4 +1,4 @@
-import Foundation
+import SwiftUI
 import Combine
 
 /// Shared state that drives which stage the overlay is in.
@@ -51,11 +51,64 @@ class OverlayViewModel: ObservableObject {
     @Published var isDraggingOut = false
     /// Text typed into the custom-prompt field in the result column.
     @Published var customPrompt: String = ""
-    /// Jelly wobble scale driven by WaitingPillView, applied at OverlayView
-    /// level (outside clipShape) so the pill can overflow its layout frame
-    /// without being clipped.
+    /// Jelly wobble scale applied at OverlayView level (outside clipShape) so
+    /// the pill can overflow its layout frame without being clipped.
     @Published var jellyX: CGFloat = 1.0
     @Published var jellyY: CGFloat = 1.0
+
+    // ── Singleton jelly task ─────────────────────────────────────────────────
+    // Owned here — NOT in WaitingPillView — so only ONE task ever exists.
+    //
+    // Why this matters: dismissAnimated() fades the old window over 0.14 s.
+    // During that window the old WaitingPillView is still live and still
+    // observes isDragHovering. If the user starts a new drag immediately, a
+    // second WaitingPillView appears in the new window. Both views would fire
+    // their own animation tasks for the same isDragHovering change → two
+    // concurrent withAnimation{} blocks targeting jellyX/Y → SwiftUI
+    // invariant violation → _crashOnException.
+    //
+    // With the task stored here, startJellyHover() always cancels the running
+    // task before creating a new one. No matter how many view instances call
+    // it, exactly one task is alive at any time.
+    private var jellyTask: Task<Void, Never>?
+
+    func startJellyHover() {
+        jellyTask?.cancel()
+        jellyTask = Task { @MainActor in
+            do {
+                withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
+                    self.jellyX = 1.12; self.jellyY = 0.86
+                }
+                try await Task.sleep(nanoseconds: 130_000_000)
+
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
+                    self.jellyX = 0.94; self.jellyY = 1.09
+                }
+                try await Task.sleep(nanoseconds: 200_000_000)
+
+                var phase = false
+                while true {
+                    phase.toggle()
+                    withAnimation(.spring(response: 0.60, dampingFraction: 0.68)) {
+                        self.jellyX = phase ? 1.04 : 0.97
+                        self.jellyY = phase ? 0.97 : 1.03
+                    }
+                    try await Task.sleep(nanoseconds: 520_000_000)
+                }
+            } catch {
+                // Cancelled — do nothing. stopJellyHover() or reset() handles
+                // the return-to-neutral animation when appropriate.
+            }
+        }
+    }
+
+    func stopJellyHover() {
+        jellyTask?.cancel()
+        jellyTask = nil
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
+            jellyX = 1.0; jellyY = 1.0
+        }
+    }
 
     func setChips(url: URL) {
         stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
@@ -63,6 +116,8 @@ class OverlayViewModel: ObservableObject {
     }
 
     func reset() {
+        jellyTask?.cancel()
+        jellyTask      = nil
         stage          = .waitingForDrop
         isDragHovering = false
         isDraggingOut  = false

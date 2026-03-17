@@ -147,51 +147,17 @@ private struct WaitingPillView: View {
         // freely without hitting the window clip boundary.
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
-        // ── Hover jelly sequence ──────────────────────────────────────────────
-        // CRASH FIX: use 'try await' (NOT 'try?') for every Task.sleep.
-        // 'try?' swallows CancellationError so a cancelled task keeps running past
-        // the sleep as a zombie — a second task fires for the new isDragHovering
-        // value, and both call withAnimation{} on the same @Published properties
-        // simultaneously → SwiftUI invariant violation → _crashOnException.
-        // With plain 'try await', cancellation immediately throws, the do/catch
-        // exits cleanly, and only the new task owns the animation state.
-        .task(id: vm.isDragHovering) {
-            if !vm.isDragHovering {
-                // File left — spring back to neutral immediately (no sleep needed).
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.72)) {
-                    vm.jellyX = 1.0; vm.jellyY = 1.0
-                }
-                return
-            }
-
-            do {
-                // File entered — squash width, compress height (liquid impact)
-                withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
-                    vm.jellyX = 1.12; vm.jellyY = 0.86
-                }
-                try await Task.sleep(nanoseconds: 130_000_000)
-
-                // Spring back — overshoot height downward (liquid rebound)
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
-                    vm.jellyX = 0.94; vm.jellyY = 1.09
-                }
-                try await Task.sleep(nanoseconds: 200_000_000)
-
-                // Slow breathing oscillation while file hovers above
-                var phase = false
-                while true {
-                    phase.toggle()
-                    withAnimation(.spring(response: 0.60, dampingFraction: 0.68)) {
-                        vm.jellyX = phase ? 1.04 : 0.97
-                        vm.jellyY = phase ? 0.97 : 1.03
-                    }
-                    try await Task.sleep(nanoseconds: 520_000_000)
-                }
-            } catch {
-                // Task cancelled — isDragHovering changed again.
-                // The sibling task that fired for the new value owns the next
-                // animation state; do nothing here so the two tasks don't fight.
-            }
+        // ── Hover jelly — routed through ViewModel, never owned by this view ──
+        // The task lives in OverlayViewModel.jellyTask (a single stored Task).
+        // Using .task(id:) here would attach one task per WaitingPillView
+        // instance. During the 0.14 s dismiss animation both the old and new
+        // WaitingPillView are live simultaneously; both would fire their tasks
+        // for the same isDragHovering change → two concurrent withAnimation{}
+        // blocks on jellyX/Y → SwiftUI invariant violation → crash.
+        // With the task owned by the ViewModel, startJellyHover() always cancels
+        // the previous task first — only one task runs regardless of view count.
+        .onChange(of: vm.isDragHovering, initial: true) { _, hovering in
+            if hovering { vm.startJellyHover() } else { vm.stopJellyHover() }
         }
     }
 }
