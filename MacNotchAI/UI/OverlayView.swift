@@ -182,9 +182,7 @@ private struct ChipsColumnView: View {
 
     private func runAction(_ action: AIAction) {
         let vm = OverlayViewModel.shared
-        withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-            vm.stage = .loading(url: fileURL, action: action)
-        }
+        setStage(.loading(url: fileURL, action: action))
         Task {
             do {
                 let content: String = FileInspector.isImageFile(fileURL)
@@ -192,13 +190,19 @@ private struct ChipsColumnView: View {
                     : (try await FileContentExtractor.extract(from: fileURL))
                 let imageURL: URL? = FileInspector.isImageFile(fileURL) ? fileURL : nil
                 let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-                    vm.stage = .result(url: fileURL, action: action, text: text)
-                }
+                setStage(.result(url: fileURL, action: action, text: text))
             } catch {
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-                    vm.stage = .error(url: fileURL, message: error.localizedDescription)
-                }
+                setStage(.error(url: fileURL, message: error.localizedDescription))
+            }
+        }
+    }
+
+    /// Set stage safely: always deferred one runloop tick so the change
+    /// never fires inside an active AppKit or SwiftUI layout pass.
+    private func setStage(_ stage: OverlayViewModel.Stage) {
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.38, dampingFraction: 0.62)) {
+                OverlayViewModel.shared.stage = stage
             }
         }
     }
@@ -339,9 +343,7 @@ private struct TwoColumnView: View {
 
     private func runAction(_ action: AIAction) {
         vm.customPrompt = ""
-        withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-            vm.stage = .loading(url: fileURL, action: action)
-        }
+        setStage(.loading(url: fileURL, action: action))
         Task {
             do {
                 let content: String = FileInspector.isImageFile(fileURL)
@@ -349,13 +351,9 @@ private struct TwoColumnView: View {
                     : (try await FileContentExtractor.extract(from: fileURL))
                 let imageURL: URL? = FileInspector.isImageFile(fileURL) ? fileURL : nil
                 let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-                    vm.stage = .result(url: fileURL, action: action, text: text)
-                }
+                setStage(.result(url: fileURL, action: action, text: text))
             } catch {
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-                    vm.stage = .error(url: fileURL, message: error.localizedDescription)
-                }
+                setStage(.error(url: fileURL, message: error.localizedDescription))
             }
         }
     }
@@ -365,9 +363,7 @@ private struct TwoColumnView: View {
         guard !prompt.isEmpty else { return }
         let action = AIAction.summariseBullets
         vm.customPrompt = ""
-        withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-            vm.stage = .loading(url: fileURL, action: action)
-        }
+        setStage(.loading(url: fileURL, action: action))
         Task {
             do {
                 let fileContent: String = FileInspector.isImageFile(fileURL)
@@ -375,13 +371,18 @@ private struct TwoColumnView: View {
                     : "\(prompt)\n\n---\n\(try await FileContentExtractor.extract(from: fileURL))"
                 let imageURL: URL? = FileInspector.isImageFile(fileURL) ? fileURL : nil
                 let text = try await provider.complete(action: action, content: fileContent, imageURL: imageURL)
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-                    vm.stage = .result(url: fileURL, action: action, text: text)
-                }
+                setStage(.result(url: fileURL, action: action, text: text))
             } catch {
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.60)) {
-                    vm.stage = .error(url: fileURL, message: error.localizedDescription)
-                }
+                setStage(.error(url: fileURL, message: error.localizedDescription))
+            }
+        }
+    }
+
+    /// Deferred, animated stage change — never called inside an active layout pass.
+    private func setStage(_ stage: OverlayViewModel.Stage) {
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.38, dampingFraction: 0.62)) {
+                OverlayViewModel.shared.stage = stage
             }
         }
     }

@@ -79,8 +79,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         OverlayViewModel.shared.$stage
             .receive(on: DispatchQueue.main)
             .sink { [weak self] stage in
-                // Already on main — no inner dispatch (double-dispatch causes constraint loop crash)
-                self?.resizeOverlay(for: stage)
+                // Defer to the NEXT runloop cycle.
+                // The sink can fire while SwiftUI is mid-layout (the @Published change
+                // and the Combine delivery both happen on the main thread).
+                // Calling NSAnimationContext/animator().setFrame() from inside an active
+                // AppKit layout pass triggers the recursive "Update Constraints in Window"
+                // assertion → abort(). One async hop breaks that synchronous chain.
+                DispatchQueue.main.async { self?.resizeOverlay(for: stage) }
             }
             .store(in: &cancellables)
     }
