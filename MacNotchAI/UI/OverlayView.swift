@@ -205,7 +205,8 @@ private struct TwoColumnView: View {
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
 
-            // ── LEFT COLUMN ──────────────────────────────────────────────
+            // ── LEFT COLUMN — 219 pt ─────────────────────────────────────
+            // 219 + 1 (divider) + 280 = 500 = window width; no horizontal overflow
             VStack(alignment: .leading, spacing: 10) {
                 FileHeaderView(fileURL: fileURL)
 
@@ -228,14 +229,14 @@ private struct TwoColumnView: View {
                 Spacer(minLength: 0)
             }
             .padding(18)
-            .frame(width: 220, alignment: .topLeading)
+            .frame(width: 219, alignment: .topLeading)
 
             // ── DIVIDER ──────────────────────────────────────────────────
             Rectangle()
                 .fill(Color.white.opacity(0.08))
                 .frame(width: 1)
 
-            // ── RIGHT COLUMN ─────────────────────────────────────────────
+            // ── RIGHT COLUMN — 280 pt ────────────────────────────────────
             VStack(alignment: .leading, spacing: 12) {
 
                 Group {
@@ -307,7 +308,10 @@ private struct TwoColumnView: View {
             .frame(width: 280, alignment: .topLeading)
             .transition(.move(edge: .trailing).combined(with: .opacity))
         }
-        .frame(minHeight: 280)
+        // No minHeight — window sizing in AppDelegate owns the height.
+        // Forcing a minHeight here can exceed the window frame and let NSHostingView's
+        // rectangular clip override the SwiftUI RoundedRectangle clip (no corners).
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.spring(response: 0.32, dampingFraction: 0.78), value: vm.stage.showsRightColumn)
     }
 

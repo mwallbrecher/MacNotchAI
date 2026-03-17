@@ -43,9 +43,19 @@ class OverlayWindow: NSPanel {
 
     // MARK: - Positioning
 
-    /// Positions and resizes the window so its top edge is flush with the notch bottom.
-    /// Stage 1: centred under notch.
-    /// Stage 2/3: left column (220 pt) pinned at notch-centre − 110 pt; grows rightward.
+    /// Moves + resizes the window instantly (no animation).
+    /// Call this BEFORE show() so the window is never visible at screen origin.
+    func place(size: CGSize, anchorAtNotchCenter: Bool) {
+        guard let screen = NSScreen.main else { return }
+        let notchBottomY: CGFloat = 37
+        let y = screen.frame.height - notchBottomY - size.height
+        let x: CGFloat = anchorAtNotchCenter
+            ? (screen.frame.width / 2) - 110
+            : (screen.frame.width - size.width) / 2
+        setFrame(NSRect(origin: CGPoint(x: x, y: y), size: size), display: false)
+    }
+
+    /// Animates to a new size/position.  Used for stage transitions after the window is visible.
     func animateTo(size: CGSize, anchorAtNotchCenter: Bool) {
         guard let screen = NSScreen.main else { return }
 
@@ -61,9 +71,10 @@ class OverlayWindow: NSPanel {
 
         // Spring-feel cubic bezier — slight overshoot on expansion.
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration            = 0.32
-            ctx.timingFunction      = CAMediaTimingFunction(controlPoints: 0.34, 1.56, 0.64, 1.0)
-            ctx.allowsImplicitAnimation = true
+            ctx.duration       = 0.32
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.56, 0.64, 1.0)
+            // Do NOT set allowsImplicitAnimation — it recursively triggers layout passes
+            // and causes the "Update Constraints in Window" crash under rapid transitions.
             self.animator().setFrame(newFrame, display: true)
         }
     }

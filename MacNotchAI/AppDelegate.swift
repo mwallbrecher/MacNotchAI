@@ -64,7 +64,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         OverlayViewModel.shared.$stage
             .receive(on: DispatchQueue.main)
             .sink { [weak self] stage in
-                DispatchQueue.main.async { self?.resizeOverlay(for: stage) }
+                // Already on main — no inner dispatch (double-dispatch causes constraint loop crash)
+                self?.resizeOverlay(for: stage)
             }
             .store(in: &cancellables)
     }
@@ -74,15 +75,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func ensureOverlayVisible() {
         if overlayWindow == nil {
             let window = OverlayWindow()
-            // Use DroppableHostingView so the pill accepts real file drops.
             let hostingView = DroppableHostingView(
                 rootView: OverlayView(provider: resolveProvider())
             )
             window.contentView = hostingView
             overlayWindow = window
         }
+        // Pre-position at the notch synchronously BEFORE ordering front.
+        // Without this the window flashes at screen origin (0, 0) for one frame.
+        overlayWindow?.place(size: CGSize(width: 240, height: 68), anchorAtNotchCenter: false)
         overlayWindow?.show()
-        resizeOverlay(for: OverlayViewModel.shared.stage)
         startDismissMonitors()
     }
 
@@ -113,7 +115,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             anchorLeft = true
 
         case .loading:
-            size = CGSize(width: 500, height: 260)
+            size = CGSize(width: 500, height: 280)
             anchorLeft = true
 
         case .result(_, _, let text):
