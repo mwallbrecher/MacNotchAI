@@ -13,7 +13,7 @@ class OverlayWindow: NSPanel {
         level                       = .floating
         backgroundColor             = .clear
         isOpaque                    = false
-        hasShadow                   = false          // All shadow via SwiftUI; avoids NSPanel chrome ring
+        hasShadow                   = false
         isMovableByWindowBackground = false
         collectionBehavior          = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
@@ -25,7 +25,6 @@ class OverlayWindow: NSPanel {
 
     func show() {
         guard !isVisible else { return }
-        // SwiftUI entry animation starts from scale(y:~0), no need for alpha fade here.
         alphaValue = 1
         orderFront(nil)
     }
@@ -37,49 +36,42 @@ class OverlayWindow: NSPanel {
             self.animator().alphaValue = 0
         }) {
             self.orderOut(nil)
-            self.alphaValue = 1   // reset for next show
+            self.alphaValue = 1
         }
     }
 
     // MARK: - Positioning
 
-    /// Moves + resizes the window instantly (no animation).
-    /// Call this BEFORE show() so the window is never visible at screen origin.
+    /// Place the window at the correct notch position instantly — call BEFORE show().
     func place(size: CGSize, anchorAtNotchCenter: Bool) {
-        guard let screen = NSScreen.main else { return }
-        let notchBottomY: CGFloat = 37
-        let y = screen.frame.height - notchBottomY - size.height
-        let x: CGFloat = anchorAtNotchCenter
-            ? (screen.frame.width / 2) - 110
-            : (screen.frame.width - size.width) / 2
-        setFrame(NSRect(origin: CGPoint(x: x, y: y), size: size), display: false)
+        setFrame(notchFrame(for: size, anchorAtNotchCenter: anchorAtNotchCenter), display: false)
     }
 
-    /// Animates to a new size/position.  Used for stage transitions after the window is visible.
+    /// Resize and reposition the window instantly.
+    ///
+    /// We intentionally do NOT use NSAnimationContext / animator().setFrame() here.
+    /// The animated proxy drives the window frame through intermediate sizes at 60 fps;
+    /// AppKit runs a full constraint-solving layout pass on each intermediate frame.
+    /// When those intermediate sizes are inconsistent with the NSHostingView's fixed-width
+    /// SwiftUI subviews the solver cannot converge → recursive "Update Constraints in
+    /// Window" → abort().  All visual animation is handled by SwiftUI transitions and
+    /// spring modifiers inside the content view, so the instant frame change is invisible
+    /// to the user — they only see the black content shape morphing smoothly.
     func animateTo(size: CGSize, anchorAtNotchCenter: Bool) {
-        guard let screen = NSScreen.main else { return }
+        let newFrame = notchFrame(for: size, anchorAtNotchCenter: anchorAtNotchCenter)
+        guard frame != newFrame else { return }
+        setFrame(newFrame, display: true)
+    }
 
+    // MARK: - Private helpers
+
+    private func notchFrame(for size: CGSize, anchorAtNotchCenter: Bool) -> NSRect {
+        guard let screen = NSScreen.main else { return frame }
         let notchBottomY: CGFloat = 37
         let y = screen.frame.height - notchBottomY - size.height
-
         let x: CGFloat = anchorAtNotchCenter
             ? (screen.frame.width / 2) - 110
             : (screen.frame.width - size.width) / 2
-
-        let newFrame = NSRect(origin: CGPoint(x: x, y: y), size: size)
-        guard frame != newFrame else { return }
-
-        // Spring-feel cubic bezier — slight overshoot on expansion.
-        // IMPORTANT: do NOT use a bezier with a y-control-point > 1.0 (e.g. 1.56).
-        // An overshoot timing function drives the frame through an intermediate size
-        // larger than the target.  AppKit's constraint solver re-enters layout for
-        // every intermediate frame; when the frame briefly exceeds the target the
-        // solver loops → "Update Constraints in Window" assertion → abort().
-        // easeOut gives a fast start / smooth settle that still feels snappy.
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration       = 0.28
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            self.animator().setFrame(newFrame, display: true)
-        }
+        return NSRect(origin: CGPoint(x: x, y: y), size: size)
     }
 }

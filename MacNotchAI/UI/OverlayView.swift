@@ -208,129 +208,164 @@ private struct ChipsColumnView: View {
     }
 }
 
-// MARK: - Stage 3: Two-column layout
+// MARK: - Stage 3: Two-column layout (GeometryReader rebuild)
+//
+// Previous version used fixed pixel widths (219 + 1 + 280 = 500 pt hard-coded).
+// Any mismatch between those values and the actual NSHostingView width caused
+// NSHostingView's rectangular clip to win over the SwiftUI RoundedRectangle clip
+// AND caused NSAnimationContext frame animation to drive the window through
+// intermediate sizes where the fixed-width constraints couldn't be satisfied →
+// recursive "Update Constraints in Window" crash.
+//
+// This rebuild uses GeometryReader so the columns are always proportional to
+// whatever size the window actually is — no overflow, no fixed-width assumptions.
 
 private struct TwoColumnView: View {
     let fileURL: URL
     let provider: any AIProvider
     @ObservedObject private var vm = OverlayViewModel.shared
 
-    private var currentActions: [AIAction] {
-        FileInspector.suggestedActions(for: fileURL)
+    var body: some View {
+        GeometryReader { geo in
+            let totalW  = geo.size.width
+            let divW    = CGFloat(1)
+            let leftW   = floor(totalW * 0.42)
+            let rightW  = totalW - leftW - divW
+
+            HStack(alignment: .top, spacing: 0) {
+                leftColumn
+                    .frame(width: leftW, alignment: .topLeading)
+                    .clipped()
+
+                Color.white.opacity(0.08)
+                    .frame(width: divW)
+
+                rightColumn
+                    .frame(width: rightW, alignment: .topLeading)
+                    .clipped()
+            }
+            .frame(width: totalW, height: geo.size.height, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
+    // ── Left: file header + chip list ────────────────────────────────────────
 
-            // ── LEFT COLUMN — 219 pt ─────────────────────────────────────
-            // 219 + 1 (divider) + 280 = 500 = window width; no horizontal overflow
-            VStack(alignment: .leading, spacing: 10) {
-                FileHeaderView(fileURL: fileURL)
+    private var leftColumn: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            FileHeaderView(fileURL: fileURL)
 
-                Text("Suggested")
+            Text("Suggested")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.white.opacity(0.35))
+
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(FileInspector.suggestedActions(for: fileURL)) { action in
+                    ActionChip(
+                        title: action.rawValue,
+                        isLoading: {
+                            if case .loading(_, let a) = vm.stage { return a == action }
+                            return false
+                        }()
+                    ) { runAction(action) }
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(15)
+    }
+
+    // ── Right: result card + prompt field + follow-ups ────────────────────────
+
+    private var rightColumn: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            resultCard
+
+            TextField("Ask anything…", text: $vm.customPrompt)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(.white.opacity(0.75))
+                .padding(.horizontal, 11)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.07))
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .onSubmit { runCustomPrompt() }
+
+            if case .result = vm.stage {
+                Text("Follow up")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.white.opacity(0.35))
-                    .padding(.top, 2)
 
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(currentActions) { action in
-                        ActionChip(
-                            title: action.rawValue,
-                            isLoading: {
-                                if case .loading(_, let a) = vm.stage { return a == action }
-                                return false
-                            }()
-                        ) { runAction(action) }
+                    ForEach(followUpActions) { action in
+                        ActionChip(title: action.rawValue, isLoading: false) {
+                            runAction(action)
+                        }
                     }
                 }
-                Spacer(minLength: 0)
             }
-            .padding(18)
-            .frame(width: 219, alignment: .topLeading)
 
-            // ── DIVIDER ──────────────────────────────────────────────────
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-                .frame(width: 1)
-
-            // ── RIGHT COLUMN — 280 pt ────────────────────────────────────
-            VStack(alignment: .leading, spacing: 12) {
-
-                Group {
-                    switch vm.stage {
-                    case .loading:
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .scaleEffect(0.62)
-                                .tint(.white)
-                            Text("Thinking…")
-                                .font(.system(size: 13))
-                                .foregroundColor(.white.opacity(0.45))
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 80, alignment: .leading)
-
-                    case .result(_, _, let text):
-                        ScrollView {
-                            Text(text)
-                                .font(.system(size: 13))
-                                .foregroundColor(.white.opacity(0.88))
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(maxHeight: 220)
-
-                    case .error(_, let msg):
-                        Label(msg, systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(.orange.opacity(0.85))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                    default:
-                        EmptyView()
-                    }
-                }
-                .padding(12)
-                .background(Color.white.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-                // Custom prompt
-                TextField("Ask anything about this file…", text: $vm.customPrompt)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.75))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(Color.white.opacity(0.07))
-                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .onSubmit { runCustomPrompt() }
-
-                // Follow-up chips (only after a result)
-                if case .result = vm.stage {
-                    Text("Follow up")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.35))
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(followUpActions) { action in
-                            ActionChip(title: action.rawValue, isLoading: false) {
-                                runAction(action)
-                            }
-                        }
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(16)
-            .frame(width: 280, alignment: .topLeading)
-            .transition(.move(edge: .trailing).combined(with: .opacity))
+            Spacer(minLength: 0)
         }
-        // No minHeight — window sizing in AppDelegate owns the height.
-        // Forcing a minHeight here can exceed the window frame and let NSHostingView's
-        // rectangular clip override the SwiftUI RoundedRectangle clip (no corners).
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: vm.stage.showsRightColumn)
+        .padding(14)
     }
+
+    // ── Result / loading / error card ─────────────────────────────────────────
+
+    @ViewBuilder
+    private var resultCard: some View {
+        switch vm.stage {
+        case .loading:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .scaleEffect(0.62)
+                    .tint(.white)
+                Text("Thinking…")
+                    .font(.system(size: 13))
+                    .foregroundColor(.white.opacity(0.45))
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+            .background(Color.white.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+        case .result(_, _, let text):
+            ScrollView(.vertical, showsIndicators: true) {
+                Text(text)
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.white.opacity(0.88))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+            }
+            .frame(maxHeight: 200)
+            .background(Color.white.opacity(0.05))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+        case .error(_, let msg):
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 13))
+                Text(msg)
+                    .font(.system(size: 12))
+                    .foregroundColor(.white.opacity(0.80))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.orange.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+        default:
+            EmptyView()
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
     private var followUpActions: [AIAction] {
         guard case .result(_, let action, _) = vm.stage else { return [] }
@@ -346,11 +381,11 @@ private struct TwoColumnView: View {
         setStage(.loading(url: fileURL, action: action))
         Task {
             do {
-                let content: String = FileInspector.isImageFile(fileURL)
+                let content = FileInspector.isImageFile(fileURL)
                     ? "Analyse the attached image."
                     : (try await FileContentExtractor.extract(from: fileURL))
-                let imageURL: URL? = FileInspector.isImageFile(fileURL) ? fileURL : nil
-                let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
+                let imgURL = FileInspector.isImageFile(fileURL) ? fileURL : nil
+                let text   = try await provider.complete(action: action, content: content, imageURL: imgURL)
                 setStage(.result(url: fileURL, action: action, text: text))
             } catch {
                 setStage(.error(url: fileURL, message: error.localizedDescription))
@@ -366,11 +401,11 @@ private struct TwoColumnView: View {
         setStage(.loading(url: fileURL, action: action))
         Task {
             do {
-                let fileContent: String = FileInspector.isImageFile(fileURL)
-                    ? "Analyse the attached image as requested: \(prompt)"
+                let body = FileInspector.isImageFile(fileURL)
+                    ? "Analyse as requested: \(prompt)"
                     : "\(prompt)\n\n---\n\(try await FileContentExtractor.extract(from: fileURL))"
-                let imageURL: URL? = FileInspector.isImageFile(fileURL) ? fileURL : nil
-                let text = try await provider.complete(action: action, content: fileContent, imageURL: imageURL)
+                let imgURL = FileInspector.isImageFile(fileURL) ? fileURL : nil
+                let text   = try await provider.complete(action: action, content: body, imageURL: imgURL)
                 setStage(.result(url: fileURL, action: action, text: text))
             } catch {
                 setStage(.error(url: fileURL, message: error.localizedDescription))
@@ -378,7 +413,7 @@ private struct TwoColumnView: View {
         }
     }
 
-    /// Deferred, animated stage change — never called inside an active layout pass.
+    /// Always deferred one runloop tick — never called during an active layout pass.
     private func setStage(_ stage: OverlayViewModel.Stage) {
         DispatchQueue.main.async {
             withAnimation(.spring(response: 0.38, dampingFraction: 0.62)) {
