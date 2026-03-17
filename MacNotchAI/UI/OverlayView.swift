@@ -307,6 +307,13 @@ private struct TwoColumnView: View {
             }
 
             Spacer(minLength: 0)
+
+            // Handoff button — visible once we have a result
+            if case .result(let url, let act, let text) = vm.stage {
+                HandoffButton(fileURL: url, action: act, result: text)
+                    .padding(.top, 4)
+                    .transition(.opacity.animation(.easeInOut(duration: 0.18)))
+            }
         }
         .padding(14)
     }
@@ -490,6 +497,58 @@ private struct CloseButton: View {
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.12), value: isHovered)
+    }
+}
+
+// MARK: - Handoff button
+
+/// "Continue in [Provider]" — copies context + opens the AI app.
+/// Morphs into a ✓ confirmation pill for 2 seconds after tapping.
+private struct HandoffButton: View {
+    let fileURL: URL
+    let action: AIAction
+    let result: String
+
+    @State private var didTap = false
+
+    var body: some View {
+        Button {
+            guard !didTap else { return }
+            HandoffManager.handOff(fileURL: fileURL, action: action, result: result)
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.72)) { didTap = true }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { didTap = false }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: didTap ? "checkmark" : HandoffManager.providerIcon())
+                    .font(.system(size: 9, weight: .bold))
+                    .contentTransition(.symbolEffect(.replace))
+
+                Text(didTap
+                     ? "Copied · check clipboard"
+                     : "Continue in \(HandoffManager.providerName())")
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+
+                if !didTap {
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 9, weight: .semibold))
+                }
+            }
+            .foregroundColor(.white.opacity(didTap ? 1.0 : 0.45))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: .infinity)
+            .background(
+                didTap
+                    ? Color.green.opacity(0.18)
+                    : Color.white.opacity(0.05)
+            )
+            .clipShape(Capsule(style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .animation(.spring(response: 0.25, dampingFraction: 0.72), value: didTap)
     }
 }
 
