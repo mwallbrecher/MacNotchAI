@@ -10,24 +10,29 @@ class DragMonitor: ObservableObject {
 
     @Published var isDraggingFile = false
 
-    private var dragMonitor:   Any?
+    private var dragMonitor:    Any?
     private var mouseUpMonitor: Any?
+
+    // ── Drag-end polling ─────────────────────────────────────────────────────
+    // NSEvent.addGlobalMonitorForEvents(.leftMouseUp) is NOT delivered during
+    // an active AppKit drag session because macOS runs the drag in the special
+    // .eventTracking runloop mode which silences .default-mode global monitors.
+    // A Timer added to .common mode fires in EVERY mode (default, eventTracking,
+    // modalPanel) and polls the drag pasteboard — when it empties the drag ended.
+    private var pollTimer: Timer?
 
     private init() {}
 
     func startMonitoring() {
-        // Global event callbacks already fire on the main thread.
-        // Use MainActor.assumeIsolated instead of Task { @MainActor in … }
-        // so there is ZERO async hop — the overlay appears on the very same
-        // runloop turn as the first drag event, not one cycle later.
+        // Global drag callbacks already fire on the main thread.
+        // MainActor.assumeIsolated gives ZERO async hop — pill appears on the
+        // very same runloop turn as the first drag event.
         dragMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { event in
             MainActor.assumeIsolated { DragMonitor.shared.handleDrag(event) }
         }
 
-        // 150 ms delay before clearing isDraggingFile on mouseUp.
-        // This gives performDragOperation time to fire and change the stage
-        // (it fires synchronously before mouseUp) AND gives the user time to
-        // start a second drag immediately without the pill disappearing.
+        // mouseUp monitor kept as a fast-path fallback for non-drag-session
+        // mouse releases (e.g. user clicks and barely moves).
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 MainActor.assumeIsolated { DragMonitor.shared.handleMouseUp() }
@@ -40,26 +45,60 @@ class DragMonitor: ObservableObject {
         if let m = mouseUpMonitor { NSEvent.removeMonitor(m) }
         dragMonitor    = nil
         mouseUpMonitor = nil
+        stopPolling()
     }
 
     /// Called by DroppableHostingView immediately after a successful drop.
     func dragCompleted() {
         isDraggingFile = false
+        stopPolling()
     }
 
-    // MARK: - Private
+    // MARK: - Private – event handlers
 
     private func handleDrag(_ event: NSEvent) {
-        isDraggingFile = hasFile(on: NSPasteboard(name: .drag))
+        let hasDrag = hasFile(on: NSPasteboard(name: .drag))
+        if hasDrag, !isDraggingFile {
+            isDraggingFile = true
+            startPolling()      // begin pasteboard-polling so we detect drag-end
+        } else if !hasDrag {
+            isDraggingFile = false
+            stopPolling()
+        }
     }
 
     private func handleMouseUp() {
-        // If the drop was caught (dragCompleted already fired) or a new drag
-        // has started (isDraggingFile flipped back to true via handleDrag),
-        // AppDelegate.observeDragState guards against a spurious hideOverlay()
-        // using the isDraggingFile flag at the time it runs.
         isDraggingFile = false
+        stopPolling()
     }
+
+    // MARK: - Private – drag-end polling
+
+    /// Starts a timer that fires in .common runloop mode (works even inside
+    /// AppKit's .eventTracking modal drag loop) and clears isDraggingFile
+    /// the moment the drag pasteboard empties.
+    private func startPolling() {
+        stopPolling()
+        let t = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            // Timer fires on the main runloop; MainActor.assumeIsolated is safe.
+            MainActor.assumeIsolated {
+                if !self.hasFile(on: NSPasteboard(name: .drag)) {
+                    self.isDraggingFile = false
+                    self.stopPolling()
+                }
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)   // .common = fires in ALL modes
+        pollTimer = t
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    // MARK: - Private – pasteboard inspection
 
     private func hasFile(on pasteboard: NSPasteboard) -> Bool {
         if let urls = pasteboard.readObjects(

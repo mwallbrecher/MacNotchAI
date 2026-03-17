@@ -57,8 +57,19 @@ struct OverlayView: View {
         }
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-        // Shadow only here — NSPanel.hasShadow = false prevents chrome ring artifact
-        .shadow(color: .black.opacity(0.65), radius: 28, x: 0, y: 10)
+        // compositingGroup() rasterises the clipped shape into a bitmap BEFORE
+        // the shadow is computed, so the shadow traces the rounded pill/card
+        // outline rather than the rectangular bounding box of the view.
+        .compositingGroup()
+        // Stage 1 (pill) lives right under the dark notch — no shadow needed,
+        // and any shadow there creates a visible dark rectangle around the pill.
+        // Stages 2/3 (card) need a gentle lift shadow against the screen content.
+        .shadow(
+            color:  vm.stage.tag == 0 ? .clear : .black.opacity(0.45),
+            radius: vm.stage.tag == 0 ? 0      : 18,
+            x: 0,
+            y:      vm.stage.tag == 0 ? 0      : 8
+        )
         // Liquid entry scale (shrinks to ~0 height at notch, then drops down)
         .scaleEffect(x: dropX, y: dropY, anchor: .top)
         // Drive corner-radius morph and stage content transitions with same spring
