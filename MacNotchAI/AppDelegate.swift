@@ -55,7 +55,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 } else {
                     if case .waitingForDrop = vm.stage {
-                        // Drag ended without dropping on our pill — dismiss pill.
+                        // ── "Can't reopen" fix ───────────────────────────────────
+                        // isDraggingFile can become false from two sources:
+                        //   a) dragCompleted() — drop WAS caught (stage already .chips → branch not reached)
+                        //   b) handleMouseUp()  — drag ended without a catch, OR the user
+                        //      immediately started a SECOND drag (isDraggingFile flipped back to true).
+                        // Guard against case (b): if a new drag has already started by the
+                        // time this sink fires, keep the pill visible instead of hiding it.
+                        guard !DragMonitor.shared.isDraggingFile else { return }
                         self.hideOverlay()
                     } else if vm.isDraggingOut {
                         // User dragged the file OUT of the shelf — close session.

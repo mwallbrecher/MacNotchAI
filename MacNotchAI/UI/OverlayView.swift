@@ -65,16 +65,19 @@ struct OverlayView: View {
         .animation(.spring(response: 0.38, dampingFraction: 0.60), value: cornerRadius)
         .animation(.spring(response: 0.38, dampingFraction: 0.60), value: vm.stage.tag)
         // ── Entry sequence ─────────────────────────────────────────────────
+        // Two phases but compressed so the pill is VISUALLY PRESENT within ~80 ms.
+        // The window is always ready to accept drops from the moment show() fires;
+        // this animation is purely cosmetic, not a gating concern.
         .task {
-            // Phase 1 — 80 ms: horizontal spread (like the notch mouth opening)
-            withAnimation(.spring(response: 0.18, dampingFraction: 0.72)) {
-                dropX = 1.08     // slightly wider than final → overshoot
-                dropY = 0.28
+            // Phase 1 — horizontal spread (notch mouth opening), very fast
+            withAnimation(.spring(response: 0.12, dampingFraction: 0.70)) {
+                dropX = 1.06
+                dropY = 0.42
             }
-            try? await Task.sleep(nanoseconds: 90_000_000)
+            try? await Task.sleep(nanoseconds: 35_000_000)  // 35 ms (was 90 ms)
 
-            // Phase 2 — liquid drop: low damping gives 2-3 bounces
-            withAnimation(.spring(response: 0.46, dampingFraction: 0.50)) {
+            // Phase 2 — liquid drop with gentle bounce; faster response than before
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.56)) {
                 dropX = 1.0
                 dropY = 1.0
             }

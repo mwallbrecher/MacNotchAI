@@ -3,26 +3,34 @@ import Combine
 
 /// Watches for file drags anywhere on screen.
 /// Only publishes `isDraggingFile`; the actual stage transition (Stage 1 → 2)
-/// is now handled by DroppableHostingView via NSDraggingDestination,
-/// so there is no more "near top" heuristic.
+/// is handled by DroppableHostingView via NSDraggingDestination.
 @MainActor
 class DragMonitor: ObservableObject {
     static let shared = DragMonitor()
 
     @Published var isDraggingFile = false
 
-    private var dragMonitor:  Any?
+    private var dragMonitor:   Any?
     private var mouseUpMonitor: Any?
 
     private init() {}
 
     func startMonitoring() {
+        // Global event callbacks already fire on the main thread.
+        // Use MainActor.assumeIsolated instead of Task { @MainActor in … }
+        // so there is ZERO async hop — the overlay appears on the very same
+        // runloop turn as the first drag event, not one cycle later.
         dragMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { event in
-            Task { @MainActor in DragMonitor.shared.handleDrag(event) }
+            MainActor.assumeIsolated { DragMonitor.shared.handleDrag(event) }
         }
+
+        // 150 ms delay before clearing isDraggingFile on mouseUp.
+        // This gives performDragOperation time to fire and change the stage
+        // (it fires synchronously before mouseUp) AND gives the user time to
+        // start a second drag immediately without the pill disappearing.
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                Task { @MainActor in DragMonitor.shared.handleMouseUp() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                MainActor.assumeIsolated { DragMonitor.shared.handleMouseUp() }
             }
         }
     }
@@ -34,8 +42,7 @@ class DragMonitor: ObservableObject {
         mouseUpMonitor = nil
     }
 
-    /// Called by DroppableHostingView after a successful drop so the pill
-    /// disappears immediately without waiting for the mouseUp event.
+    /// Called by DroppableHostingView immediately after a successful drop.
     func dragCompleted() {
         isDraggingFile = false
     }
@@ -47,8 +54,10 @@ class DragMonitor: ObservableObject {
     }
 
     private func handleMouseUp() {
-        // If the file was dropped on our view, dragCompleted() already cleared
-        // isDraggingFile.  If the user dropped elsewhere, clear it now.
+        // If the drop was caught (dragCompleted already fired) or a new drag
+        // has started (isDraggingFile flipped back to true via handleDrag),
+        // AppDelegate.observeDragState guards against a spurious hideOverlay()
+        // using the isDraggingFile flag at the time it runs.
         isDraggingFile = false
     }
 
