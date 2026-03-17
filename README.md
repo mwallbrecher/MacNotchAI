@@ -198,6 +198,12 @@ MacNotchAI/
 
 ---
 
+## Built With
+
+All product decisions, architecture direction, and design were made by [@mwallbrecher](https://github.com/mwallbrecher). [Claude Code](https://claude.ai/code) (Anthropic) was used as an AI pair programmer during development.
+
+---
+
 ## License
 
 MIT — do whatever you want with it.
