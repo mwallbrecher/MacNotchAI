@@ -4,56 +4,76 @@ class OverlayWindow: NSPanel {
 
     init() {
         super.init(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 280),
-            styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
-            backing: .buffered,
-            defer: false
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 68),
+            styleMask:   [.nonactivatingPanel, .fullSizeContentView, .borderless],
+            backing:     .buffered,
+            defer:       false
         )
-
-        self.isFloatingPanel = true
-        self.level = .floating
-        // The SwiftUI view provides the black background and corner radius.
-        // Keeping the window itself clear lets the shadow render correctly.
-        self.backgroundColor = .clear
-        self.isOpaque = false
-        self.hasShadow = true
-        self.isMovableByWindowBackground = false
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        isFloatingPanel          = true
+        level                    = .floating
+        backgroundColor          = .clear
+        isOpaque                 = false
+        hasShadow                = true
+        isMovableByWindowBackground = false
+        collectionBehavior       = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
 
-    // CRITICAL: do not steal keyboard focus from the user's current app
-    override var canBecomeKey: Bool { false }
+    // Allow becoming key so text fields inside the panel can receive input.
+    // The .nonactivatingPanel style mask still prevents the app from activating,
+    // so the user's current app keeps its focus visually.
+    override var canBecomeKey:  Bool { true }
     override var canBecomeMain: Bool { false }
 
-    func showAtTopCenter() {
-        guard let screen = NSScreen.main else { return }
-        let screenWidth = screen.frame.width
-        let screenHeight = screen.frame.height
+    // MARK: - Show / hide
 
-        // Flush the top edge of the panel with the bottom of the notch (~37pt).
-        // On Macs without a notch this still anchors sensibly near the top.
-        let notchBottomY: CGFloat = 37
-        let panelTopY = screenHeight - notchBottomY
-        let x = (screenWidth - frame.width) / 2
-        let y = panelTopY - frame.height // panel hangs downward from notch
-
-        setFrameOrigin(NSPoint(x: x, y: y))
-
+    func show() {
+        guard !isVisible else { return }
         alphaValue = 0
         orderFront(nil)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             self.animator().alphaValue = 1.0
         }
     }
 
     func dismissAnimated() {
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.12
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
             self.animator().alphaValue = 0
         }) {
             self.orderOut(nil)
+        }
+    }
+
+    // MARK: - Positioning
+
+    /// Move + resize the window so its top edge sits flush with the notch.
+    /// For Stage 1 the panel is horizontally centered.
+    /// For Stage 2/3 the LEFT edge of the left column is pinned to notch-center - 110pt,
+    /// so the panel grows to the right as the result column slides in.
+    func animateTo(size: CGSize, anchorAtNotchCenter: Bool) {
+        guard let screen = NSScreen.main else { return }
+
+        let notchBottomY: CGFloat = 37
+        let y = screen.frame.height - notchBottomY - size.height
+
+        let x: CGFloat
+        if anchorAtNotchCenter {
+            // Left column (220pt wide) centred at notch — panel grows rightward.
+            x = (screen.frame.width / 2) - 110
+        } else {
+            // Pill centred under notch.
+            x = (screen.frame.width - size.width) / 2
+        }
+
+        let newFrame = NSRect(origin: CGPoint(x: x, y: y), size: size)
+        guard frame != newFrame else { return }
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.22
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            self.animator().setFrame(newFrame, display: true)
         }
     }
 }
