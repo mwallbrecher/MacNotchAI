@@ -2,10 +2,13 @@ import SwiftUI
 
 struct SettingsView: View {
     @AppStorage("selectedProvider") private var selectedProvider = AIProviderType.groq.rawValue
-    @State private var groqKey = ""
-    @State private var anthropicKey = ""
-    @State private var openAIKey = ""
+    @State private var apiKey = ""
     @State private var ollamaAvailable = false
+    @State private var saved = false
+
+    private var selectedType: AIProviderType {
+        AIProviderType(rawValue: selectedProvider) ?? .groq
+    }
 
     var body: some View {
         Form {
@@ -16,44 +19,50 @@ struct SettingsView: View {
                     }
                 }
                 .pickerStyle(.radioGroup)
-            }
-
-            Section("API Keys (stored securely in Keychain)") {
-                if selectedProvider == AIProviderType.groq.rawValue {
-                    LabeledContent("Groq API Key") {
-                        SecureField("gsk_...", text: $groqKey)
-                            .onSubmit {
-                                KeychainManager.shared.save(key: groqKey, service: "com.aidrop.groq")
-                            }
-                    }
-                    Link("Get a free Groq key →", destination: URL(string: "https://console.groq.com")!)
-                        .font(.caption)
-                }
-
-                if selectedProvider == AIProviderType.anthropic.rawValue {
-                    LabeledContent("Anthropic API Key") {
-                        SecureField("sk-ant-...", text: $anthropicKey)
-                            .onSubmit {
-                                KeychainManager.shared.save(key: anthropicKey, service: "com.aidrop.anthropic")
-                            }
-                    }
-                    Link("Get an Anthropic key →", destination: URL(string: "https://console.anthropic.com")!)
-                        .font(.caption)
-                }
-
-                if selectedProvider == AIProviderType.openai.rawValue {
-                    LabeledContent("OpenAI API Key") {
-                        SecureField("sk-...", text: $openAIKey)
-                            .onSubmit {
-                                KeychainManager.shared.save(key: openAIKey, service: "com.aidrop.openai")
-                            }
-                    }
-                    Link("Get an OpenAI key →", destination: URL(string: "https://platform.openai.com")!)
-                        .font(.caption)
+                .onChange(of: selectedProvider) { _ in
+                    apiKey = KeychainManager.shared.load(service: keychainService(for: selectedType)) ?? ""
+                    saved = false
                 }
             }
 
-            if selectedProvider == AIProviderType.ollama.rawValue {
+            if selectedType != .ollama {
+                Section("API Key (stored securely in Keychain)") {
+                    SecureField(placeholder(for: selectedType), text: $apiKey)
+
+                    HStack {
+                        Button("Save Key") {
+                            KeychainManager.shared.save(
+                                key: apiKey.trimmingCharacters(in: .whitespaces),
+                                service: keychainService(for: selectedType)
+                            )
+                            saved = true
+                        }
+                        .disabled(apiKey.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                        if saved {
+                            Label("Saved", systemImage: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                                .font(.caption)
+                        }
+
+                        Spacer()
+
+                        switch selectedType {
+                        case .groq:
+                            Link("Get a free Groq key →", destination: URL(string: "https://console.groq.com")!)
+                                .font(.caption)
+                        case .anthropic:
+                            Link("Get an Anthropic key →", destination: URL(string: "https://console.anthropic.com")!)
+                                .font(.caption)
+                        case .openai:
+                            Link("Get an OpenAI key →", destination: URL(string: "https://platform.openai.com/api-keys")!)
+                                .font(.caption)
+                        case .ollama:
+                            EmptyView()
+                        }
+                    }
+                }
+            } else {
                 Section("Ollama (Local)") {
                     HStack {
                         Circle()
@@ -73,15 +82,29 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 450)
+        .frame(width: 420)
         .padding()
-        .onAppear(perform: loadSavedKeys)
+        .onAppear {
+            apiKey = KeychainManager.shared.load(service: keychainService(for: selectedType)) ?? ""
+        }
     }
 
-    private func loadSavedKeys() {
-        groqKey      = KeychainManager.shared.load(service: "com.aidrop.groq") ?? ""
-        anthropicKey = KeychainManager.shared.load(service: "com.aidrop.anthropic") ?? ""
-        openAIKey    = KeychainManager.shared.load(service: "com.aidrop.openai") ?? ""
+    private func keychainService(for type: AIProviderType) -> String {
+        switch type {
+        case .groq:      return "com.aidrop.groq"
+        case .anthropic: return "com.aidrop.anthropic"
+        case .openai:    return "com.aidrop.openai"
+        case .ollama:    return "com.aidrop.ollama"
+        }
+    }
+
+    private func placeholder(for type: AIProviderType) -> String {
+        switch type {
+        case .groq:      return "gsk_..."
+        case .anthropic: return "sk-ant-..."
+        case .openai:    return "sk-..."
+        case .ollama:    return ""
+        }
     }
 }
 

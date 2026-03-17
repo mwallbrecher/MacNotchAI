@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct MenuBarView: View {
     var body: some View {
@@ -8,6 +9,12 @@ struct MenuBarView: View {
                 .padding(.bottom, 4)
 
             Divider()
+
+            Button("AI Setup...") {
+                if let delegate = NSApp.delegate as? AppDelegate {
+                    delegate.showOnboarding()
+                }
+            }
 
             Button("Settings...") {
                 NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
