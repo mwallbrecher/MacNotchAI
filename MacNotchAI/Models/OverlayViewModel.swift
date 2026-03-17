@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// Shared state that drives which stage the overlay is in.
 /// AppDelegate writes to it; OverlayView reads from it.

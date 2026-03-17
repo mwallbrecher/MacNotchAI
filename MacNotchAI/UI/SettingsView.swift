@@ -69,11 +69,7 @@ struct SettingsView: View {
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
                 }
-                .task {
-                    ollamaAvailable = await Task.detached {
-                        OllamaProvider().isAvailable
-                    }.value
-                }
+                .task { ollamaAvailable = await isOllamaRunning() }
             }
         }
         .formStyle(.grouped)
@@ -86,5 +82,19 @@ struct SettingsView: View {
         groqKey      = KeychainManager.shared.load(service: "com.aidrop.groq") ?? ""
         anthropicKey = KeychainManager.shared.load(service: "com.aidrop.anthropic") ?? ""
         openAIKey    = KeychainManager.shared.load(service: "com.aidrop.openai") ?? ""
+    }
+}
+
+/// Checks whether Ollama is running by pinging its health endpoint.
+/// Uses proper async/await instead of a blocking semaphore.
+private func isOllamaRunning() async -> Bool {
+    guard let url = URL(string: "http://localhost:11434/api/tags") else { return false }
+    var request = URLRequest(url: url, timeoutInterval: 1.5)
+    request.httpMethod = "GET"
+    do {
+        let (_, response) = try await URLSession.shared.data(for: request)
+        return (response as? HTTPURLResponse)?.statusCode == 200
+    } catch {
+        return false
     }
 }
