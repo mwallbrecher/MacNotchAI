@@ -13,6 +13,8 @@ final class AnthropicProvider: AIProvider {
     var isAvailable: Bool { !apiKey.isEmpty }
 
     func complete(action: AIAction, content: String, imageURL: URL?) async throws -> String {
+        guard isAvailable else { throw AIError.noAPIKey(provider: name) }
+
         var request = URLRequest(url: URL(string: baseURL)!)
         request.httpMethod = "POST"
         request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
@@ -44,9 +46,12 @@ final class AnthropicProvider: AIProvider {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, _) = try await URLSession.shared.data(for: request)
-        let response = try JSONDecoder().decode(AnthropicResponse.self, from: data)
-        return response.content.first?.text ?? "No response"
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+            throw AIError.apiError(data.apiErrorMessage() ?? "HTTP \(http.statusCode)")
+        }
+        let decoded = try JSONDecoder().decode(AnthropicResponse.self, from: data)
+        return decoded.content.first?.text ?? "No response"
     }
 
     private func mimeType(for url: URL) -> String {

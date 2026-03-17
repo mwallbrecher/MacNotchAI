@@ -33,6 +33,8 @@ class OverlayViewModel: ObservableObject {
     }
 
     @Published var stage: Stage = .waitingForDrop
+    /// True while a file is physically dragged over the Stage-1 pill.
+    @Published var isDragHovering = false
     /// Text typed into the custom-prompt field in the result column.
     @Published var customPrompt: String = ""
 
