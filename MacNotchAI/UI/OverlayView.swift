@@ -6,6 +6,14 @@ struct OverlayView: View {
     @ObservedObject private var vm = OverlayViewModel.shared
     let provider: any AIProvider
 
+    /// Pill-shaped when waiting; card-shaped once content appears.
+    private var cornerRadius: CGFloat {
+        switch vm.stage {
+        case .waitingForDrop: return 34
+        default:              return 20
+        }
+    }
+
     var body: some View {
         Group {
             switch vm.stage {
@@ -26,8 +34,9 @@ struct OverlayView: View {
             }
         }
         .background(Color.black)
-        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .shadow(color: .black.opacity(0.55), radius: 24, y: 12)
+        .animation(.spring(response: 0.30, dampingFraction: 0.75), value: cornerRadius)
     }
 }
 

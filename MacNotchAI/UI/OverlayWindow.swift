@@ -71,8 +71,9 @@ class OverlayWindow: NSPanel {
         guard frame != newFrame else { return }
 
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.22
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ctx.duration = 0.30
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.34, 1.56, 0.64, 1.0) // spring feel
+            ctx.allowsImplicitAnimation = true
             self.animator().setFrame(newFrame, display: true)
         }
     }

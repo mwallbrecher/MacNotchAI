@@ -1,5 +1,4 @@
 import SwiftUI
-import AppKit
 
 struct MenuBarView: View {
     var body: some View {
@@ -11,9 +10,7 @@ struct MenuBarView: View {
             Divider()
 
             Button("AI Setup...") {
-                if let delegate = NSApp.delegate as? AppDelegate {
-                    delegate.showOnboarding()
-                }
+                NotificationCenter.default.post(name: .showOnboarding, object: nil)
             }
 
             Button("Settings...") {

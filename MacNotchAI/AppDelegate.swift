@@ -17,12 +17,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         observeDragState()
         observeStageChanges()
 
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleShowOnboarding),
+            name: .showOnboarding, object: nil
+        )
+
         // Show onboarding on very first launch.
         if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self.showOnboarding()
             }
         }
+    }
+
+    @objc private func handleShowOnboarding() {
+        showOnboarding()
     }
 
     // MARK: - Drag observation
@@ -80,6 +89,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func hideOverlay() {
         stopDismissMonitors()
         overlayWindow?.dismissAnimated()
+        overlayWindow = nil   // recreate next drag so provider is always fresh
         OverlayViewModel.shared.reset()
     }
 
@@ -187,6 +197,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
     }
+}
+
+// MARK: - Notification names
+
+extension Notification.Name {
+    static let showOnboarding = Notification.Name("com.aidrop.showOnboarding")
 }
 
 // MARK: - Provider resolution
