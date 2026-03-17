@@ -41,6 +41,14 @@ Secrets.plist
 *api_key*
 *credentials*
 
+# ── Claude Code ───────────────────────────────────────────────────────────────
+# .claude/ contains Claude Code session data, conversation history, and
+# temporary git worktrees. Like .vscode/ or .cursor/, it is local tooling
+# and should not be committed.
+# CLAUDE.md (the project brief) is intentionally tracked — it gives future
+# AI sessions the full architectural context automatically.
+.claude/
+
 # ── Editor / OS artefacts ──────────────────────────────────────────────────────
 *.swp
 *.swo
