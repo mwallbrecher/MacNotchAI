@@ -30,6 +30,17 @@ class OverlayViewModel: ObservableObject {
             default: return nil
             }
         }
+
+        /// Stable integer used as SwiftUI animation value driver on stage changes.
+        var tag: Int {
+            switch self {
+            case .waitingForDrop: return 0
+            case .chips:          return 1
+            case .loading:        return 2
+            case .result:         return 3
+            case .error:          return 4
+            }
+        }
     }
 
     @Published var stage: Stage = .waitingForDrop
@@ -44,7 +55,8 @@ class OverlayViewModel: ObservableObject {
     }
 
     func reset() {
-        stage = .waitingForDrop
+        stage        = .waitingForDrop
+        isDragHovering = false
         customPrompt = ""
     }
 }
