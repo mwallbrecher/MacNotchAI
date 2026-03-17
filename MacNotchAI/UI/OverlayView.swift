@@ -43,30 +43,28 @@ struct OverlayView: View {
                     .transition(.identity)
 
             default:
-                ZStack(alignment: .topTrailing) {
-                    Group {
-                        switch vm.stage {
-                        case .chips(let url, let actions):
-                            ChipsColumnView(fileURL: url, actions: actions, provider: provider)
-                                .transition(.asymmetric(
-                                    insertion: .scale(scale: 0.88, anchor: .top)
-                                        .combined(with: .opacity),
-                                    removal: .scale(scale: 0.92, anchor: .top)
-                                        .combined(with: .opacity)
-                                ))
-                        case .loading(let url, _), .result(let url, _, _), .error(let url, _):
-                            TwoColumnView(fileURL: url, provider: provider)
-                                .transition(.asymmetric(
-                                    insertion: .move(edge: .trailing).combined(with: .opacity),
-                                    removal: .opacity
-                                ))
-                        default:
-                            EmptyView()
-                        }
+                // No ZStack overlay — CloseButton lives inside FileHeaderView
+                // so it is part of the layout flow and can never be obscured
+                // by a ScrollView scrollbar or any other sibling view.
+                Group {
+                    switch vm.stage {
+                    case .chips(let url, let actions):
+                        ChipsColumnView(fileURL: url, actions: actions, provider: provider)
+                            .transition(.asymmetric(
+                                insertion: .scale(scale: 0.88, anchor: .top)
+                                    .combined(with: .opacity),
+                                removal: .scale(scale: 0.92, anchor: .top)
+                                    .combined(with: .opacity)
+                            ))
+                    case .loading(let url, _), .result(let url, _, _), .error(let url, _):
+                        TwoColumnView(fileURL: url, provider: provider)
+                            .transition(.asymmetric(
+                                insertion: .move(edge: .trailing).combined(with: .opacity),
+                                removal: .opacity
+                            ))
+                    default:
+                        EmptyView()
                     }
-                    CloseButton()
-                        .padding(10)
-                        .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                 }
                 .background(Color.black)
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -475,7 +473,13 @@ private struct FileHeaderView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundColor(.white)
                 .lineLimit(1)
+
             Spacer()
+
+            // Close button is part of the header row — never overlaid on top
+            // of other content.  Sitting here it can't be obscured by a
+            // ScrollView scrollbar or any sibling positioned at .topTrailing.
+            CloseButton()
         }
     }
 }
