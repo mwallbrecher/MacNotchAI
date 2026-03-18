@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @AppStorage("selectedProvider") private var selectedProvider = AIProviderType.groq.rawValue
+    @AppStorage("uiScale")          private var uiScaleRaw       = UIScale.small.rawValue
     @State private var apiKey = ""
     @State private var ollamaAvailable = false
     @State private var saved = false
@@ -12,6 +13,49 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section("Appearance") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Window Size")
+                        .font(.headline)
+
+                    HStack(spacing: 10) {
+                        ForEach(UIScale.allCases, id: \.rawValue) { scale in
+                            let selected = uiScaleRaw == scale.rawValue
+                            Button {
+                                uiScaleRaw = scale.rawValue
+                            } label: {
+                                VStack(spacing: 4) {
+                                    Text(scale.label)
+                                        .font(.system(size: 13, weight: selected ? .semibold : .regular))
+                                    Text(scale.sizeHint)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(selected
+                                              ? Color.accentColor.opacity(0.15)
+                                              : Color.secondary.opacity(0.08))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                .strokeBorder(selected ? Color.accentColor : .clear,
+                                                              lineWidth: 1.5)
+                                        )
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    Text("Takes effect on the next drag.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+
             Section("AI Provider") {
                 VStack(spacing: 6) {
                     ForEach(AIProviderType.allCases, id: \.rawValue) { type in

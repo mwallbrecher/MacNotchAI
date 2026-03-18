@@ -10,6 +10,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var escapeMonitor: Any?
     private var outsideClickMonitor: Any?
 
+    // ── Dismiss-race protection ───────────────────────────────────────────────
+    // When hideOverlay() fires, dismissAnimated() starts a 0.14 s alpha fade.
+    // If a new drag begins during that window, the fading window is still alive
+    // and its DroppableHostingView still observes OverlayViewModel.  A freshly
+    // created second window produces two WaitingPillViews both calling jelly
+    // animation methods → two concurrent withAnimation{} on the same bindings
+    // → SwiftUI invariant violation → EXC_BREAKPOINT.
+    //
+    // Fix: DON'T nil overlayWindow in hideOverlay().  Instead issue a UUID token
+    // that travels with the dismissAnimated completion closure.  ensureOverlayVisible()
+    // can safely reuse the fading window by invalidating the token — the completion
+    // closure's token-guard then skips orderOut/nil so the window stays alive.
+    //
+    // isWindowDismissing gates resizeOverlay() so a stage-change resize triggered
+    // by reset() (e.g. chips→waitingForDrop) doesn't visually resize a fading window.
+    private var dismissToken      = UUID()
+    private var isWindowDismissing = false
+
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -17,6 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DragMonitor.shared.startMonitoring()
         observeDragState()
         observeStageChanges()
+        observeChipsExpanded()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleShowOnboarding),
@@ -35,6 +54,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             name: .showCustomDisable, object: nil
         )
 
+        // Space switches cancel any active system drag and leave DragMonitor in a
+        // stale state — pressTimeChangeCount and lastDragChangeCount diverge, making
+        // the next drag on the new space fail the pasteboard guard silently.
+        // Reset drag state on every space change so the pill can appear fresh.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(handleActiveSpaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil
+        )
+
+        // If the user's key screen changes (external display connected/disconnected,
+        // lid closed, etc.) reposition the overlay window to the new notch location.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleScreenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+
         // Show onboarding on very first launch.
         if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
@@ -43,10 +78,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func handleShowOnboarding()   { showOnboarding()    }
-    @objc private func handleHideOverlay()      { hideOverlay()       }
-    @objc private func handleShowHotkeyPicker() { showHotkeyPicker()  }
+    @objc private func handleShowOnboarding()    { showOnboarding()    }
+    @objc private func handleHideOverlay()       { hideOverlay()       }
+    @objc private func handleShowHotkeyPicker()  { showHotkeyPicker()  }
     @objc private func handleShowCustomDisable() { showCustomDisable() }
+
+    /// Called by macOS whenever the user switches Mission Control spaces.
+    /// Resets DragMonitor so stale pasteboard change-counts from the previous
+    /// space don't block the pill from appearing on the new space.
+    ///
+    /// The notification arrives up to ~200 ms after the visual space transition.
+    /// If the user starts a new drag on the target space within that window the
+    /// Task below fires while a live drag is already in progress — calling
+    /// hideOverlay() here would tear down the pill while a file is mid-air
+    /// (miscatch) or while AppKit is delivering drag callbacks to the now-
+    /// deallocated DroppableHostingView (crash). Guard against both by skipping
+    /// the dismiss whenever a drag is already in flight.
+    @objc private func handleActiveSpaceChanged() {
+        Task { @MainActor in
+            DragMonitor.shared.resetAfterSpaceChange()
+            // Only dismiss the Stage-1 pill if no drag is currently active.
+            if case .waitingForDrop = OverlayViewModel.shared.stage,
+               !DragMonitor.shared.isDraggingFile {
+                hideOverlay()
+            }
+        }
+    }
+
+    /// Called when screens are added, removed, or change resolution.
+    /// Re-positions the overlay window so it stays centred on the correct notch.
+    @objc private func handleScreenParametersChanged() {
+        Task { @MainActor in
+            guard let window = overlayWindow, window.isVisible else { return }
+            let anchorLeft = OverlayViewModel.shared.stage.tag > 0
+            window.place(
+                size: window.frame.size,
+                anchorAtNotchCenter: anchorLeft
+            )
+        }
+    }
 
     // MARK: - Drag observation
     // Stage 1 → pill visible while any file is being dragged.
@@ -78,11 +148,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         guard !DragMonitor.shared.isDraggingFile else { return }
                         self.hideOverlay()
                     } else if vm.isDraggingOut {
-                        // User dragged the file OUT of the shelf — close session.
+                        // User dragged the file out — clear the flag but keep
+                        // the shelf open. Only × or Escape can dismiss it now.
                         vm.isDraggingOut = false
-                        self.hideOverlay()
                     }
-                    // Otherwise (stage 2/3, no drag-out): shelf stays open.
+                    // Shelf stays open until the user explicitly closes it.
                 }
             }
             .store(in: &cancellables)
@@ -103,66 +173,161 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
     }
 
+    private func observeChipsExpanded() {
+        OverlayViewModel.shared.$isChipsExpanded
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.resizeOverlay(for: OverlayViewModel.shared.stage)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func observeFollowupsExpanded() {
+        OverlayViewModel.shared.$isFollowupsExpanded
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    self?.resizeOverlay(for: OverlayViewModel.shared.stage)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
     // MARK: - Overlay lifecycle
 
     private func ensureOverlayVisible() {
-        if overlayWindow == nil {
-            let window = OverlayWindow()
-            let hostingView = DroppableHostingView(
-                rootView: OverlayView(provider: resolveProvider())
-            )
-            window.contentView = hostingView
-            overlayWindow = window
+        let s = UIScale.current.multiplier
+        let pillSize = CGSize(width: 288 * s, height: 96 * s)
+
+        if let win = overlayWindow {
+            // ── Reuse path ───────────────────────────────────────────────────
+            // A window exists — it is either already visible (no-op) or mid-dismiss
+            // (alpha fading to 0).  In the latter case: invalidate the pending
+            // dismiss token so its completion closure no-ops, then snap alpha back
+            // to 1 and reset the view model.
+            // Full reset is safe here: we're about to show WaitingPillView again,
+            // and cancelling the token means the deferred reset in the completion
+            // will never fire (token mismatch guard), so there's no double-reset.
+            dismissToken       = UUID()    // ← cancels any pending dismiss completion
+            isWindowDismissing = false     // ← unblocks resizeOverlay()
+            win.alphaValue     = 1
+            OverlayViewModel.shared.reset()   // ← stage → .waitingForDrop before orderFront
+            win.place(size: pillSize, anchorAtNotchCenter: false)
+            win.orderFront(nil)
+            startDismissMonitors()
+            return
         }
+
+        // ── Create path ──────────────────────────────────────────────────────
+        // No window at all — build one fresh.
+        let window = OverlayWindow()
+        let hostingView = DroppableHostingView(
+            rootView: OverlayView(provider: resolveProvider())
+        )
+        window.contentView = hostingView
+        overlayWindow = window
+
         // Pre-position at the notch synchronously BEFORE ordering front.
         // Without this the window flashes at screen origin (0, 0) for one frame.
-        // 288×96 gives 24 pt transparent border on each side (horizontal) and 14 pt
-        // top/bottom — the wobble scaleEffect overflows into this transparent canvas
-        // without hitting the window clip boundary.
-        overlayWindow?.place(size: CGSize(width: 288, height: 96), anchorAtNotchCenter: false)
+        overlayWindow?.place(size: pillSize, anchorAtNotchCenter: false)
         overlayWindow?.show()
         startDismissMonitors()
     }
 
     func hideOverlay() {
+        guard overlayWindow != nil else { return }   // already hidden — no double-dismiss
         stopDismissMonitors()
-        overlayWindow?.dismissAnimated()
-        overlayWindow = nil   // recreate next drag so provider is always fresh
-        OverlayViewModel.shared.reset()
+
+        // ── Partial reset (flags only, stage intact) ──────────────────────────
+        // Clears hover/jelly flags but leaves stage unchanged so the SwiftUI
+        // content keeps showing whatever was on screen when the user pressed ×.
+        OverlayViewModel.shared.partialReset()
+
+        // ── Trigger SwiftUI collapse animation ────────────────────────────────
+        // Explicit withAnimation so the collapse uses a DIFFERENT spring than
+        // the entry. Entry (in OverlayView.onAppear) uses dampingFraction 0.58
+        // (underdamped → bouncy pop-in). Collapse uses dampingFraction 1.0
+        // (critically damped → Y goes monotonically 1.0 → 0.02, never overshoots
+        // into negative values, never "pops" back into view).
+        // anchor: .top = the overlay squishes upward into the notch.
+        // response: 0.18 → fast snap into the notch (~0.18 s to reach target).
+        // dampingFraction: 1.0 → critically damped, Y travels straight to 0,
+        // no overshoot, no bounce back into view.
+        withAnimation(.spring(response: 0.18, dampingFraction: 1.0)) {
+            OverlayViewModel.shared.isCollapsing = true
+        }
+
+        // ── Token-guarded deferred teardown ──────────────────────────────────
+        // 0.28 s gives the spring comfortable room to reach Y=0.02 and settle.
+        // If ensureOverlayVisible() fires first it writes a new token → this
+        // closure becomes a no-op and the window is reused instead.
+        let token = UUID()
+        dismissToken       = token
+        isWindowDismissing = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
+            guard let self, self.dismissToken == token else { return }
+            self.isWindowDismissing = false
+            self.overlayWindow?.orderOut(nil)
+            self.overlayWindow = nil
+            // Full reset now: window is invisible so the stage flip is silent.
+            OverlayViewModel.shared.reset()   // also sets isCollapsing = false
+        }
+        // NOTE: overlayWindow is intentionally NOT nilled here.
+        // ensureOverlayVisible() checks for an existing window and reuses it.
     }
 
     // MARK: - Window sizing
 
     private func resizeOverlay(for stage: OverlayViewModel.Stage) {
-        guard let window = overlayWindow, window.isVisible else { return }
+        // Skip resize while a dismiss animation is in flight.  reset() triggers a
+        // .waitingForDrop stage change that would otherwise instantly shrink a
+        // chips/result-sized window while it's fading out — visible and wrong.
+        guard let window = overlayWindow, window.isVisible, !isWindowDismissing else { return }
 
+        let s = UIScale.current.multiplier
         let size: CGSize
         let anchorLeft: Bool   // true = pin left column under notch centre
 
         switch stage {
         case .waitingForDrop:
-            size = CGSize(width: 288, height: 96)   // extra canvas for wobble overflow
+            size = CGSize(width: 288 * s, height: 96 * s)   // extra canvas for wobble overflow
             anchorLeft = false
 
         case .chips(_, let actions):
-            let n = min(actions.count, 6)
-            let h = 18 + 44 + 20 + CGFloat(n) * 40 + 18
-            size = CGSize(width: 280, height: max(h, 180))
+            if OverlayViewModel.shared.isChipsExpanded {
+                let n = min(actions.count, 6)
+                // header(50) + spacing(10) + "Suggested"(14) + spacing(10)
+                // + chips(n×36 + (n-1)×6) + spacing(10) + prompt(42) + padding(36)
+                let chipsH = CGFloat(n) * 36 + CGFloat(max(n - 1, 0)) * 6
+                let h = (50 + 10 + 14 + 10 + chipsH + 10 + 42 + 36) * s
+                size = CGSize(width: 280 * s, height: max(h, 220 * s))
+            } else {
+                // Collapsed: header + spacing + prompt field + padding only
+                let h = (50 + 10 + 42 + 36) * s
+                size = CGSize(width: 280 * s, height: max(h, 148 * s))
+            }
             anchorLeft = true
 
         case .loading:
-            size = CGSize(width: 500, height: 280)
+            size = CGSize(width: 500 * s, height: 280 * s)
             anchorLeft = true
 
         case .result(_, _, let text):
+            // Window is always sized to fit the full expanded layout (result card +
+            // prompt + follow-up chips). The follow-up toggle only controls content
+            // visibility inside the window — the ScrollView grows into the freed space
+            // without the window frame changing at all.
             let lines = max(text.components(separatedBy: "\n").count, text.count / 55)
             let resultH = min(CGFloat(lines) * 20, 200)
-            let h = 18 + 44 + resultH + 44 + 24 + 3 * 40 + 18
-            size = CGSize(width: 500, height: min(max(h, 320), 500))
+            let h = (18 + 44 + resultH + 44 + 20 + 3 * 40 + 44 + 18) * s
+            size = CGSize(width: 500 * s, height: min(max(h, 380 * s), 600 * s))
             anchorLeft = true
 
         case .error:
-            size = CGSize(width: 500, height: 220)
+            size = CGSize(width: 500 * s, height: 220 * s)
             anchorLeft = true
         }
 

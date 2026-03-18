@@ -3,6 +3,7 @@ import SwiftUI
 struct MenuBarView: View {
 
     @AppStorage("disabledUntil") private var disabledUntil: Double = 0
+    @Environment(\.openSettings) private var openSettings
 
     private var isDisabled: Bool {
         disabledUntil > Date().timeIntervalSince1970
@@ -41,7 +42,7 @@ struct MenuBarView: View {
             }
 
             Button("Settings…") {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                openSettings()
                 NSApp.activate(ignoringOtherApps: true)
             }
             .keyboardShortcut(",")

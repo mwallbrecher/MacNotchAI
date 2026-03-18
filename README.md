@@ -218,4 +218,4 @@ All product decisions, architecture direction, and design were made by [@mwallbr
 
 ## License
 
-MIT — do whatever you want with it.
+Open Source. Feel free to clone, edit the code and contribute your ideas. Do not use my project idea & code for commecial or public purposes!
