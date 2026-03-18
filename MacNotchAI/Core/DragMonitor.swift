@@ -77,6 +77,11 @@ class DragMonitor: ObservableObject {
 
         let hasDrag = hasFile(on: pb)
         if hasDrag, !isDraggingFile {
+            // Hotkey gate: if a modifier key is required, only show the pill when
+            // it is currently held.  The check runs once per drag session (here,
+            // on the first event where changeCount increments).  NSEvent.modifierFlags
+            // is the live system-wide modifier state — accurate mid-drag.
+            guard HotkeyManager.shared.isHotkeyHeld() else { return }
             isDraggingFile = true
             startPolling()
         } else if !hasDrag {

@@ -5,6 +5,7 @@ import SwiftUI
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayWindow: OverlayWindow?
     private var onboardingWindow: NSWindow?
+    private var hotkeyPickerWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
     private var escapeMonitor: Any?
     private var outsideClickMonitor: Any?
@@ -25,6 +26,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(handleHideOverlay),
             name: .hideOverlay, object: nil
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleShowHotkeyPicker),
+            name: .showHotkeyPicker, object: nil
+        )
 
         // Show onboarding on very first launch.
         if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
@@ -34,8 +39,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func handleShowOnboarding() { showOnboarding() }
-    @objc private func handleHideOverlay()    { hideOverlay()    }
+    @objc private func handleShowOnboarding()   { showOnboarding()   }
+    @objc private func handleHideOverlay()      { hideOverlay()      }
+    @objc private func handleShowHotkeyPicker() { showHotkeyPicker() }
 
     // MARK: - Drag observation
     // Stage 1 → pill visible while any file is being dragged.
@@ -51,6 +57,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // Only show the pill if we're not already in a later stage.
                     // This also prevents re-triggering during a drag-OUT gesture.
                     if case .waitingForDrop = vm.stage {
+                        // Respect the "Disable for X minutes" setting.
+                        guard !self.isPillDisabled else { return }
                         self.ensureOverlayVisible()
                     }
                 } else {
@@ -186,6 +194,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let m = outsideClickMonitor { NSEvent.removeMonitor(m); outsideClickMonitor = nil }
     }
 
+    // MARK: - Disable helper
+
+    /// True when the user has temporarily paused the pill via "Disable for X minutes".
+    private var isPillDisabled: Bool {
+        UserDefaults.standard.double(forKey: "disabledUntil") > Date().timeIntervalSince1970
+    }
+
+    // MARK: - Hotkey picker
+
+    func showHotkeyPicker() {
+        if hotkeyPickerWindow == nil {
+            let hosting = NSHostingController(rootView: HotkeyPickerView {
+                self.hotkeyPickerWindow?.close()
+                self.hotkeyPickerWindow = nil
+            })
+            let win = NSWindow(contentViewController: hosting)
+            win.title = "Drag Hotkey"
+            win.styleMask = [.titled, .closable]
+            win.isReleasedWhenClosed = false
+            win.center()
+            hotkeyPickerWindow = win
+        }
+        hotkeyPickerWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     // MARK: - Onboarding
 
     func showOnboarding() {
@@ -231,8 +265,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - Notification names
 
 extension Notification.Name {
-    static let showOnboarding = Notification.Name("com.aidrop.showOnboarding")
-    static let hideOverlay    = Notification.Name("com.aidrop.hideOverlay")
+    static let showOnboarding   = Notification.Name("com.aidrop.showOnboarding")
+    static let hideOverlay      = Notification.Name("com.aidrop.hideOverlay")
+    static let showHotkeyPicker = Notification.Name("com.aidrop.showHotkeyPicker")
 }
 
 // MARK: - Provider resolution

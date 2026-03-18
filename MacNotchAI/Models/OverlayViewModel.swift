@@ -56,6 +56,11 @@ class OverlayViewModel: ObservableObject {
     @Published var jellyX: CGFloat = 1.0
     @Published var jellyY: CGFloat = 1.0
 
+    // ── Jelly cooldown ───────────────────────────────────────────────────────
+    // Records when startJellyHover() last kicked off a wobble.  Any re-entry
+    // within 500 ms is ignored so edge-grazing doesn't produce rapid stutter.
+    private var lastJellyFiredAt: Date = .distantPast
+
     // ── Singleton jelly task ─────────────────────────────────────────────────
     // Owned here — NOT in WaitingPillView — so only ONE task ever exists.
     //
@@ -73,6 +78,13 @@ class OverlayViewModel: ObservableObject {
     private var jellyTask: Task<Void, Never>?
 
     func startJellyHover() {
+        // 500 ms cooldown: suppress re-triggers caused by the cursor grazing the pill
+        // edge and rapidly alternating enter/exit events.  The wobble animation is
+        // ~300 ms; a 500 ms gate gives a comfortable visual rest between wobbles.
+        let now = Date()
+        guard now.timeIntervalSince(lastJellyFiredAt) >= 0.5 else { return }
+        lastJellyFiredAt = now
+
         jellyTask?.cancel()
         jellyTask = Task { @MainActor in
             do {
@@ -118,12 +130,13 @@ class OverlayViewModel: ObservableObject {
 
     func reset() {
         jellyTask?.cancel()
-        jellyTask      = nil
-        stage          = .waitingForDrop
-        isDragHovering = false
-        isDraggingOut  = false
-        customPrompt   = ""
-        jellyX         = 1.0
-        jellyY         = 1.0
+        jellyTask        = nil
+        stage            = .waitingForDrop
+        isDragHovering   = false
+        isDraggingOut    = false
+        customPrompt     = ""
+        jellyX           = 1.0
+        jellyY           = 1.0
+        lastJellyFiredAt = .distantPast   // reset cooldown so next session starts fresh
     }
 }
