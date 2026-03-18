@@ -29,6 +29,15 @@ class DragMonitor: ObservableObject {
     // fresh items to the drag pasteboard).
     private var lastDragChangeCount: Int = NSPasteboard(name: .drag).changeCount
 
+    // ── Press-time guard ──────────────────────────────────────────────────────
+    // Snapshot the drag pasteboard changeCount the instant the left mouse button
+    // goes down.  In handleDrag we only proceed if count EXCEEDS this snapshot —
+    // meaning the source app wrote new drag data AFTER the press started.
+    // This eliminates false triggers where stale file data in the pasteboard
+    // (from a previous drag) would fire the pill on a plain pointer-hold + move.
+    private var pressTimeChangeCount: Int = NSPasteboard(name: .drag).changeCount
+    private var mouseDownMonitor: Any?
+
     private init() {}
 
     func startMonitoring() {
@@ -39,20 +48,34 @@ class DragMonitor: ObservableObject {
             MainActor.assumeIsolated { DragMonitor.shared.handleDrag(event) }
         }
 
-        // mouseUp monitor kept as a fast-path fallback for non-drag-session
-        // mouse releases (e.g. user clicks and barely moves).
+        // Snapshot the pasteboard changeCount the instant the mouse button goes
+        // down — before any drag source has had a chance to write new data.
+        mouseDownMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { _ in
+            MainActor.assumeIsolated {
+                DragMonitor.shared.pressTimeChangeCount = NSPasteboard(name: .drag).changeCount
+            }
+        }
+
+        // mouseUp monitor: fast-path for releases outside AppKit's drag loop.
+        // Guard: if the left button is already down again a new drag has started —
+        // this Up event belongs to the previous press, skip cleanup entirely.
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                MainActor.assumeIsolated { DragMonitor.shared.handleMouseUp() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                MainActor.assumeIsolated {
+                    guard NSEvent.pressedMouseButtons & 1 == 0 else { return }
+                    DragMonitor.shared.handleMouseUp()
+                }
             }
         }
     }
 
     func stopMonitoring() {
-        if let m = dragMonitor    { NSEvent.removeMonitor(m) }
-        if let m = mouseUpMonitor { NSEvent.removeMonitor(m) }
-        dragMonitor    = nil
-        mouseUpMonitor = nil
+        if let m = dragMonitor      { NSEvent.removeMonitor(m) }
+        if let m = mouseUpMonitor   { NSEvent.removeMonitor(m) }
+        if let m = mouseDownMonitor { NSEvent.removeMonitor(m) }
+        dragMonitor      = nil
+        mouseUpMonitor   = nil
+        mouseDownMonitor = nil
         stopPolling()
     }
 
@@ -68,11 +91,18 @@ class DragMonitor: ObservableObject {
         let pb    = NSPasteboard(name: .drag)
         let count = pb.changeCount
 
-        // Skip events where the pasteboard hasn't changed — these are either
-        // continued drag-move events for an already-detected drag (isDraggingFile
-        // is already true, polling handles cleanup) or plain mouse moves after a
-        // previous drag whose stale contents are still in the pasteboard.
+        // Skip events where the pasteboard hasn't changed.
         guard count != lastDragChangeCount else { return }
+
+        // Only react to pasteboard writes that happened AFTER this mouse press.
+        // If count == pressTimeChangeCount the data is stale (written in a
+        // previous session) — a plain pointer-hold + move must not trigger the
+        // pill.  Mark it seen and bail; a real file drag will increment count
+        // above pressTimeChangeCount before the first drag event arrives.
+        guard count > pressTimeChangeCount else {
+            lastDragChangeCount = count   // mark seen so we don't loop
+            return
+        }
         lastDragChangeCount = count
 
         let hasDrag = hasFile(on: pb)
