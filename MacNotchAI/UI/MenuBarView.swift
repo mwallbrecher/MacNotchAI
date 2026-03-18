@@ -2,16 +2,20 @@ import SwiftUI
 
 struct MenuBarView: View {
 
-    // Tracks the wall-clock epoch at which the pill re-enables.
-    // 0 (default) = not disabled.
     @AppStorage("disabledUntil") private var disabledUntil: Double = 0
 
     private var isDisabled: Bool {
         disabledUntil > Date().timeIntervalSince1970
     }
 
-    private var minutesLeft: Int {
-        max(1, Int(ceil((disabledUntil - Date().timeIntervalSince1970) / 60)))
+    /// Smart remaining-time label handles minutes, hours, and "until re-enabled".
+    private var pausedLabel: String {
+        let secs = disabledUntil - Date().timeIntervalSince1970
+        guard secs > 0 else { return "" }
+        // Sentinel for "Until Re-Enabled" — more than one year away
+        if secs > 365 * 24 * 3600 { return "Paused · until re-enabled" }
+        if secs > 3600 { return "Paused · \(Int(secs / 3600))h left" }
+        return "Paused · \(max(1, Int(ceil(secs / 60)))) min left"
     }
 
     var body: some View {
@@ -22,7 +26,7 @@ struct MenuBarView: View {
                 Text("AI Drop")
                     .font(.headline)
                 if isDisabled {
-                    Text("Paused · \(minutesLeft) min left")
+                    Text(pausedLabel)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -44,22 +48,48 @@ struct MenuBarView: View {
 
             Divider()
 
-            // ── Disable / hotkey controls ──────────────────────────────────────
+            // ── Disable / re-enable ────────────────────────────────────────────
             if isDisabled {
-                // Replace the submenu with a single "re-enable" action while paused
                 Button("Re-enable Now") {
                     disabledUntil = 0
                 }
             } else {
                 Menu("Disable for…") {
+                    // ── Timed presets ──────────────────────────────────────────
                     Button("5 minutes")  { disableFor(5)  }
                     Button("15 minutes") { disableFor(15) }
                     Button("30 minutes") { disableFor(30) }
                     Button("1 hour")     { disableFor(60) }
+
+                    Divider()
+
+                    // ── Session / day options ──────────────────────────────────
+                    Button("For today") {
+                        // Disable until midnight tonight (start of tomorrow)
+                        let midnight = Calendar.current.date(
+                            byAdding: .day, value: 1,
+                            to: Calendar.current.startOfDay(for: Date())
+                        ) ?? Date().addingTimeInterval(24 * 3600)
+                        disabledUntil = midnight.timeIntervalSince1970
+                    }
+
+                    Button("Until Re-Enabled") {
+                        // Sentinel: 10 years from now — isPillDisabled stays true
+                        // until the user explicitly taps "Re-enable Now".
+                        disabledUntil = Date().addingTimeInterval(10 * 365 * 24 * 3600)
+                            .timeIntervalSince1970
+                    }
+
+                    Divider()
+
+                    // ── Custom amount ──────────────────────────────────────────
+                    Button("Custom…") {
+                        NotificationCenter.default.post(name: .showCustomDisable, object: nil)
+                    }
                 }
             }
 
-            // Hotkey button — label morphs to show the current hotkey when set
+            // Hotkey button — morphs to show the active key when configured
             Button(HotkeyManager.shared.isEnabled
                     ? "Hotkey: \(HotkeyManager.shared.displayString)…"
                     : "Add Hotkey…") {

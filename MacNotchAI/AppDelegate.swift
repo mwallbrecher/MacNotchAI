@@ -30,6 +30,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(handleShowHotkeyPicker),
             name: .showHotkeyPicker, object: nil
         )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleShowCustomDisable),
+            name: .showCustomDisable, object: nil
+        )
 
         // Show onboarding on very first launch.
         if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
@@ -39,9 +43,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func handleShowOnboarding()   { showOnboarding()   }
-    @objc private func handleHideOverlay()      { hideOverlay()      }
-    @objc private func handleShowHotkeyPicker() { showHotkeyPicker() }
+    @objc private func handleShowOnboarding()   { showOnboarding()    }
+    @objc private func handleHideOverlay()      { hideOverlay()       }
+    @objc private func handleShowHotkeyPicker() { showHotkeyPicker()  }
+    @objc private func handleShowCustomDisable() { showCustomDisable() }
 
     // MARK: - Drag observation
     // Stage 1 → pill visible while any file is being dragged.
@@ -220,6 +225,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // MARK: - Custom disable duration
+
+    func showCustomDisable() {
+        let alert = NSAlert()
+        alert.messageText     = "Disable AI Drop for…"
+        alert.informativeText = "Enter a duration in minutes (e.g. 45)."
+        alert.addButton(withTitle: "Disable")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "Minutes"
+        field.font = .systemFont(ofSize: 13)
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let text = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let minutes = Int(text), minutes > 0 else { return }
+        let until = Date().addingTimeInterval(Double(minutes) * 60).timeIntervalSince1970
+        UserDefaults.standard.set(until, forKey: "disabledUntil")
+    }
+
     // MARK: - Onboarding
 
     func showOnboarding() {
@@ -268,6 +297,7 @@ extension Notification.Name {
     static let showOnboarding   = Notification.Name("com.aidrop.showOnboarding")
     static let hideOverlay      = Notification.Name("com.aidrop.hideOverlay")
     static let showHotkeyPicker = Notification.Name("com.aidrop.showHotkeyPicker")
+    static let showCustomDisable = Notification.Name("com.aidrop.showCustomDisable")
 }
 
 // MARK: - Provider resolution

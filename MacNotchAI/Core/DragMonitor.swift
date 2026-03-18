@@ -85,24 +85,16 @@ class DragMonitor: ObservableObject {
         let pb    = NSPasteboard(name: .drag)
         let count = pb.changeCount
 
-        // Normal case: same pasteboard content as last time — either a continued
-        // drag-move event for an already-detected drag, or a plain mouse move with
-        // stale pasteboard data from a previous drag.
-        guard count != lastDragChangeCount else {
-            // Defence-in-depth re-arm:
-            // If isDraggingFile was spuriously cleared while this drag session is
-            // still live (the pressedMouseButtons guard above now prevents this in
-            // most cases, but guard against any other future path), re-detect here.
-            // Safe because stopPolling() snapshots the pasteboard changeCount into
-            // lastDragChangeCount only when the pasteboard is genuinely empty —
-            // so when we reach this branch with isDraggingFile=false AND a file is
-            // still on the pasteboard, we know the drag is still active.
-            if !isDraggingFile && hasFile(on: pb) && HotkeyManager.shared.isHotkeyHeld() {
-                isDraggingFile = true
-                startPolling()
-            }
-            return
-        }
+        // Same pasteboard content as last time — either continued drag-move events
+        // for an already-detected drag (isDraggingFile is true, poll timer handles
+        // cleanup) or plain mouse moves / pointer-hold while stale file data from
+        // a previous drag is still on the pasteboard.
+        //
+        // IMPORTANT: do NOT attempt to re-arm isDraggingFile here.  The stale data
+        // path (pointer down + hold with no file) would cause hasFile() to return
+        // true for old drag contents → false pill trigger.  The pressedMouseButtons
+        // guard in the mouseUpMonitor already prevents the spurious-reset scenario.
+        guard count != lastDragChangeCount else { return }
         lastDragChangeCount = count
 
         let hasDrag = hasFile(on: pb)
