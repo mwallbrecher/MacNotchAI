@@ -85,6 +85,29 @@ class DragMonitor: ObservableObject {
         stopPolling()
     }
 
+    /// Called when the user switches Mission Control spaces.
+    /// Re-syncs the stale-pasteboard guards so the first drag on the new space
+    /// isn't blocked by a changeCount left over from the previous session.
+    ///
+    /// If a drag is already in flight (user started dragging on the target space
+    /// before this notification fired) we ONLY update `lastDragChangeCount` —
+    /// leaving `isDraggingFile`, the poll timer, and `pressTimeChangeCount` intact.
+    /// Resetting those while a live drag is active would cause observeDragState to
+    /// call hideOverlay(), tearing down the pill mid-air.
+    func resetAfterSpaceChange() {
+        let count = NSPasteboard(name: .drag).changeCount
+        if isDraggingFile {
+            // Active drag on the new space — just advance the seen-count baseline
+            // so subsequent drag events aren't treated as stale.
+            lastDragChangeCount = count
+            return
+        }
+        isDraggingFile = false
+        stopPolling()
+        lastDragChangeCount  = count
+        pressTimeChangeCount = count
+    }
+
     // MARK: - Private – event handlers
 
     private func handleDrag(_ event: NSEvent) {

@@ -29,14 +29,21 @@ class OverlayWindow: NSPanel {
         orderFront(nil)
     }
 
-    func dismissAnimated() {
+    /// Fade the window to alpha 0 over 0.14 s, then call `completion`.
+    ///
+    /// The caller is responsible for `orderOut` / cleanup inside `completion`.
+    /// Keeping `orderOut` out of this method lets AppDelegate cancel a pending
+    /// dismiss (by ignoring the completion) when a new drag interrupts the fade —
+    /// preventing the "two live windows" race that caused the EXC_BREAKPOINT crash.
+    func dismissAnimated(completion: (() -> Void)? = nil) {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.14
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             self.animator().alphaValue = 0
         }) {
-            self.orderOut(nil)
+            // Reset alpha so the window is ready for potential reuse.
             self.alphaValue = 1
+            completion?()
         }
     }
 
@@ -66,12 +73,26 @@ class OverlayWindow: NSPanel {
     // MARK: - Private helpers
 
     private func notchFrame(for size: CGSize, anchorAtNotchCenter: Bool) -> NSRect {
-        guard let screen = NSScreen.main else { return frame }
+        // NSScreen.main is transiently nil during space/screen transitions.
+        // Fall through the chain rather than returning the current (possibly
+        // zero-size) frame — a zero-size setFrame triggers a layout pass with
+        // unsatisfiable constraints → crash.
+        guard let screen = NSScreen.main
+                        ?? NSScreen.screens.first(where: { $0.frame.origin == .zero })
+                        ?? NSScreen.screens.first
+        else { return frame }
+
         let notchBottomY: CGFloat = 37
         let y = screen.frame.height - notchBottomY - size.height
-        let x: CGFloat = anchorAtNotchCenter
-            ? (screen.frame.width / 2) - 110
-            : (screen.frame.width - size.width) / 2
+        let x: CGFloat
+        if anchorAtNotchCenter {
+            // Keep the notch centre at ~39 % from the window's left edge —
+            // the same visual relationship at every UI scale.
+            // At base size (280 pt card width) this equals the original 110 pt offset.
+            x = (screen.frame.width / 2) - (size.width * (110.0 / 280.0))
+        } else {
+            x = (screen.frame.width - size.width) / 2
+        }
         return NSRect(origin: CGPoint(x: x, y: y), size: size)
     }
 }

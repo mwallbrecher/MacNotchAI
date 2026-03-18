@@ -6,7 +6,36 @@ import Combine
 @MainActor
 class OverlayViewModel: ObservableObject {
     static let shared = OverlayViewModel()
-    private init() {}
+
+    // Persisted UI preference keys
+    private static let keyChipsExpanded     = "pref.chipsExpanded"
+    private static let keyFollowupsExpanded = "pref.followupsExpanded"
+
+    private var cancellables = Set<AnyCancellable>()
+
+    private init() {
+        // ── Restore persisted UI preferences from the previous session ────────
+        // This means collapsing chips or follow-ups carries over between drops.
+        if let saved = UserDefaults.standard.object(forKey: Self.keyChipsExpanded) as? Bool {
+            isChipsExpanded = saved
+        }
+        if let saved = UserDefaults.standard.object(forKey: Self.keyFollowupsExpanded) as? Bool {
+            isFollowupsExpanded = saved
+        }
+
+        // ── Persist changes automatically ─────────────────────────────────────
+        // dropFirst() skips the initial value that Combine emits on subscription
+        // so we don't write UserDefaults unnecessarily at startup.
+        $isChipsExpanded
+            .dropFirst()
+            .sink { UserDefaults.standard.set($0, forKey: Self.keyChipsExpanded) }
+            .store(in: &cancellables)
+
+        $isFollowupsExpanded
+            .dropFirst()
+            .sink { UserDefaults.standard.set($0, forKey: Self.keyFollowupsExpanded) }
+            .store(in: &cancellables)
+    }
 
     enum Stage {
         case waitingForDrop
@@ -15,7 +44,6 @@ class OverlayViewModel: ObservableObject {
         case result(url: URL, action: AIAction, text: String)
         case error(url: URL, message: String)
 
-        /// Whether the right-column result panel should be visible.
         var showsRightColumn: Bool {
             switch self {
             case .loading, .result, .error: return true
@@ -31,7 +59,7 @@ class OverlayViewModel: ObservableObject {
             }
         }
 
-        /// Stable integer used as SwiftUI animation value driver on stage changes.
+        /// Integer tag used as SwiftUI animation value when stage changes.
         var tag: Int {
             switch self {
             case .waitingForDrop: return 0
@@ -44,99 +72,98 @@ class OverlayViewModel: ObservableObject {
     }
 
     @Published var stage: Stage = .waitingForDrop
-    /// True while a file is physically dragged over the Stage-1 pill.
     @Published var isDragHovering = false
-    /// True from the moment a drag-OUT gesture starts until the drag ends.
-    /// AppDelegate watches this to close the session after the drop.
-    @Published var isDraggingOut = false
-    /// Text typed into the custom-prompt field in the result column.
+    @Published var isDraggingOut  = false
     @Published var customPrompt: String = ""
-    /// Jelly wobble scale applied at OverlayView level (outside clipShape) so
-    /// the pill can overflow its layout frame without being clipped.
+
+    // Last AI result snapshot — saved when the user taps ← back so they can
+    // restore it via → without re-running the AI call. Cleared on fresh drop,
+    // new action start, or full reset.
+    @Published var cachedResult: Stage? = nil
+
+    // ── Jelly wobble ─────────────────────────────────────────────────────────
+    // Applied to the pill scaleEffect in OverlayView (outside clipShape so it
+    // overflows into the transparent canvas without hitting NSHostingView clip).
+    // IMPORTANT: NSView bounds are NOT changed by SwiftUI scaleEffect — the
+    // drag hitbox is always the full 288×96 canvas, regardless of visual scale.
     @Published var jellyX: CGFloat = 1.0
     @Published var jellyY: CGFloat = 1.0
 
-    // ── Jelly cooldown ───────────────────────────────────────────────────────
-    // Records when startJellyHover() last kicked off a wobble.  Any re-entry
-    // within 500 ms is ignored so edge-grazing doesn't produce rapid stutter.
-    private var lastJellyFiredAt: Date = .distantPast
+    // ── Collapse / entry gate ─────────────────────────────────────────────────
+    // OverlayView combines this with its local `appeared` Bool to compute
+    // `isAtFullScale`. Setting isCollapsing = true plays the spring in reverse
+    // (Y: 1.0 → 0.02, squishing back into the notch). reset() clears it so the
+    // next entry (or reuse) plays the pop-in spring again.
+    @Published var isCollapsing:        Bool = false
+    @Published var isChipsExpanded:     Bool = true     // overwritten by init() from UserDefaults
+    @Published var isFollowupsExpanded: Bool = false    // overwritten by init() from UserDefaults
 
-    // ── Singleton jelly task ─────────────────────────────────────────────────
-    // Owned here — NOT in WaitingPillView — so only ONE task ever exists.
+    // MARK: - Jelly
     //
-    // Why this matters: dismissAnimated() fades the old window over 0.14 s.
-    // During that window the old WaitingPillView is still live and still
-    // observes isDragHovering. If the user starts a new drag immediately, a
-    // second WaitingPillView appears in the new window. Both views would fire
-    // their own animation tasks for the same isDragHovering change → two
-    // concurrent withAnimation{} blocks targeting jellyX/Y → SwiftUI
-    // invariant violation → _crashOnException.
-    //
-    // With the task stored here, startJellyHover() always cancels the running
-    // task before creating a new one. No matter how many view instances call
-    // it, exactly one task is alive at any time.
-    private var jellyTask: Task<Void, Never>?
+    // Design rule: ONE withAnimation call per method, called directly on the main
+    // thread. No Tasks, no sleep-based timing, no multi-phase choreography.
+    // The spring's own damping ratio produces the wobble naturally — if damping < 1
+    // the spring overshoots and oscillates to rest, which IS the wobble effect.
+    // This eliminates the entire class of "two concurrent withAnimation on the same
+    // binding" crashes that multi-Task approaches produce.
 
     func startJellyHover() {
-        // 500 ms cooldown: suppress re-triggers caused by the cursor grazing the pill
-        // edge and rapidly alternating enter/exit events.  The wobble animation is
-        // ~300 ms; a 500 ms gate gives a comfortable visual rest between wobbles.
-        let now = Date()
-        guard now.timeIntervalSince(lastJellyFiredAt) >= 0.5 else { return }
-        lastJellyFiredAt = now
-
-        jellyTask?.cancel()
-        jellyTask = Task { @MainActor in
-            do {
-                // Phase 1 — impact: cursor enters, pill squashes outward
-                withAnimation(.spring(response: 0.15, dampingFraction: 0.55)) {
-                    self.jellyX = 1.12; self.jellyY = 0.86
-                }
-                try await Task.sleep(nanoseconds: 120_000_000)
-
-                // Phase 2 — rebound: liquid springs back through overshoot
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.48)) {
-                    self.jellyX = 0.94; self.jellyY = 1.09
-                }
-                try await Task.sleep(nanoseconds: 170_000_000)
-
-                // Phase 3 — settle: return to exact neutral and stay there.
-                // No looping — a moving pill makes it harder to aim the drop.
-                // The hitbox (NSView.bounds = 288×96) never changes with
-                // scaleEffect, but a still pill is easier to target visually.
-                withAnimation(.spring(response: 0.38, dampingFraction: 0.80)) {
-                    self.jellyX = 1.0; self.jellyY = 1.0
-                }
-                // Task ends — pill is perfectly still while cursor hovers.
-            } catch {
-                // Cancelled (cursor left mid-wobble). stopJellyHover() will
-                // snap back to neutral so the pill is never stuck mid-squash.
-            }
+        // Overdamped enough to reach 1.12 cleanly without oscillating past it.
+        withAnimation(.spring(response: 0.22, dampingFraction: 0.72)) {
+            jellyX = 1.12; jellyY = 1.12
         }
     }
 
     func stopJellyHover() {
-        jellyTask?.cancel()
-        jellyTask = nil
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
+        // Low damping fraction → spring overshoots 1.0 and oscillates briefly.
+        // That oscillation is the wobble. No manual phase timing needed.
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.44)) {
             jellyX = 1.0; jellyY = 1.0
         }
     }
 
+    // MARK: - State
+
     func setChips(url: URL) {
+        // Fresh drop — previous session's cached result no longer relevant.
+        cachedResult = nil
         stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
         customPrompt = ""
     }
 
+    /// Navigate back to the chips stage while keeping the current result cached
+    /// so the user can tap → to restore it without re-running the AI.
+    func navigateBackToChips(savingResult result: Stage, url: URL) {
+        cachedResult = result
+        stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
+        customPrompt = ""
+    }
+
+    /// Partial reset: clears transient interaction flags without touching `stage`.
+    /// Called at the START of hideOverlay() so the fade animation plays over the
+    /// current stage's UI — not over a prematurely-switched WaitingPillView.
+    func partialReset() {
+        isDragHovering = false
+        isDraggingOut  = false
+        jellyX         = 1.0
+        jellyY         = 1.0
+    }
+
+    /// Full state reset. Called once the dismiss animation completes (window hidden)
+    /// or when a fading window is recycled by ensureOverlayVisible().
+    /// Restores isChipsExpanded / isFollowupsExpanded from the persisted preference
+    /// so the next session starts in the state the user left it.
     func reset() {
-        jellyTask?.cancel()
-        jellyTask        = nil
-        stage            = .waitingForDrop
-        isDragHovering   = false
-        isDraggingOut    = false
-        customPrompt     = ""
-        jellyX           = 1.0
-        jellyY           = 1.0
-        lastJellyFiredAt = .distantPast   // reset cooldown so next session starts fresh
+        stage         = .waitingForDrop
+        isDragHovering = false
+        isDraggingOut  = false
+        customPrompt   = ""
+        cachedResult   = nil
+        jellyX         = 1.0
+        jellyY         = 1.0
+        isCollapsing   = false
+        // Restore saved preferences so each new session matches the last one.
+        isChipsExpanded     = UserDefaults.standard.object(forKey: Self.keyChipsExpanded)     as? Bool ?? true
+        isFollowupsExpanded = UserDefaults.standard.object(forKey: Self.keyFollowupsExpanded) as? Bool ?? false
     }
 }

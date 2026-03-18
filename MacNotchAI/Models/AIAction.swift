@@ -23,6 +23,11 @@ enum AIAction: String, CaseIterable, Identifiable {
     case extractTextFromImage   = "Extract Text (OCR)"
     case generateAltText        = "Generate Alt Text"
 
+    // Free-form follow-up — used when the user types a custom question
+    // in the prompt field. System prompt deliberately stays neutral so the
+    // AI answers the question instead of applying a fixed transformation.
+    case freeform               = "Custom Query"
+
     var id: String { rawValue }
 
     var systemPrompt: String {
@@ -59,6 +64,8 @@ enum AIAction: String, CaseIterable, Identifiable {
             return "Extract and transcribe all text visible in this image."
         case .generateAltText:
             return "Write concise, descriptive alt text for this image suitable for accessibility."
+        case .freeform:
+            return "You are a helpful document assistant. The user's message contains a question followed by the document content. Answer the question accurately and concisely using the document as context. Do not summarise unless asked."
         }
     }
 }
