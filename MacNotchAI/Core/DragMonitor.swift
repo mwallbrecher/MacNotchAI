@@ -39,11 +39,28 @@ class DragMonitor: ObservableObject {
             MainActor.assumeIsolated { DragMonitor.shared.handleDrag(event) }
         }
 
-        // mouseUp monitor kept as a fast-path fallback for non-drag-session
-        // mouse releases (e.g. user clicks and barely moves).
+        // mouseUp monitor — fast-path fallback for releases that happen outside
+        // the AppKit drag-session modal loop (e.g. user barely moves before releasing).
+        //
+        // CRITICAL — the pressed-button guard:
+        // The callback fires 50 ms after the mouse button is released.  During those
+        // 50 ms the user may have already STARTED A NEW DRAG (pressed the button again).
+        // Without the guard, handleMouseUp() fires while a new drag is active:
+        //   • isDraggingFile = false  →  Combine sink calls hideOverlay()
+        //   • stopPolling() snapshots the NEW drag's changeCount into lastDragChangeCount
+        //   • Every subsequent handleDrag for the new drag sees count == lastDragChangeCount
+        //     → returns early → isDraggingFile never set back to true → pill gone forever
+        //
+        // NSEvent.pressedMouseButtons bit 0 = left button.  If it is set the user
+        // has already pressed the button again — this release belonged to the previous
+        // drag, not the current one.  Skip cleanup entirely and let the poll timer or
+        // the new drag's own completion path handle teardown.
         mouseUpMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                MainActor.assumeIsolated { DragMonitor.shared.handleMouseUp() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                MainActor.assumeIsolated {
+                    guard NSEvent.pressedMouseButtons & 1 == 0 else { return }
+                    DragMonitor.shared.handleMouseUp()
+                }
             }
         }
     }
@@ -68,11 +85,24 @@ class DragMonitor: ObservableObject {
         let pb    = NSPasteboard(name: .drag)
         let count = pb.changeCount
 
-        // Skip events where the pasteboard hasn't changed — these are either
-        // continued drag-move events for an already-detected drag (isDraggingFile
-        // is already true, polling handles cleanup) or plain mouse moves after a
-        // previous drag whose stale contents are still in the pasteboard.
-        guard count != lastDragChangeCount else { return }
+        // Normal case: same pasteboard content as last time — either a continued
+        // drag-move event for an already-detected drag, or a plain mouse move with
+        // stale pasteboard data from a previous drag.
+        guard count != lastDragChangeCount else {
+            // Defence-in-depth re-arm:
+            // If isDraggingFile was spuriously cleared while this drag session is
+            // still live (the pressedMouseButtons guard above now prevents this in
+            // most cases, but guard against any other future path), re-detect here.
+            // Safe because stopPolling() snapshots the pasteboard changeCount into
+            // lastDragChangeCount only when the pasteboard is genuinely empty —
+            // so when we reach this branch with isDraggingFile=false AND a file is
+            // still on the pasteboard, we know the drag is still active.
+            if !isDraggingFile && hasFile(on: pb) && HotkeyManager.shared.isHotkeyHeld() {
+                isDraggingFile = true
+                startPolling()
+            }
+            return
+        }
         lastDragChangeCount = count
 
         let hasDrag = hasFile(on: pb)
