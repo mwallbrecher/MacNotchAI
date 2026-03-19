@@ -84,11 +84,6 @@ The entire flow happens in a floating black panel — no app switching, no typin
 
 All API keys are stored in **macOS Keychain** — never in files, never in the app bundle.
 
-### UX Details
-- Close (×) button integrated into the file header row — never obscured by scrollbars
-- Escape key or click-outside dismisses the pill (stages 2/3 stay open — shelf behaviour)
-- Pill hides reliably when drag is released without dropping (`.common`-mode polling timer works inside AppKit's drag session modal loop)
-
 ---
 
 ## Requirements
@@ -205,7 +200,7 @@ MacNotchAI/
 ## Inspired By
 
 - Apple's **Dynamic Island** interaction philosophy — contextual, springy, alive
-- The HCI research finding that **task-switching overhead** is the primary friction in AI-assisted workflows
+- My HCI research finding that **task-switching overhead** is the primary friction in AI-assisted workflows
 - The idea that **the OS itself** is the best AI interface — not another app
 
 ---
