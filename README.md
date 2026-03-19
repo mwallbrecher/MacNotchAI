@@ -8,7 +8,7 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 
 ## How to Install
 
-1. Download **AIDropv0.5.dmg** from the [latest release](https://github.com/mwallbrecher/MacNotchAI/releases/latest)
+1. Download **AIDropv.dmg** from the [latest release](https://github.com/mwallbrecher/MacNotchAI/releases/latest)
 2. Open the DMG and drag **MacNotchAI.app** into your **Applications** folder
 3. Launch the app — it lives in your **menu bar** (look for the ✦ icon)
 4. On first launch, pick your AI provider and paste your API key
@@ -20,7 +20,7 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 
 ## The Problem It Solves
 
-Opening a file → switching to a browser → uploading it to an AI chat → waiting → copying the result back — this workflow has been measured at **17–41 seconds of task completion overhead** per interaction (Kingston University HCI study, 2025). That overhead compounds every time you need a summary, a translation, or a key-date extraction.
+Opening a file → switching to a browser → uploading it to an AI chat → waiting → copying the result back — this workflow has been measured at **17–41 seconds of task completion overhead** per interaction (Moritz Wallbrecher at Kingston University, 2026). That overhead compounds every time you need a summary, a translation, or a key-date extraction.
 
 AI Drop eliminates every step except the one that matters: **what do you want to do with this file?**
 
