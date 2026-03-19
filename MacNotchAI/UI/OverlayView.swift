@@ -200,6 +200,25 @@ private struct ChipsColumnView: View {
             }
 
             PromptField(text: $vm.customPrompt, onSubmit: runCustomPrompt)
+
+            // Handoff confirmation pill — pops in ~0.18 s after navigation, stays
+            // 6 s then dissolves with a wobbly spring so it feels alive not abrupt.
+            if let name = vm.handoffProviderName {
+                HStack(spacing: 6 * scale) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 11 * scale, weight: .semibold))
+                        .foregroundColor(.green)
+                    Text("Session opened in \(name).")
+                        .font(.system(size: 11 * scale, weight: .medium))
+                        .foregroundColor(.white.opacity(0.55))
+                }
+                .padding(.horizontal, 10 * scale)
+                .padding(.vertical, 6 * scale)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .background(Color.green.opacity(0.10))
+                .liquidGlassCapsule(tintOpacity: 0.08)
+                .transition(.scale(scale: 0.85, anchor: .bottom).combined(with: .opacity))
+            }
         }
         .padding(18 * scale)
         .frame(width: 280 * scale, alignment: .topLeading)
@@ -873,13 +892,29 @@ private struct HandoffButton: View {
     var body: some View {
         Button {
             guard !didTap else { return }
+            didTap = true
             HandoffManager.handOff(fileURL: fileURL, action: action, result: result)
-            // Navigate back to stage 2 with chips collapsed — same as drag-out.
             let vm = OverlayViewModel.shared
+            let providerName = HandoffManager.providerName()
             if case .result = vm.stage {
+                // Navigate to stage 2 instantly — the button disappears with the card.
                 withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) {
                     vm.navigateBackToChips(savingResult: vm.stage, url: fileURL)
                     vm.isChipsExpanded = false
+                }
+                // Pop the confirmation pill into the already-visible stage 2 card
+                // after the navigation spring has had a moment to settle.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                    withAnimation(.spring(response: 0.30, dampingFraction: 0.72)) {
+                        vm.handoffProviderName = providerName
+                    }
+                }
+                // Wobbly spring fade-out after 6 s — low damping produces a gentle
+                // oscillation as the pill dissolves, matching the entry spring feel.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) {
+                    withAnimation(.spring(response: 0.45, dampingFraction: 0.52)) {
+                        vm.handoffProviderName = nil
+                    }
                 }
             }
         } label: {

@@ -80,6 +80,9 @@ class OverlayViewModel: ObservableObject {
     // restore it via → without re-running the AI call. Cleared on fresh drop,
     // new action start, or full reset.
     @Published var cachedResult: Stage? = nil
+    // Drives the "Session opened in …" confirmation pill in stage 2.
+    // Set after handoff navigation, auto-cleared after 6 s.
+    @Published var handoffProviderName: String? = nil
 
     // ── Jelly wobble ─────────────────────────────────────────────────────────
     // Applied to the pill scaleEffect in OverlayView (outside clipShape so it
@@ -143,10 +146,11 @@ class OverlayViewModel: ObservableObject {
     /// Called at the START of hideOverlay() so the fade animation plays over the
     /// current stage's UI — not over a prematurely-switched WaitingPillView.
     func partialReset() {
-        isDragHovering = false
-        isDraggingOut  = false
-        jellyX         = 1.0
-        jellyY         = 1.0
+        isDragHovering      = false
+        isDraggingOut       = false
+        handoffProviderName = nil
+        jellyX              = 1.0
+        jellyY              = 1.0
     }
 
     /// Full state reset. Called once the dismiss animation completes (window hidden)
@@ -158,8 +162,9 @@ class OverlayViewModel: ObservableObject {
         isDragHovering = false
         isDraggingOut  = false
         customPrompt   = ""
-        cachedResult   = nil
-        jellyX         = 1.0
+        cachedResult        = nil
+        handoffProviderName = nil
+        jellyX              = 1.0
         jellyY         = 1.0
         isCollapsing   = false
         // Restore saved preferences so each new session matches the last one.
