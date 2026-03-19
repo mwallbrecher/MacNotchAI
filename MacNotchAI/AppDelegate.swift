@@ -9,6 +9,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var escapeMonitor: Any?
     private var outsideClickMonitor: Any?
+    private var dragOutEndTimer: Timer?          // polls mouse state after a drag-out gesture
 
     // ── Dismiss-race protection ───────────────────────────────────────────────
     // When hideOverlay() fires, dismissAnimated() starts a 0.14 s alpha fade.
@@ -34,6 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         checkAccessibilityPermission()
         DragMonitor.shared.startMonitoring()
         observeDragState()
+        observeDragOutState()
         observeStageChanges()
         observeChipsExpanded()
 
@@ -147,15 +149,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         // time this sink fires, keep the pill visible instead of hiding it.
                         guard !DragMonitor.shared.isDraggingFile else { return }
                         self.hideOverlay()
-                    } else if vm.isDraggingOut {
-                        // User dragged the file out — clear the flag but keep
-                        // the shelf open. Only × or Escape can dismiss it now.
-                        vm.isDraggingOut = false
                     }
                     // Shelf stays open until the user explicitly closes it.
+                    // Drag-out roll-back is handled separately by observeDragOutState().
                 }
             }
             .store(in: &cancellables)
+    }
+
+    // MARK: - Drag-out detection
+    //
+    // SwiftUI's .onDrag uses an internal AppKit NSDraggingSession that does NOT
+    // write to NSPasteboard(name: .drag), so DragMonitor never sees it and
+    // isDraggingFile never changes.  Global leftMouseUp monitors are also silenced
+    // inside AppKit's .eventTracking runloop mode.
+    //
+    // Solution: the moment isDraggingOut becomes true, start a 50 ms timer in
+    // .common runloop mode (fires in ALL modes, including .eventTracking) that
+    // polls NSEvent.pressedMouseButtons.  When the left button is released the
+    // drag has ended — apply the stage roll-back and stop the timer.
+
+    private func observeDragOutState() {
+        OverlayViewModel.shared.$isDraggingOut
+            .receive(on: DispatchQueue.main)
+            .removeDuplicates()
+            .sink { [weak self] draggingOut in
+                if draggingOut {
+                    self?.startDragOutEndDetector()
+                } else {
+                    self?.stopDragOutEndDetector()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func startDragOutEndDetector() {
+        stopDragOutEndDetector()
+        let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                // Left mouse button no longer held — drag session has ended.
+                if NSEvent.pressedMouseButtons & 1 == 0 {
+                    self?.handleDragOutEnded()
+                }
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        dragOutEndTimer = t
+    }
+
+    private func stopDragOutEndDetector() {
+        dragOutEndTimer?.invalidate()
+        dragOutEndTimer = nil
+    }
+
+    @MainActor
+    private func handleDragOutEnded() {
+        stopDragOutEndDetector()
+        let vm = OverlayViewModel.shared
+        guard vm.isDraggingOut else { return }
+        vm.isDraggingOut = false
+
+        if case .result(let url, _, _) = vm.stage {
+            // Stage 3 → stage 2. Keep the AI reply cached so → can restore it.
+            // Also collapse chips so the shelf lands in its compact resting state.
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) {
+                vm.navigateBackToChips(savingResult: vm.stage, url: url)
+                vm.isChipsExpanded = false
+            }
+        } else if case .chips = vm.stage, vm.isChipsExpanded {
+            // Stage 2 with chips shown → collapse them.
+            withAnimation(.spring(response: 0.18, dampingFraction: 1.0)) {
+                vm.isChipsExpanded = false
+            }
+        }
     }
 
     private func observeStageChanges() {

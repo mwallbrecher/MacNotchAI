@@ -874,9 +874,13 @@ private struct HandoffButton: View {
         Button {
             guard !didTap else { return }
             HandoffManager.handOff(fileURL: fileURL, action: action, result: result)
-            withAnimation(.spring(response: 0.25, dampingFraction: 0.72)) { didTap = true }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { didTap = false }
+            // Navigate back to stage 2 with chips collapsed — same as drag-out.
+            let vm = OverlayViewModel.shared
+            if case .result = vm.stage {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) {
+                    vm.navigateBackToChips(savingResult: vm.stage, url: fileURL)
+                    vm.isChipsExpanded = false
+                }
             }
         } label: {
             HStack(spacing: 5 * scale) {
