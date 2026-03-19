@@ -4,6 +4,12 @@ import PDFKit
 struct FileContentExtractor {
 
     static func extract(from url: URL) async throws -> String {
+        // Under Hardened Runtime, URLs received via drag-and-drop from Finder
+        // arrive as security-scoped URLs. startAccessingSecurityScopedResource()
+        // is required to read them; for plain path URLs it is a harmless no-op.
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
         let ext = url.pathExtension.lowercased()
 
         switch ext {
@@ -22,6 +28,7 @@ struct FileContentExtractor {
     }
 
     private static func extractPDF(from url: URL) throws -> String {
+        // Security scope is already active from the caller (extract).
         guard let pdf = PDFDocument(url: url) else {
             throw ExtractionError.cannotOpenPDF
         }
