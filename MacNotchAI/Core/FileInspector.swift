@@ -19,9 +19,20 @@ struct FileInspector {
             return [.summariseBullets, .extractKeyPoints]
         case "json", "xml", "yaml", "yml":
             return [.explainCode, .summariseBullets]
+        case "mp4", "mov", "avi", "mkv", "m4v", "wmv", "flv", "webm",
+             "zip", "rar", "7z", "tar", "gz",
+             "dmg", "pkg", "exe",
+             "mp3", "aac", "wav", "flac", "ogg", "m4a":
+            return []   // unsupported — caller should show error state
         default:
             return [.summariseBullets, .summariseShort, .extractKeyPoints]
         }
+    }
+
+    /// Returns true for file types AI Drop cannot process.
+    /// Drop handlers use this to route directly to the error stage.
+    static func isUnsupportedFileType(_ url: URL) -> Bool {
+        suggestedActions(for: url).isEmpty
     }
 
     static func isImageFile(_ url: URL) -> Bool {

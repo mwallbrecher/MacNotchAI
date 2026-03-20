@@ -90,6 +90,19 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
               let url = cachedDropURL else { cachedDropURL = nil; return false }
         cachedDropURL = nil
 
+        // Reject unsupported binary types (video, audio, archives) immediately —
+        // go straight to the error stage so we never attempt to layout a chips
+        // column for a file we cannot read. This also avoids the pill→chips window
+        // resize that can trigger the recursive "Update Constraints in Window" crash
+        // when the content size constraints are unexpectedly large (e.g. a 6 MB MP4).
+        if FileInspector.isUnsupportedFileType(url) {
+            OverlayViewModel.shared.stage = .error(
+                url: url,
+                message: ""\(url.lastPathComponent)" can't be analysed.\nAI Drop supports PDF, text, images, and code files."
+            )
+            return true
+        }
+
         // Animate chips column in with a spring — the transition IS the catch feedback.
         withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) {
             OverlayViewModel.shared.setChips(url: url)

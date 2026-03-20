@@ -67,7 +67,13 @@ class OverlayWindow: NSPanel {
     func animateTo(size: CGSize, anchorAtNotchCenter: Bool) {
         let newFrame = notchFrame(for: size, anchorAtNotchCenter: anchorAtNotchCenter)
         guard frame != newFrame else { return }
-        setFrame(newFrame, display: true)
+        // display: false — do NOT trigger an immediate AppKit redraw here.
+        // display: true causes AppKit to start a layout pass synchronously inside
+        // setFrame; if a SwiftUI transition is already mid-flight (e.g. pill → chips)
+        // that second layout pass re-enters the constraint solver before it has
+        // finished, producing "more Update Constraints in Window passes than views" → abort().
+        // AppKit will schedule its own display on the next run-loop cycle automatically.
+        setFrame(newFrame, display: false)
     }
 
     // MARK: - Private helpers

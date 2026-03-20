@@ -4,6 +4,10 @@
 
 AI Drop is a native macOS menu-bar app that turns your physical notch into an AI interface. While dragging a file, a pill emerges from the notch. Drop the file on it, pick an action, and the result appears inline — no browser, no chat window, no context switching.
 
+![AI Drop in action](https://github.com/mwallbrecher/MacNotchAI/releases/download/v0.7.0/AiDropPopUp.gif)
+
+> 📄 Read the full research background on the [publication page](https://moritzwallbrecher.com/publication).
+
 ---
 
 ## How to Install
