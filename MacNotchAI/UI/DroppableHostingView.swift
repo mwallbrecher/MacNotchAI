@@ -98,7 +98,7 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
         if FileInspector.isUnsupportedFileType(url) {
             OverlayViewModel.shared.stage = .error(
                 url: url,
-                message: ""\(url.lastPathComponent)" can't be analysed.\nAI Drop supports PDF, text, images, and code files."
+                message: "\"\(url.lastPathComponent)\" can't be analysed.\nAI Drop supports PDF, text, images, and code files."
             )
             return true
         }
