@@ -18,7 +18,16 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 4. On first launch, pick your AI provider and paste your API key
 5. Drag any file toward the top of your screen to get started
 
-> **First open:** macOS may block the app because it isn't notarized yet. Right-click → **Open** to bypass Gatekeeper, or go to **System Settings → Privacy & Security → Open Anyway**.
+> **First open:** macOS will block the app because it isn't notarized yet. The right-click → Open bypass was removed in macOS 15 Sequoia. Use one of the two methods below.
+>
+> **Option A — System Settings (no Terminal)**
+> After the "Not Opened" dialog, go to **System Settings → Privacy & Security**, scroll down, and click **"Open Anyway"** next to MacNotchAI.
+>
+> **Option B — Terminal (one command)**
+> ```bash
+> xattr -cr /Applications/MacNotchAI.app
+> ```
+> Then double-click the app to launch. This removes the quarantine flag macOS attaches to downloaded files.
 
 ---
 
