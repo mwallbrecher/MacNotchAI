@@ -18,17 +18,14 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 4. On first launch, pick your AI provider and paste your API key
 5. Drag any file toward the top of your screen to get started
 
-> **First open:** macOS will block the app because it isn't notarized yet. The right-click → Open bypass was removed in macOS 15 Sequoia. Use one of the two methods below.
+> **macOS Gatekeeper — run this before opening the DMG**
+> macOS will block unsigned apps. The easiest fix is to strip the quarantine flag from the downloaded DMG *before* you open it:
+> 1. Open **Terminal** (Spotlight → Terminal)
+> 2. Type `xattr -cr ` (with a trailing space), then **drag the DMG file from Finder into the Terminal window** so the path fills in automatically
+> 3. Press **Return**
+> 4. Now open the DMG and drag the app to Applications as normal
 >
-> **Option A — System Settings (no Terminal)**
-> After the "Not Opened" dialog, go to **System Settings → Privacy & Security**, scroll down, and click **"Open Anyway"** next to MacNotchAI.
->
-> **Option B — Terminal**
-> Open Terminal, type `xattr -cr ` (with a trailing space), then **drag the app from Finder into the Terminal window** to auto-fill the correct path, and press Return:
-> ```bash
-> xattr -cr /Applications/AI\ Drop.app
-> ```
-> Then double-click the app to launch. This removes the quarantine flag macOS attaches to downloaded files.
+> If you already moved the app to Applications and it's blocked there, repeat the same steps but drag the app instead of the DMG.
 
 ---
 
