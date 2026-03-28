@@ -23,9 +23,10 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 > **Option A — System Settings (no Terminal)**
 > After the "Not Opened" dialog, go to **System Settings → Privacy & Security**, scroll down, and click **"Open Anyway"** next to MacNotchAI.
 >
-> **Option B — Terminal (one command)**
+> **Option B — Terminal**
+> Open Terminal, type `xattr -cr ` (with a trailing space), then **drag the app from Finder into the Terminal window** to auto-fill the correct path, and press Return:
 > ```bash
-> xattr -cr /Applications/MacNotchAI.app
+> xattr -cr /Applications/AI\ Drop.app
 > ```
 > Then double-click the app to launch. This removes the quarantine flag macOS attaches to downloaded files.
 
