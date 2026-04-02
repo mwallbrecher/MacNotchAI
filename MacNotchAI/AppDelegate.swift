@@ -6,6 +6,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayWindow: OverlayWindow?
     private var onboardingWindow: NSWindow?
     private var hotkeyPickerWindow: NSWindow?
+    private var startupToastWindow: NSPanel?
     private var cancellables = Set<AnyCancellable>()
     private var escapeMonitor: Any?
     private var outsideClickMonitor: Any?
@@ -77,6 +78,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 self.showOnboarding()
+            }
+        }
+
+        // Brief startup toast — let the user know AI Drop is alive and ready.
+        // Skip on the very first launch (onboarding already greets them).
+        if UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+                self.showStartupToast()
             }
         }
     }
@@ -293,6 +302,65 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Retain for 2 s then release — SwiftUI/Metal are warmed up by then.
         var retained: NSWindow? = win
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { retained = nil }
+    }
+
+    // MARK: - Startup toast
+
+    /// Shows a compact "AI Drop is ready" banner just below the notch for 5 s,
+    /// then spring-fades it out. Called on every launch after onboarding is done.
+    private func showStartupToast() {
+        guard startupToastWindow == nil else { return }
+
+        let toastW: CGFloat = 390
+        let toastH: CGFloat = 56     // matches StartupToastView intrinsic height
+
+        // ── Build the floating panel ────────────────────────────────────────
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: toastW, height: toastH),
+            styleMask:   [.nonactivatingPanel, .fullSizeContentView, .borderless],
+            backing:     .buffered,
+            defer:       false
+        )
+        panel.isFloatingPanel             = true
+        panel.level                       = .floating
+        panel.backgroundColor             = .clear
+        panel.isOpaque                    = false
+        panel.hasShadow                   = false
+        panel.isMovableByWindowBackground = false
+        panel.collectionBehavior          = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        // ── Observable state that drives the SwiftUI spring animation ───────
+        let toastState = StartupToastState()
+        let hosting = NSHostingView(rootView: StartupToastView(state: toastState))
+        hosting.wantsLayer = true
+        hosting.layer?.backgroundColor = CGColor.clear
+        panel.contentView = hosting
+
+        // ── Position: centred on screen, just below the notch ──────────────
+        if let screen = NSScreen.main {
+            let x = (screen.frame.width - toastW) / 2
+            // notchBottomY=37 + 10 pt gap = top edge of the toast window
+            let y = screen.frame.height - 37 - toastH - 10
+            panel.setFrame(NSRect(x: x, y: y, width: toastW, height: toastH),
+                           display: false)
+        }
+
+        panel.orderFront(nil)
+        startupToastWindow = panel
+
+        // Trigger the spring pop-in one run-loop cycle after orderFront so
+        // the window is fully composited before the animation starts.
+        DispatchQueue.main.async {
+            toastState.show()
+        }
+
+        // ── Auto-dismiss after 5 s ──────────────────────────────────────────
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            toastState.dismiss {
+                self?.startupToastWindow?.orderOut(nil)
+                self?.startupToastWindow = nil
+            }
+        }
     }
 
     private func ensureOverlayVisible() {
