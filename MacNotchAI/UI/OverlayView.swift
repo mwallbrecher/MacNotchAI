@@ -1156,13 +1156,18 @@ private struct SecondFileDragOverlay: View {
 
     var body: some View {
         ZStack {
-            // ── Darkening layer ─────────────────────────────────────────────
+            // ── Blur + light darkening — lets the session content show through ──
+            // withinWindow blending blurs the card content that sits below this
+            // view in the same window's ZStack, so the AI reply / chips remain
+            // legible as a ghosted backdrop while the drag hint is in the foreground.
+            // The black tint is intentionally low so the blurred session is visible;
+            // hover bumps it slightly to make the "Release" text easier to read.
             VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
-            Color.black.opacity(isHovering ? 0.72 : 0.58)
+            Color.black.opacity(isHovering ? 0.38 : 0.22)
                 .animation(.easeInOut(duration: 0.14), value: isHovering)
 
             // Optional blue tint mirrors the stage-1 pill hover colour
-            Color.accentColor.opacity(isHovering ? 0.10 : 0)
+            Color.accentColor.opacity(isHovering ? 0.08 : 0)
                 .animation(.easeInOut(duration: 0.14), value: isHovering)
 
             // ── Icon + text ─────────────────────────────────────────────────
