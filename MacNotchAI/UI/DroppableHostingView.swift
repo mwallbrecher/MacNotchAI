@@ -75,37 +75,36 @@ final class DroppableHostingView<Content: View>: NSHostingView<Content> {
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         // Clear hover and signal drag-end UNCONDITIONALLY — the user released the
         // mouse button so the drag session is over regardless of payload validity.
-        // dragCompleted() before the guard prevents the poll timer outliving this
-        // point and avoids the race where a failed guard leaves the timer firing
-        // hideOverlay() during a new drag session.
         OverlayViewModel.shared.isDragHovering = false
         DragMonitor.shared.dragCompleted()
 
-        // Use the URL cached during draggingEntered — zero pasteboard I/O here.
-        // Do NOT fall back to extractURL(from: sender.draggingPasteboard): that
-        // call can stall 150-300 ms at drop time because the source app begins
-        // tearing down its drag session the instant the mouse button is released,
-        // racing the pasteboard IPC and blocking the main thread → UI freeze.
-        guard case .waitingForDrop = OverlayViewModel.shared.stage,
-              let url = cachedDropURL else { cachedDropURL = nil; return false }
+        guard let url = cachedDropURL else { cachedDropURL = nil; return false }
         cachedDropURL = nil
 
-        // Reject unsupported binary types (video, audio, archives) immediately —
-        // go straight to the error stage so we never attempt to layout a chips
-        // column for a file we cannot read. This also avoids the pill→chips window
-        // resize that can trigger the recursive "Update Constraints in Window" crash
-        // when the content size constraints are unexpectedly large (e.g. a 6 MB MP4).
+        let vm = OverlayViewModel.shared
+
+        // ── Active session: offer add/replace ────────────────────────────────────
+        // Stage 2/3 is open — don't replace the session silently. Instead set the
+        // pending URL so the banner prompt appears inside the card.
+        guard case .waitingForDrop = vm.stage else {
+            // Unsupported types can't be added to a session either
+            guard !FileInspector.isUnsupportedFileType(url) else { return false }
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.68)) {
+                vm.pendingSecondFileURL = url
+            }
+            return true
+        }
+
+        // ── Normal first-file flow ────────────────────────────────────────────────
         if FileInspector.isUnsupportedFileType(url) {
-            OverlayViewModel.shared.stage = .error(
+            vm.stage = .error(
                 url: url,
                 message: "\"\(url.lastPathComponent)\" can't be analysed.\nAI Drop supports PDF, text, images, and code files."
             )
             return true
         }
-
-        // Animate chips column in with a spring — the transition IS the catch feedback.
         withAnimation(.spring(response: 0.42, dampingFraction: 0.58)) {
-            OverlayViewModel.shared.setChips(url: url)
+            vm.setChips(url: url)
         }
         return true
     }

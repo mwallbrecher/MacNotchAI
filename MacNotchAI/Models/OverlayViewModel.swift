@@ -84,6 +84,16 @@ class OverlayViewModel: ObservableObject {
     // Set after handoff navigation, auto-cleared after 6 s.
     @Published var handoffProviderName: String? = nil
 
+    /// URL of a second file dropped while an active session is running.
+    /// Shown as a banner prompt: "Add to session" or "New session".
+    /// Cleared when the user picks an option or dismisses.
+    @Published var pendingSecondFileURL: URL? = nil
+
+    /// Files added to the current session via "Add to session".
+    /// Their content is concatenated with the primary file's content in AI calls.
+    /// Cleared on reset() and setChips() (fresh session).
+    @Published var additionalFileURLs: [URL] = []
+
     // ── Jelly wobble ─────────────────────────────────────────────────────────
     // Applied to the pill scaleEffect in OverlayView (outside clipShape so it
     // overflows into the transparent canvas without hitting NSHostingView clip).
@@ -128,6 +138,7 @@ class OverlayViewModel: ObservableObject {
     // MARK: - State
 
     func setChips(url: URL) {
+        additionalFileURLs = []   // fresh drop clears any previously added files
         // Fresh drop — previous session's cached result no longer relevant.
         cachedResult = nil
         stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
@@ -149,6 +160,7 @@ class OverlayViewModel: ObservableObject {
         isDragHovering      = false
         isDraggingOut       = false
         handoffProviderName = nil
+        pendingSecondFileURL = nil
         jellyX              = 1.0
         jellyY              = 1.0
     }
@@ -164,6 +176,8 @@ class OverlayViewModel: ObservableObject {
         customPrompt   = ""
         cachedResult        = nil
         handoffProviderName = nil
+        pendingSecondFileURL  = nil
+        additionalFileURLs    = []
         jellyX              = 1.0
         jellyY         = 1.0
         isCollapsing   = false

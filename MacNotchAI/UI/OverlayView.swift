@@ -42,29 +42,40 @@ struct OverlayView: View {
                     .transition(.identity)
 
             default:
-                // No ZStack overlay — CloseButton lives inside FileHeaderView
-                // so it is part of the layout flow and can never be obscured
-                // by a ScrollView scrollbar or any other sibling view.
-                Group {
-                    switch vm.stage {
-                    case .chips(let url, let actions):
-                        ChipsColumnView(fileURL: url, actions: actions, provider: provider, closeNS: closeNS)
-                            .transition(.asymmetric(
-                                insertion: .scale(scale: 0.88, anchor: .top)
-                                    .combined(with: .opacity),
-                                removal: .scale(scale: 0.92, anchor: .top)
-                                    .combined(with: .opacity)
-                            ))
-                    case .loading(let url, _), .result(let url, _, _), .error(let url, _):
-                        TwoColumnView(fileURL: url, provider: provider, closeNS: closeNS)
-                            .transition(.asymmetric(
-                                insertion: .move(edge: .trailing).combined(with: .opacity),
-                                removal: .opacity
-                            ))
-                    default:
-                        EmptyView()
+                // ZStack lets the SecondFilePromptBanner overlay the bottom of the
+                // card. Both card content and banner are wrapped together BEFORE
+                // liquidGlass so the clipShape includes the banner.
+                ZStack(alignment: .bottom) {
+                    Group {
+                        switch vm.stage {
+                        case .chips(let url, let actions):
+                            ChipsColumnView(fileURL: url, actions: actions, provider: provider, closeNS: closeNS)
+                                .transition(.asymmetric(
+                                    insertion: .scale(scale: 0.88, anchor: .top)
+                                        .combined(with: .opacity),
+                                    removal: .scale(scale: 0.92, anchor: .top)
+                                        .combined(with: .opacity)
+                                ))
+                        case .loading(let url, _), .result(let url, _, _), .error(let url, _):
+                            TwoColumnView(fileURL: url, provider: provider, closeNS: closeNS)
+                                .transition(.asymmetric(
+                                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                                    removal: .opacity
+                                ))
+                        default:
+                            EmptyView()
+                        }
+                    }
+
+                    // Second-file prompt banner — spring-slides up from the bottom
+                    // edge of the card when a second file is dropped mid-session.
+                    if vm.pendingSecondFileURL != nil {
+                        SecondFilePromptBanner(provider: provider)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
+                .animation(.spring(response: 0.35, dampingFraction: 0.72),
+                            value: vm.pendingSecondFileURL != nil)
                 .liquidGlass(cornerRadius: cornerRadius, tintOpacity: 0.60)
                 .transition(.identity)
             }
@@ -226,12 +237,11 @@ private struct ChipsColumnView: View {
 
     private func runAction(_ action: AIAction) {
         setStage(.loading(url: fileURL, action: action))
+        let additionalURLs = vm.additionalFileURLs
         Task {
             do {
-                let content: String = FileInspector.isImageFile(fileURL)
-                    ? "Analyse the attached image."
-                    : (try await FileContentExtractor.extract(from: fileURL))
-                let imageURL: URL? = FileInspector.isImageFile(fileURL) ? fileURL : nil
+                let (content, imageURL) = try await buildMultiFileContent(
+                    primary: fileURL, additional: additionalURLs)
                 let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
                 setStage(.result(url: fileURL, action: action, text: text))
             } catch {
@@ -244,19 +254,18 @@ private struct ChipsColumnView: View {
         let prompt = vm.customPrompt.trimmingCharacters(in: .whitespaces)
         guard !prompt.isEmpty else { return }
         vm.customPrompt = ""
-        vm.cachedResult = nil   // new query replaces any saved result
-        // Use .freeform so the system prompt asks the AI to *answer the question*
-        // rather than blindly summarising. The user's prompt leads the content
-        // so the AI sees it before the document text.
+        vm.cachedResult = nil
         let action = AIAction.freeform
         setStage(.loading(url: fileURL, action: action))
+        let additionalURLs = vm.additionalFileURLs
         Task {
             do {
-                let body = FileInspector.isImageFile(fileURL)
+                let (baseContent, imageURL) = try await buildMultiFileContent(
+                    primary: fileURL, additional: additionalURLs)
+                let finalContent = imageURL != nil
                     ? "Question: \(prompt)"
-                    : "Question: \(prompt)\n\n--- Document ---\n\(try await FileContentExtractor.extract(from: fileURL))"
-                let imgURL = FileInspector.isImageFile(fileURL) ? fileURL : nil
-                let text   = try await provider.complete(action: action, content: body, imageURL: imgURL)
+                    : "Question: \(prompt)\n\n--- Documents ---\n\(baseContent)"
+                let text = try await provider.complete(action: action, content: finalContent, imageURL: imageURL)
                 setStage(.result(url: fileURL, action: action, text: text))
             } catch {
                 setStage(.error(url: fileURL, message: error.localizedDescription))
@@ -520,15 +529,14 @@ private struct TwoColumnView: View {
 
     private func runAction(_ action: AIAction) {
         vm.customPrompt = ""
-        vm.cachedResult = nil   // new action replaces any saved result
+        vm.cachedResult = nil
         setStage(.loading(url: fileURL, action: action))
+        let additionalURLs = vm.additionalFileURLs
         Task {
             do {
-                let content = FileInspector.isImageFile(fileURL)
-                    ? "Analyse the attached image."
-                    : (try await FileContentExtractor.extract(from: fileURL))
-                let imgURL = FileInspector.isImageFile(fileURL) ? fileURL : nil
-                let text   = try await provider.complete(action: action, content: content, imageURL: imgURL)
+                let (content, imageURL) = try await buildMultiFileContent(
+                    primary: fileURL, additional: additionalURLs)
+                let text = try await provider.complete(action: action, content: content, imageURL: imageURL)
                 setStage(.result(url: fileURL, action: action, text: text))
             } catch {
                 setStage(.error(url: fileURL, message: error.localizedDescription))
@@ -540,19 +548,18 @@ private struct TwoColumnView: View {
         let prompt = vm.customPrompt.trimmingCharacters(in: .whitespaces)
         guard !prompt.isEmpty else { return }
         vm.customPrompt = ""
-        vm.cachedResult = nil   // new query replaces any saved result
-        // Use .freeform so the system prompt asks the AI to *answer the question*
-        // rather than blindly summarising. The user's prompt leads the content
-        // so the AI sees it before the document text.
+        vm.cachedResult = nil
         let action = AIAction.freeform
         setStage(.loading(url: fileURL, action: action))
+        let additionalURLs = vm.additionalFileURLs
         Task {
             do {
-                let body = FileInspector.isImageFile(fileURL)
+                let (baseContent, imageURL) = try await buildMultiFileContent(
+                    primary: fileURL, additional: additionalURLs)
+                let finalContent = imageURL != nil
                     ? "Question: \(prompt)"
-                    : "Question: \(prompt)\n\n--- Document ---\n\(try await FileContentExtractor.extract(from: fileURL))"
-                let imgURL = FileInspector.isImageFile(fileURL) ? fileURL : nil
-                let text   = try await provider.complete(action: action, content: body, imageURL: imgURL)
+                    : "Question: \(prompt)\n\n--- Documents ---\n\(baseContent)"
+                let text = try await provider.complete(action: action, content: finalContent, imageURL: imageURL)
                 setStage(.result(url: fileURL, action: action, text: text))
             } catch {
                 setStage(.error(url: fileURL, message: error.localizedDescription))
@@ -610,11 +617,25 @@ private struct FileHeaderView: View {
 
                 // Name + "Drag to move" — always truncated, never grows the pill.
                 VStack(alignment: .leading, spacing: 1 * scale) {
-                    Text(fileURL.lastPathComponent)
-                        .font(.system(size: 12 * scale, weight: .semibold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    HStack(spacing: 5 * scale) {
+                        Text(fileURL.lastPathComponent)
+                            .font(.system(size: 12 * scale, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if !vm.additionalFileURLs.isEmpty {
+                            Text("+\(vm.additionalFileURLs.count)")
+                                .font(.system(size: 9 * scale, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 5 * scale)
+                                .padding(.vertical, 2 * scale)
+                                .background(Color.accentColor.opacity(0.75))
+                                .clipShape(Capsule(style: .continuous))
+                                .transition(.scale(scale: 0.7).combined(with: .opacity))
+                        }
+                    }
+                    .animation(.spring(response: 0.28, dampingFraction: 0.72),
+                                value: vm.additionalFileURLs.count)
                     Text("Drag to move")
                         .font(.system(size: 9 * scale, weight: .regular))
                         .foregroundColor(.white.opacity(0.35))
@@ -1063,5 +1084,157 @@ struct ActionChip: View {
         .animation(.spring(response: 0.22, dampingFraction: 0.65), value: isHovered)
         .onHover { isHovered = $0 }
         .disabled(isLoading)
+    }
+}
+
+// MARK: - Multi-file content builder
+
+/// Extracts and joins content from all files in the session.
+/// Single-file behaviour is unchanged — exactly the same strings as before.
+/// Multi-file: each file's content is preceded by a filename header.
+/// Returns (content: String, imageURL: URL?) where imageURL is only set
+/// for a SINGLE-image session (no additionals) so vision models work.
+private func buildMultiFileContent(
+    primary fileURL: URL,
+    additional additionalURLs: [URL]
+) async throws -> (content: String, imageURL: URL?) {
+    let allURLs = [fileURL] + additionalURLs
+
+    // ── Single image (no additionals) ─────────────────────────────────────────
+    if allURLs.count == 1, FileInspector.isImageFile(allURLs[0]) {
+        return ("Analyse the attached image.", allURLs[0])
+    }
+
+    // ── Single non-image ──────────────────────────────────────────────────────
+    if allURLs.count == 1 {
+        return (try await FileContentExtractor.extract(from: allURLs[0]), nil)
+    }
+
+    // ── Multiple files ────────────────────────────────────────────────────────
+    var sections: [String] = []
+    for url in allURLs {
+        let body: String
+        if FileInspector.isImageFile(url) {
+            // Vision analysis is only available for single-image sessions;
+            // in multi-file mode describe the image by name / context.
+            body = "[Image: \(url.lastPathComponent) — visual description not available in multi-file mode]"
+        } else {
+            body = (try? await FileContentExtractor.extract(from: url))
+                ?? "[Could not read: \(url.lastPathComponent)]"
+        }
+        sections.append("=== \(url.lastPathComponent) ===\n\(body)")
+    }
+    return (sections.joined(separator: "\n\n"), nil)
+}
+
+// MARK: - Second-file prompt banner
+
+/// Slides up from the bottom of the active card when the user drops a second file
+/// while a session is already open. Offers two choices: add the file to the
+/// current session's AI context, or start a fresh session with just the new file.
+private struct SecondFilePromptBanner: View {
+    let provider: any AIProvider
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        guard let url = vm.pendingSecondFileURL else { return AnyView(EmptyView()) }
+
+        return AnyView(
+            VStack(alignment: .leading, spacing: 8 * scale) {
+
+                // ── Header ─────────────────────────────────────────────────────
+                HStack(spacing: 6 * scale) {
+                    Image(systemName: "doc.badge.plus")
+                        .font(.system(size: 11 * scale, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.65))
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 11 * scale, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    // Dismiss / cancel
+                    Button {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.80)) {
+                            vm.pendingSecondFileURL = nil
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9 * scale, weight: .bold))
+                            .foregroundColor(.white.opacity(0.40))
+                            .frame(width: 20 * scale, height: 20 * scale)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Dismiss")
+                }
+
+                // ── Action buttons ─────────────────────────────────────────────
+                HStack(spacing: 8 * scale) {
+
+                    // Add to session
+                    Button { addToSession(url: url) } label: {
+                        Label("Add to session", systemImage: "plus.circle.fill")
+                            .font(.system(size: 11 * scale, weight: .semibold))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7 * scale)
+                            .background(Color.accentColor.opacity(0.88))
+                            .clipShape(Capsule(style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Analyse both files together in the current session")
+
+                    // New session
+                    Button { startNewSession(url: url) } label: {
+                        Label("New session", systemImage: "arrow.counterclockwise")
+                            .font(.system(size: 11 * scale, weight: .medium))
+                            .foregroundColor(.white.opacity(0.85))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 7 * scale)
+                            .liquidGlassCapsule(tintOpacity: 0.38)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Start a new session with only the new file")
+                }
+            }
+            .padding(.horizontal, 12 * scale)
+            .padding(.top, 10 * scale)
+            .padding(.bottom, 12 * scale)
+            .background(
+                ZStack {
+                    VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
+                    Color.black.opacity(0.55)
+                    // Top separator
+                    VStack(spacing: 0) {
+                        Color.white.opacity(0.13)
+                            .frame(height: 0.75)
+                        Spacer(minLength: 0)
+                    }
+                }
+            )
+        )
+    }
+
+    private func addToSession(url: URL) {
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
+            vm.additionalFileURLs.append(url)
+            vm.pendingSecondFileURL = nil
+            // Update chip actions to the union of all files in the session
+            if case .chips(let primaryURL, _) = vm.stage {
+                let allURLs = [primaryURL] + vm.additionalFileURLs
+                vm.stage = .chips(
+                    url: primaryURL,
+                    actions: FileInspector.suggestedActions(forAll: allURLs)
+                )
+            }
+        }
+    }
+
+    private func startNewSession(url: URL) {
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.68)) {
+            vm.pendingSecondFileURL = nil
+            vm.setChips(url: url)   // setChips() clears additionalFileURLs
+        }
     }
 }

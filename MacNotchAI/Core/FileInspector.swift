@@ -29,6 +29,23 @@ struct FileInspector {
         }
     }
 
+    /// Returns the union of suggested actions for all given URLs, preserving the
+    /// order from the first URL and appending actions from subsequent URLs that
+    /// aren't already present.
+    static func suggestedActions(forAll urls: [URL]) -> [AIAction] {
+        guard !urls.isEmpty else { return [] }
+        var seen = Set<AIAction>()
+        var result: [AIAction] = []
+        for url in urls {
+            for action in suggestedActions(for: url) {
+                if seen.insert(action).inserted {
+                    result.append(action)
+                }
+            }
+        }
+        return result
+    }
+
     /// Returns true for file types AI Drop cannot process.
     /// Drop handlers use this to route directly to the error stage.
     static func isUnsupportedFileType(_ url: URL) -> Bool {
