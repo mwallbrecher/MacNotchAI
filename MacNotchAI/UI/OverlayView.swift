@@ -3,7 +3,8 @@ import SwiftUI
 // MARK: - Root overlay view
 
 struct OverlayView: View {
-    @ObservedObject private var vm = OverlayViewModel.shared
+    @ObservedObject private var vm          = OverlayViewModel.shared
+    @ObservedObject private var dragMonitor = DragMonitor.shared
     let provider: any AIProvider
 
     @AppStorage("uiScale") private var uiScaleRaw = UIScale.small.rawValue
@@ -67,6 +68,15 @@ struct OverlayView: View {
                         }
                     }
 
+                    // Second-file drag overlay — darkens the card and shows a hint
+                    // the moment the user starts dragging ANY file while a session is
+                    // open, even before they bring it near the notch. Hidden once the
+                    // drop lands and the banner takes over.
+                    if dragMonitor.isDraggingFile, vm.pendingSecondFileURL == nil {
+                        SecondFileDragOverlay()
+                            .transition(.opacity)
+                    }
+
                     // Second-file prompt banner — spring-slides up from the bottom
                     // edge of the card when a second file is dropped mid-session.
                     if vm.pendingSecondFileURL != nil {
@@ -74,6 +84,8 @@ struct OverlayView: View {
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
+                .animation(.easeInOut(duration: 0.20),
+                            value: dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil)
                 .animation(.spring(response: 0.35, dampingFraction: 0.72),
                             value: vm.pendingSecondFileURL != nil)
                 .liquidGlass(cornerRadius: cornerRadius, tintOpacity: 0.60)
@@ -1125,6 +1137,56 @@ private func buildMultiFileContent(
         sections.append("=== \(url.lastPathComponent) ===\n\(body)")
     }
     return (sections.joined(separator: "\n\n"), nil)
+}
+
+// MARK: - Second-file drag overlay
+
+/// Full-card dark overlay that appears as soon as the user starts dragging any
+/// file while a session is already open. Communicates that the card is still a
+/// valid drop target — the user can release here to add the file or start fresh.
+///
+/// Disappears the moment the drop lands (replaced by SecondFilePromptBanner).
+private struct SecondFileDragOverlay: View {
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    /// True once the cursor is physically over the card — drives the
+    /// enhanced "release now" state.
+    private var isHovering: Bool { vm.isDragHovering }
+
+    var body: some View {
+        ZStack {
+            // ── Darkening layer ─────────────────────────────────────────────
+            VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
+            Color.black.opacity(isHovering ? 0.72 : 0.58)
+                .animation(.easeInOut(duration: 0.14), value: isHovering)
+
+            // Optional blue tint mirrors the stage-1 pill hover colour
+            Color.accentColor.opacity(isHovering ? 0.10 : 0)
+                .animation(.easeInOut(duration: 0.14), value: isHovering)
+
+            // ── Icon + text ─────────────────────────────────────────────────
+            VStack(spacing: 10 * scale) {
+                Image(systemName: isHovering ? "arrow.down.circle.fill" : "arrow.down.circle")
+                    .font(.system(size: 28 * scale, weight: .semibold))
+                    .foregroundColor(.white.opacity(isHovering ? 1.0 : 0.70))
+                    .scaleEffect(isHovering ? 1.12 : 1.0)
+                    .contentTransition(.symbolEffect(.replace))
+                    .animation(.spring(response: 0.28, dampingFraction: 0.62), value: isHovering)
+
+                Text(isHovering ? "Release to add or replace" : "Drop here to add another file\nor start a new session")
+                    .font(.system(size: 13 * scale, weight: .semibold))
+                    .foregroundColor(.white.opacity(isHovering ? 1.0 : 0.72))
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(3)
+                    .contentTransition(.opacity)
+                    .animation(.easeInOut(duration: 0.14), value: isHovering)
+            }
+            .padding(20 * scale)
+        }
+        // Fill the entire card
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 }
 
 // MARK: - Second-file prompt banner
