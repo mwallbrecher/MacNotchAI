@@ -38,6 +38,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         observeDragOutState()
         observeStageChanges()
         observeChipsExpanded()
+        prewarmSwiftUI()
 
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleShowOnboarding),
@@ -140,15 +141,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 } else {
                     if case .waitingForDrop = vm.stage {
-                        // ── "Can't reopen" fix ───────────────────────────────────
-                        // isDraggingFile can become false from two sources:
-                        //   a) dragCompleted() — drop WAS caught (stage already .chips → branch not reached)
-                        //   b) handleMouseUp()  — drag ended without a catch, OR the user
-                        //      immediately started a SECOND drag (isDraggingFile flipped back to true).
-                        // Guard against case (b): if a new drag has already started by the
-                        // time this sink fires, keep the pill visible instead of hiding it.
+                        // ── Poll-timer race guard ────────────────────────────────
+                        // isDraggingFile=false can arrive from two sources:
+                        //   a) dragCompleted() — drop WAS caught (stage already .chips → not reached)
+                        //   b) poll timer or handleMouseUp() — drag ended without a catch
+                        //
+                        // The poll timer fires in .common runloop mode (fires even inside
+                        // AppKit's .eventTracking drag loop) and can see an empty drag
+                        // pasteboard milliseconds BEFORE AppKit delivers performDragOperation
+                        // — the source app starts tearing down its session the instant the
+                        // mouse is released, racing the poll interval.
+                        //
+                        // Calling hideOverlay() immediately here would dismiss the window
+                        // before performDragOperation arrives, losing the cached URL and
+                        // causing a silent drop failure. Fix: defer by 150 ms and re-check.
+                        // By then any in-flight performDragOperation has advanced the stage
+                        // to .chips (or .error), making the second guard a safe no-op.
                         guard !DragMonitor.shared.isDraggingFile else { return }
-                        self.hideOverlay()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                            guard let self else { return }
+                            guard !DragMonitor.shared.isDraggingFile,
+                                  case .waitingForDrop = OverlayViewModel.shared.stage else { return }
+                            self.hideOverlay()
+                        }
                     }
                     // Shelf stays open until the user explicitly closes it.
                     // Drag-out roll-back is handled separately by observeDragOutState().
@@ -263,6 +278,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Overlay lifecycle
 
+    /// Warms up SwiftUI's hosting infrastructure at launch.
+    ///
+    /// Creating an NSHostingView causes Metal/CoreAnimation initialisation and the
+    /// first SwiftUI layout pass. If this happens on the drag-detection hot path
+    /// (first ever file drag) the combined overhead introduces a visible cold-start
+    /// delay or, in rare cases, a crash when a layout pass races the first stage
+    /// transition. A minimal hidden view created eagerly at launch eliminates both.
+    private func prewarmSwiftUI() {
+        let hosting = NSHostingView(rootView: Color.clear.frame(width: 1, height: 1))
+        let win = NSWindow(contentRect: .zero, styleMask: .borderless,
+                           backing: .buffered, defer: false)
+        win.contentView = hosting
+        // Retain for 2 s then release — SwiftUI/Metal are warmed up by then.
+        var retained: NSWindow? = win
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { retained = nil }
+    }
+
     private func ensureOverlayVisible() {
         let s = UIScale.current.multiplier
         let pillSize = CGSize(width: 288 * s, height: 96 * s)
@@ -294,6 +326,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.contentView = hostingView
         overlayWindow = window
+
+        // Guarantee clean ViewModel state before the window is ever visible.
+        // The deferred reset() inside hideOverlay() covers most cases, but on the
+        // very first launch (or if a space-change hide raced with a new drag) the
+        // deferred closure may not have fired yet — calling reset() here is safe
+        // because stage is already .waitingForDrop and SwiftUI hasn't painted yet.
+        OverlayViewModel.shared.reset()
 
         // Pre-position at the notch synchronously BEFORE ordering front.
         // Without this the window flashes at screen origin (0, 0) for one frame.
