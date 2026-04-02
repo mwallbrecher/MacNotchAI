@@ -12,7 +12,7 @@ AI Drop is a native macOS menu-bar app that turns your physical notch into an AI
 
 ## How to Install
 
-1. Download **AIDropv.dmg** from the [latest release](https://github.com/mwallbrecher/MacNotchAI/releases/latest)
+1. Download **AIDrop.dmg** from the [latest release](https://github.com/mwallbrecher/MacNotchAI/releases/latest)
 2. Open the DMG and drag **MacNotchAI.app** into your **Applications** folder
 3. Launch the app — it lives in your **menu bar** (look for the ✦ icon)
 4. On first launch, pick your AI provider and paste your API key
