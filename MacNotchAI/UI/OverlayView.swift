@@ -67,6 +67,13 @@ struct OverlayView: View {
                             EmptyView()
                         }
                     }
+                    // Blur + dim the card content itself when a second-file drag is
+                    // in progress so the session is visible as a ghosted backdrop.
+                    // The overlay only adds the icon/text on top — no opaque layer.
+                    .blur(radius: (dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil) ? 3.5 : 0)
+                    .opacity((dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil) ? 0.45 : 1.0)
+                    .animation(.easeInOut(duration: 0.22),
+                               value: dragMonitor.isDraggingFile && vm.pendingSecondFileURL == nil)
 
                     // Second-file drag overlay — darkens the card and shows a hint
                     // the moment the user starts dragging ANY file while a session is
@@ -602,109 +609,15 @@ private struct FileHeaderView: View {
     let fileURL: URL
     let closeNS: Namespace.ID
     @ObservedObject private var vm = OverlayViewModel.shared
-    @State private var isHoveringGroup    = false
     @State private var isHoveringCollapse = false
     @Environment(\.uiScale) private var scale
-
-    // Async icon — placeholder avoids main-thread stall on first render.
-    @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
 
     var body: some View {
         HStack(spacing: 8 * scale) {
 
-            // ── File info pill ───────────────────────────────────────────────
-            // Icon + name + share in a rounded rect that reads as one "file object".
-            // The pill size NEVER changes — full name is shown in a floating badge
-            // overlaid below so layout is not disturbed.
-            HStack(spacing: 8 * scale) {
-                // File icon (async load)
-                Image(nsImage: fileIcon)
-                    .resizable()
-                    .frame(width: 24 * scale, height: 24 * scale)
-                    .onAppear {
-                        Task { @MainActor in
-                            fileIcon = NSWorkspace.shared.icon(forFile: fileURL.path)
-                        }
-                    }
-
-                // Name + "Drag to move" — always truncated, never grows the pill.
-                VStack(alignment: .leading, spacing: 1 * scale) {
-                    HStack(spacing: 5 * scale) {
-                        Text(fileURL.lastPathComponent)
-                            .font(.system(size: 12 * scale, weight: .semibold))
-                            .foregroundColor(.white)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        if !vm.additionalFileURLs.isEmpty {
-                            Text("+\(vm.additionalFileURLs.count)")
-                                .font(.system(size: 9 * scale, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 5 * scale)
-                                .padding(.vertical, 2 * scale)
-                                .background(Color.accentColor.opacity(0.75))
-                                .clipShape(Capsule(style: .continuous))
-                                .transition(.scale(scale: 0.7).combined(with: .opacity))
-                        }
-                    }
-                    .animation(.spring(response: 0.28, dampingFraction: 0.72),
-                                value: vm.additionalFileURLs.count)
-                    Text("Drag to move")
-                        .font(.system(size: 9 * scale, weight: .regular))
-                        .foregroundColor(.white.opacity(0.35))
-                        .lineLimit(1)
-                }
-                .fixedSize(horizontal: false, vertical: true)
-
-                ShareButton(fileURL: fileURL)
-            }
-            .padding(.horizontal, 9 * scale)
-            .padding(.vertical, 7 * scale)
-            .background(
-                RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
-                    .fill(Color.white.opacity(isHoveringGroup ? 0.08 : 0.05))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
-                    )
-            )
-            .onDrag {
-                vm.isDraggingOut = true
-                return NSItemProvider(object: fileURL as NSURL)
-            }
-            .onHover { isHoveringGroup = $0 }
-            .animation(.easeInOut(duration: 0.12), value: isHoveringGroup)
-            .help("Drag to move file elsewhere")
-            // ── Floating full-name badge ─────────────────────────────────────
-            // Pure overlay — zero effect on the pill's own frame or the card layout.
-            // Appears below the pill, floats over whatever content is beneath it.
-            .overlay(alignment: .bottomLeading) {
-                if isHoveringGroup {
-                    Text(fileURL.lastPathComponent)
-                        .font(.system(size: 11 * scale, weight: .medium))
-                        .foregroundColor(.white.opacity(0.92))
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.horizontal, 9 * scale)
-                        .padding(.vertical, 6 * scale)
-                        .frame(maxWidth: 220 * scale, alignment: .leading)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                                .fill(Color(white: 0.10).opacity(0.96))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                                        .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
-                                )
-                                .shadow(color: .black.opacity(0.40), radius: 8, x: 0, y: 3)
-                        )
-                        .offset(y: 38 * scale)   // float below the pill row
-                        .zIndex(200)
-                        .transition(
-                            .scale(scale: 0.90, anchor: .topLeading)
-                             .combined(with: .opacity)
-                             .animation(.spring(response: 0.22, dampingFraction: 0.72))
-                        )
-                }
-            }
+            // ── File pill(s) ─────────────────────────────────────────────────
+            // One icon-only pill per file; carousel kicks in beyond two files.
+            FilePillsRow(primaryURL: fileURL)
 
             Spacer(minLength: 0)
 
@@ -776,35 +689,372 @@ private struct FileHeaderView: View {
     }
 }
 
+// MARK: - File pills row
+
+/// Horizontal gallery of icon-only draggable file pills.
+/// - 1–2 files: shown side by side.
+/// - 3+ files:  shows 2 at a time with prev/next chevrons and a "+N" overflow badge.
+private struct FilePillsRow: View {
+    let primaryURL: URL
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    /// Index of the first visible file in the carousel window.
+    @State private var offset = 0
+
+    private var allFiles: [URL] { [primaryURL] + vm.additionalFileURLs }
+
+    /// The 1 or 2 files currently visible in the carousel window.
+    private var visibleFiles: [URL] {
+        let start = min(offset, max(0, allFiles.count - 2))
+        let end   = min(start + 2, allFiles.count)
+        return Array(allFiles[start..<end])
+    }
+
+    /// How many files are hidden beyond the right edge of the window.
+    private var hiddenCount: Int { max(0, allFiles.count - (offset + 2)) }
+
+    var body: some View {
+        Group {
+            if allFiles.count == 1 {
+                // ── Single file: restore full pill (icon + name + share) ─────
+                SingleFilePill(fileURL: primaryURL)
+            } else {
+                // ── Multi-file: icon-only carousel ──────────────────────────
+                HStack(spacing: 5 * scale) {
+                    // Left arrow — shown once user has scrolled right
+                    if offset > 0 {
+                        carouselArrow(forward: false)
+                            .transition(.scale(scale: 0.7).combined(with: .opacity))
+                    }
+
+                    // Visible file pills (max 2)
+                    ForEach(visibleFiles, id: \.absoluteString) { url in
+                        FilePill(fileURL: url, onRemove: removeAction(for: url))
+                            .transition(.asymmetric(
+                                insertion: .scale(scale: 0.80).combined(with: .opacity),
+                                removal:   .scale(scale: 0.80).combined(with: .opacity)
+                            ))
+                    }
+
+                    // Overflow controls — only when there are more than 2 files total
+                    if allFiles.count > 2 {
+                        HStack(spacing: 4 * scale) {
+                            // "+N" badge: remaining files beyond the current window
+                            if hiddenCount > 0 {
+                                Text("+\(hiddenCount)")
+                                    .font(.system(size: 9 * scale, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 5 * scale)
+                                    .padding(.vertical, 2 * scale)
+                                    .background(Color.accentColor.opacity(0.75))
+                                    .clipShape(Capsule(style: .continuous))
+                                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+                            }
+                            // Right arrow
+                            if hiddenCount > 0 {
+                                carouselArrow(forward: true)
+                                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+                            }
+                        }
+                    }
+
+                    // Share button — shares all files in the session together
+                    ShareButton(fileURLs: allFiles)
+                }
+                .animation(.spring(response: 0.28, dampingFraction: 0.72), value: offset)
+                // Clamp offset when files are removed
+                .onChange(of: allFiles.count, initial: false) { _, count in
+                    let maxOffset = max(0, count - 2)
+                    if offset > maxOffset {
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
+                            offset = maxOffset
+                        }
+                    }
+                }
+            }
+        }
+        .animation(.spring(response: 0.28, dampingFraction: 0.72), value: allFiles.count)
+    }
+
+    /// Returns the remove closure for a given pill URL.
+    /// - Additional file: removes it from `additionalFileURLs`.
+    /// - Primary file: promotes the first additional to primary, keeping the rest.
+    private func removeAction(for url: URL) -> () -> Void {
+        {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
+                if url == primaryURL {
+                    // Promote first additional to primary
+                    guard let newPrimary = vm.additionalFileURLs.first else { return }
+                    let remaining = Array(vm.additionalFileURLs.dropFirst())
+                    let allNew = [newPrimary] + remaining
+                    vm.stage = .chips(
+                        url: newPrimary,
+                        actions: FileInspector.suggestedActions(forAll: allNew)
+                    )
+                    vm.additionalFileURLs = remaining
+                } else {
+                    vm.additionalFileURLs.removeAll { $0 == url }
+                    // Recalculate chip actions with updated file list
+                    if case .chips(let primary, _) = vm.stage {
+                        let allNew = [primary] + vm.additionalFileURLs
+                        vm.stage = .chips(
+                            url: primary,
+                            actions: FileInspector.suggestedActions(forAll: allNew)
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func carouselArrow(forward: Bool) -> some View {
+        Button {
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
+                offset = max(0, min(offset + (forward ? 1 : -1), allFiles.count - 2))
+            }
+        } label: {
+            Image(systemName: forward ? "chevron.right" : "chevron.left")
+                .font(.system(size: 8 * scale, weight: .bold))
+                .foregroundColor(.white.opacity(0.75))
+                .frame(width: 18 * scale, height: 18 * scale)
+                .background(
+                    Circle()
+                        .fill(Color.white.opacity(0.08))
+                        .overlay(Circle().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5))
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Single file pill (full — icon + name + share)
+
+/// Original full pill shown when exactly one file is in the session.
+/// Reverts to the pre-multi-file design: icon + truncated name + ShareButton + drag hint.
+private struct SingleFilePill: View {
+    let fileURL: URL
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 8 * scale) {
+            Image(nsImage: fileIcon)
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 24 * scale, height: 24 * scale)
+
+            VStack(alignment: .leading, spacing: 1 * scale) {
+                Text(fileURL.lastPathComponent)
+                    .font(.system(size: 12 * scale, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text("Drag to move")
+                    .font(.system(size: 9 * scale, weight: .regular))
+                    .foregroundColor(.white.opacity(0.35))
+                    .lineLimit(1)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+
+            ShareButton(fileURL: fileURL)
+        }
+        .padding(.horizontal, 9 * scale)
+        .padding(.vertical, 7 * scale)
+        .background(
+            RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
+                .fill(Color.white.opacity(isHovering ? 0.08 : 0.05))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
+                )
+        )
+        .onDrag {
+            vm.isDraggingOut = true
+            return NSItemProvider(object: fileURL as NSURL)
+        }
+        .onHover { isHovering = $0 }
+        .animation(.easeInOut(duration: 0.12), value: isHovering)
+        .help("Drag to move file elsewhere")
+        // Floating full-name badge on hover
+        .overlay(alignment: .bottomLeading) {
+            if isHovering {
+                Text(fileURL.lastPathComponent)
+                    .font(.system(size: 11 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.92))
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 9 * scale)
+                    .padding(.vertical, 6 * scale)
+                    .frame(maxWidth: 220 * scale, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                            .fill(Color(white: 0.10).opacity(0.96))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                            )
+                            .shadow(color: .black.opacity(0.40), radius: 8, x: 0, y: 3)
+                    )
+                    .fixedSize()
+                    .offset(y: 38 * scale)
+                    .zIndex(200)
+                    .transition(
+                        .scale(scale: 0.90, anchor: .topLeading)
+                         .combined(with: .opacity)
+                         .animation(.spring(response: 0.22, dampingFraction: 0.72))
+                    )
+            }
+        }
+        .onAppear {
+            Task { @MainActor in
+                fileIcon = NSWorkspace.shared.icon(forFile: fileURL.path)
+            }
+        }
+    }
+}
+
+// MARK: - Single file pill (icon-only)
+
+/// Icon-only draggable pill for one file.
+/// Shows a floating filename tooltip and an × remove button on hover.
+private struct FilePill: View {
+    let fileURL: URL
+    /// Called when the user clicks the × badge. Nil = no × shown (e.g. primary file
+    /// when it is the only remaining file, though that case uses SingleFilePill).
+    let onRemove: (() -> Void)?
+    @ObservedObject private var vm = OverlayViewModel.shared
+    @Environment(\.uiScale) private var scale
+
+    @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
+    @State private var isHovering = false
+
+    var body: some View {
+        Image(nsImage: fileIcon)
+            .resizable()
+            .interpolation(.high)
+            .frame(width: 24 * scale, height: 24 * scale)
+            .padding(.horizontal, 8 * scale)
+            .padding(.vertical, 7 * scale)
+            .background(
+                RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
+                    .fill(Color.white.opacity(isHovering ? 0.10 : 0.06))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
+                    )
+            )
+            // × remove badge — top-trailing corner, visible on hover
+            .overlay(alignment: .topTrailing) {
+                if isHovering, let onRemove {
+                    Button(action: onRemove) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 6 * scale, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 13 * scale, height: 13 * scale)
+                            .background(Circle().fill(Color(white: 0.20).opacity(0.95)))
+                            .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .offset(x: 4 * scale, y: -4 * scale)
+                    .transition(.scale(scale: 0.5).combined(with: .opacity)
+                        .animation(.spring(response: 0.20, dampingFraction: 0.68)))
+                }
+            }
+            .onDrag {
+                vm.isDraggingOut = true
+                return NSItemProvider(object: fileURL as NSURL)
+            }
+            .onHover { isHovering = $0 }
+            .animation(.easeInOut(duration: 0.12), value: isHovering)
+            .help(fileURL.lastPathComponent)
+            // Floating filename tooltip
+            .overlay(alignment: .bottomLeading) {
+                if isHovering {
+                    VStack(alignment: .leading, spacing: 2 * scale) {
+                        Text(fileURL.lastPathComponent)
+                            .font(.system(size: 11 * scale, weight: .medium))
+                            .foregroundColor(.white.opacity(0.92))
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Drag to move")
+                            .font(.system(size: 9 * scale, weight: .regular))
+                            .foregroundColor(.white.opacity(0.45))
+                    }
+                    .padding(.horizontal, 9 * scale)
+                    .padding(.vertical, 6 * scale)
+                    .frame(maxWidth: 200 * scale, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                            .fill(Color(white: 0.10).opacity(0.96))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
+                            )
+                            .shadow(color: .black.opacity(0.40), radius: 8, x: 0, y: 3)
+                    )
+                    // fixedSize lets the tooltip escape the narrow pill's layout bounds
+                    .fixedSize()
+                    .offset(y: 38 * scale)
+                    .zIndex(200)
+                    .transition(
+                        .scale(scale: 0.90, anchor: .topLeading)
+                         .combined(with: .opacity)
+                         .animation(.spring(response: 0.22, dampingFraction: 0.72))
+                    )
+                }
+            }
+            .onAppear {
+                Task { @MainActor in
+                    fileIcon = NSWorkspace.shared.icon(forFile: fileURL.path)
+                }
+            }
+    }
+}
+
 // MARK: - Share button
 
 /// Circular share button in the file header.
 /// Opens a native macOS Menu with AirDrop, Messages, Mail and Copy to Clipboard.
-/// Uses NSSharingService so the OS handles service availability, accounts and sheets.
+/// Accepts one or more URLs — all files are passed to each sharing service together.
 private struct ShareButton: View {
-    let fileURL: URL
+    /// All files to share. Pass a single-element array for single-file sessions.
+    let fileURLs: [URL]
     @State private var isHovered = false
     @Environment(\.uiScale) private var scale
+
+    /// Convenience init for the common single-file case.
+    init(fileURL: URL) { fileURLs = [fileURL] }
+    init(fileURLs: [URL]) { self.fileURLs = fileURLs }
+
+    private var items: [Any] { fileURLs.map { $0 as NSURL } }
+    private var tooltip: String {
+        fileURLs.count == 1 ? "Share file" : "Share \(fileURLs.count) files"
+    }
 
     var body: some View {
         Menu {
             // ── Sharing services ────────────────────────────────────────────
             Button {
-                NSSharingService(named: .sendViaAirDrop)?.perform(withItems: [fileURL])
+                NSSharingService(named: .sendViaAirDrop)?.perform(withItems: items)
             } label: {
                 Label("AirDrop", systemImage: "wifi")
             }
             .disabled(NSSharingService(named: .sendViaAirDrop) == nil)
 
             Button {
-                NSSharingService(named: .composeMessage)?.perform(withItems: [fileURL])
+                NSSharingService(named: .composeMessage)?.perform(withItems: items)
             } label: {
                 Label("Messages", systemImage: "message.fill")
             }
             .disabled(NSSharingService(named: .composeMessage) == nil)
 
             Button {
-                NSSharingService(named: .composeEmail)?.perform(withItems: [fileURL])
+                NSSharingService(named: .composeEmail)?.perform(withItems: items)
             } label: {
                 Label("Mail", systemImage: "envelope.fill")
             }
@@ -815,9 +1065,12 @@ private struct ShareButton: View {
             // ── Local action ─────────────────────────────────────────────────
             Button {
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.writeObjects([fileURL as NSURL])
+                NSPasteboard.general.writeObjects(fileURLs.map { $0 as NSURL })
             } label: {
-                Label("Copy to Clipboard", systemImage: "doc.on.doc.fill")
+                Label(
+                    fileURLs.count == 1 ? "Copy to Clipboard" : "Copy All to Clipboard",
+                    systemImage: "doc.on.doc.fill"
+                )
             }
 
         } label: {
@@ -841,7 +1094,7 @@ private struct ShareButton: View {
         .fixedSize()
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.12), value: isHovered)
-        .help("Share file")
+        .help(tooltip)
     }
 }
 
@@ -1156,14 +1409,11 @@ private struct SecondFileDragOverlay: View {
 
     var body: some View {
         ZStack {
-            // ── Blur + light darkening — lets the session content show through ──
-            // withinWindow blending blurs the card content that sits below this
-            // view in the same window's ZStack, so the AI reply / chips remain
-            // legible as a ghosted backdrop while the drag hint is in the foreground.
-            // The black tint is intentionally low so the blurred session is visible;
-            // hover bumps it slightly to make the "Release" text easier to read.
-            VisualEffectBlur(material: .hudWindow, blendingMode: .withinWindow)
-            Color.black.opacity(isHovering ? 0.38 : 0.22)
+            // ── Very light darkening tint only — the card content below is already
+            // blurred + dimmed via modifiers on the Group in the parent ZStack, so
+            // NO opaque VisualEffectBlur here. This tint just lifts the white text
+            // slightly above the ghosted backdrop on hover.
+            Color.black.opacity(isHovering ? 0.18 : 0.04)
                 .animation(.easeInOut(duration: 0.14), value: isHovering)
 
             // Optional blue tint mirrors the stage-1 pill hover colour
@@ -1174,14 +1424,14 @@ private struct SecondFileDragOverlay: View {
             VStack(spacing: 10 * scale) {
                 Image(systemName: isHovering ? "arrow.down.circle.fill" : "arrow.down.circle")
                     .font(.system(size: 28 * scale, weight: .semibold))
-                    .foregroundColor(.white.opacity(isHovering ? 1.0 : 0.70))
+                    .foregroundColor(.white.opacity(isHovering ? 1.0 : 0.85))
                     .scaleEffect(isHovering ? 1.12 : 1.0)
                     .contentTransition(.symbolEffect(.replace))
                     .animation(.spring(response: 0.28, dampingFraction: 0.62), value: isHovering)
 
                 Text(isHovering ? "Release to add or replace" : "Drop here to add another file\nor start a new session")
                     .font(.system(size: 13 * scale, weight: .semibold))
-                    .foregroundColor(.white.opacity(isHovering ? 1.0 : 0.72))
+                    .foregroundColor(.white.opacity(isHovering ? 1.0 : 0.85))
                     .multilineTextAlignment(.center)
                     .lineSpacing(3)
                     .contentTransition(.opacity)

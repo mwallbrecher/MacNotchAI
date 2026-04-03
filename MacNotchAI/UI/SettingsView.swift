@@ -56,7 +56,10 @@ struct SettingsView: View {
                 .padding(.vertical, 4)
             }
 
-            Section("AI Provider") {
+            Section(header: Text("AI Provider"),
+                    footer: Text("* with average document sizes")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)) {
                 VStack(spacing: 6) {
                     ForEach(AIProviderType.allCases, id: \.rawValue) { type in
                         ProviderRow(

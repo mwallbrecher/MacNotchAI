@@ -21,7 +21,7 @@ struct OnboardingView: View {
                     .foregroundColor(.accentColor)
                 Text("Welcome to AI Drop")
                     .font(.title2.bold())
-                Text("Drag any file toward the top of your screen.\nDrop it on the pill to get instant AI insights.")
+                Text("Move any file towards the Notch.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -98,7 +98,15 @@ struct OnboardingView: View {
                 .padding(.top, 16)
             }
 
-            Spacer(minLength: 24)
+            Spacer(minLength: 12)
+
+            // ── Footnote ─────────────────────────────────────────────
+            Text("* with average document sizes")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary.opacity(0.55))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 8)
 
             // ── CTA ──────────────────────────────────────────────────
             Button(action: saveAndDismiss) {
@@ -158,50 +166,55 @@ struct ProviderRow: View {
     var body: some View {
         Button(action: onTap) {
             HStack(alignment: .top, spacing: 12) {
+
                 // Selection indicator
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .foregroundColor(isSelected ? .accentColor : .secondary)
                     .font(.system(size: 16))
-                    .padding(.top, 1)
+                    .padding(.top, 2)
 
-                VStack(alignment: .leading, spacing: 3) {
-                    // Name + model badge
-                    HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
+
+                    // Row 1: provider name + tier badge
+                    HStack(spacing: 7) {
                         Text(type.displayName)
                             .font(.subheadline.weight(isSelected ? .semibold : .medium))
 
-                        Text(type.modelLabel)
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(type.isFree ? .green : .secondary)
+                        // Coloured tier badge (Free / Balance / Highest Quality / Local)
+                        Text(type.badgeLabel)
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundColor(type.badgeColor)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .background(
-                                (type.isFree ? Color.green : Color.secondary).opacity(0.10)
+                            .background(type.badgeColor.opacity(0.12))
+                            .overlay(
+                                Capsule()
+                                    .strokeBorder(type.badgeColor.opacity(0.30), lineWidth: 0.75)
                             )
                             .clipShape(Capsule())
 
                         Spacer()
                     }
 
-                    // Tagline (what makes this provider special)
+                    // Row 2: tagline
                     Text(type.tagline)
                         .font(.caption.weight(.medium))
                         .foregroundColor(isSelected ? .primary.opacity(0.75) : .secondary)
 
-                    // Pricing / capacity line
+                    // Row 3: model + pricing caption
                     Text(type.pricingSubtitle)
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(.secondary.opacity(0.80))
                 }
             }
-            .padding(.vertical, 8)
+            .padding(.vertical, 9)
             .padding(.horizontal, 10)
             .background(isSelected ? Color.accentColor.opacity(0.07) : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .strokeBorder(
-                        isSelected ? Color.accentColor.opacity(0.25) : Color.secondary.opacity(0.12),
+                        isSelected ? Color.accentColor.opacity(0.28) : Color.secondary.opacity(0.12),
                         lineWidth: 1
                     )
             )

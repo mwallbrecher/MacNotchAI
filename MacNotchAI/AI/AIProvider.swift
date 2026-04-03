@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 protocol AIProvider {
     var name: String { get }
@@ -8,8 +9,8 @@ protocol AIProvider {
 
 enum AIProviderType: String, CaseIterable {
     case groq       = "Groq (Free)"
-    case anthropic  = "Anthropic (Claude)"
     case openai     = "OpenAI (GPT-4o)"
+    case anthropic  = "Anthropic (Claude)"
     case ollama     = "Ollama (Local, Free)"
 }
 
@@ -37,33 +38,53 @@ extension AIProviderType {
         }
     }
 
-    /// One-line tagline beneath the model badge (what makes this provider special).
-    var tagline: String {
+    /// Prominent tier badge label shown on the provider card.
+    var badgeLabel: String {
         switch self {
-        case .groq:      return "Fastest & cheapest"
-        case .anthropic: return "Highest-quality small model"
-        case .openai:    return "Best value overall"
-        case .ollama:    return "Runs on your Mac"
+        case .groq:      return "Free"
+        case .openai:    return "Balance"
+        case .anthropic: return "Highest Quality"
+        case .ollama:    return "Local"
         }
     }
 
-    /// Human-readable cost framed as analyses per $5 — tangible without token jargon.
+    /// Badge background colour.
+    var badgeColor: Color {
+        switch self {
+        case .groq:      return .green
+        case .openai:    return .blue
+        case .anthropic: return .purple
+        case .ollama:    return .secondary
+        }
+    }
+
+    /// One-line tagline beneath the provider name.
+    var tagline: String {
+        switch self {
+        case .groq:      return "Fast · Good for simple document analyses"
+        case .anthropic: return "Deepest reasoning · Best for power users"
+        case .openai:    return "Better reasoning · Balance between quality, speed & price"
+        case .ollama:    return "Runs on your Mac · Limited to your hardware"
+        }
+    }
+
+    /// Model identifier + cost line shown as caption.
     ///
     /// Typical AI Drop task ≈ 1,500 tokens in + 400 tokens out:
-    ///   Groq / Llama 3.1 8B   $0.05/MTok in + $0.08/MTok out → ~$0.000107/task → $5 ≈ 46,700
-    ///   Claude Haiku 4.5      $0.80/MTok in + $4.00/MTok out → ~$0.00280/task  → $5 ≈    1,786  → display ~385 (conservative, longer tasks)
-    ///   GPT-4o mini           $0.15/MTok in + $0.60/MTok out → ~$0.000465/task → $5 ≈   10,752  → display ~2,800 (mid-complexity tasks)
-    ///   Ollama                free local inference
+    ///   Groq / Llama 3.1 8B   → free tier available, ~10,000 interactions per $5
+    ///   Claude Haiku 4.5      → ~385 interactions per $5
+    ///   GPT-4o mini           → ~2,800 interactions per $5
+    ///   Ollama                → free local inference
     var pricingSubtitle: String {
         switch self {
         case .groq:
-            return "$5 ~10,000 average document interactions\nBest for lightweight tasks · free tier limits apply"
+            return "Llama 3.1 8B · Free tier available · ~10,000 interactions* per $5"
         case .anthropic:
-            return "$5 ~385 average document interactions\nBest for premium answers, coding, long context"
+            return "Claude Haiku 4.5 · ~400 interactions* per $5"
         case .openai:
-            return "$5 ~2,800 average document interactions\nBest balance of cost, quality, and image support"
+            return "GPT-4o mini · ~2,800 interactions* per $5"
         case .ollama:
-            return "Unlimited average document interactions\nNo API bill · speed and quality depend on your hardware"
+            return "Any local model · Free · No internet or API key required"
         }
     }
 
