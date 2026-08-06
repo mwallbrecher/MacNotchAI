@@ -996,7 +996,10 @@ enum FileTool: Identifiable, Hashable {
     /// dispatch them via `FileToolActions.performAsync` instead of the sync `perform`.
     var isAsync: Bool {
         switch self {
-        case .extractAudio, .transcribe, .videoToGIF, .extractFrame, .compressVideo,
+        // NOTE: .compressVideo is deliberately NOT here. It opens a batch sheet that owns
+        // its own progress UI, so the chips row must not also show a spinner waiting for a
+        // result that never arrives on this path.
+        case .extractAudio, .transcribe, .videoToGIF, .extractFrame,
              .muteVideo, .convertToMP4, .convertToMOV, .convertToM4A, .markdownToPDF, .docxToPDF:
             return true
         default:

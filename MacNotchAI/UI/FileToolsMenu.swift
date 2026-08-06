@@ -86,15 +86,19 @@ enum FileToolActions {
             runFile(tool, original: fileURL) { try FileTools.imagesToPDF(sessionFiles) }
 
         case .resizeImage:
-            guard let opts = promptImageOptions() else { return }
-            runFile(tool, original: fileURL) { try FileTools.resizeAndRecompressImage(
-                fileURL, maxDimension: opts.maxDimension, quality: opts.quality) }
+            // Batch sheet: the session may hold several images and the old NSAlert acted on
+            // the primary file only.
+            CompressPanels.showImages(fileURL: fileURL, sessionFiles: sessionFiles)
 
         case .prettyJSON:
             runFile(tool, original: fileURL) { try FileTools.prettyPrintJSON(fileURL) }
 
         case .compress:
             runFile(tool, original: fileURL) { try FileTools.compress(fileURL) }
+
+        case .compressVideo:
+            // Opens the batch sheet; the export itself runs inside it (hence not isAsync).
+            CompressPanels.showVideos(fileURL: fileURL, sessionFiles: sessionFiles)
 
         // Text / code / data (batch 3) — synchronous, instant.
         case .sortLines:
@@ -136,7 +140,6 @@ enum FileToolActions {
             case .transcribe:    output = try await MediaTools.transcribe(fileURL)
             case .videoToGIF:    output = try await MediaTools.videoToGIF(fileURL)
             case .extractFrame:  output = try await MediaTools.extractFrame(fileURL)
-            case .compressVideo: output = try await MediaTools.compressVideo(fileURL)
             case .muteVideo:     output = try await MediaTools.muteVideo(fileURL)
             case .convertToMP4:  output = try await MediaTools.convertVideo(fileURL, to: .mp4, ext: "mp4")
             case .convertToMOV:  output = try await MediaTools.convertVideo(fileURL, to: .mov, ext: "mov")
