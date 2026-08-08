@@ -7,14 +7,24 @@ import Combine
 /// One tour page. `trigger` nil = informational (Next); otherwise the page waits for
 /// the REAL action (a drop, a Tab-cycle, a hotkey…) and auto-advances on detection.
 struct TutorialStep {
-    enum Trigger: String { case drop, dropAnything, tabs, toolLaunched, radial, clipboard }
+    enum Trigger: String {
+        case drop, dropAnything, tabs, toolLaunched, radial, clipboard
+        case expose, joinSession
+    }
     let icon: String
     let title: String
     let body: String
     let trigger: Trigger?
     let hint: String
 
-    static let all: [TutorialStep] = [
+    /// The tour, minus anything this build cannot actually do. The two sharing pages are
+    /// dropped when no share service is configured — a step whose try-it silently does
+    /// nothing is worse than no step at all.
+    static var all: [TutorialStep] {
+        BackendConfig.isSharingAvailable ? base + sharing : base
+    }
+
+    private static let base: [TutorialStep] = [
         .init(icon: "arrow.down.circle",
               title: "Drop a file",
               body: "Drag any file toward the top of your screen — a pill drops from the notch. Release the file on it and a session opens with smart actions for that file.",
@@ -53,6 +63,24 @@ struct TutorialStep {
               title: "Sessions live on",
               body: "Minimize a session with – and bring it back from the menu bar. Recent Sessions keeps your last 25 — searchable (including the answers) via Search Sessions.",
               trigger: nil, hint: ""),
+    ]
+
+    /// Sharing — two beats: hand a session over, then pick it up.
+    private static let sharing: [TutorialStep] = [
+        .init(icon: "person.2.badge.key",
+              title: "Hand a session to a colleague",
+              body: "⌃⌘E exposes the session you have open. Everything stays on your Mac until you press it — then the file and AI answers are encrypted and uploaded, and you get a reusable 6-digit Session ID. Add a password and not even the service can read the snapshot.",
+              trigger: .expose,
+              // The step needs a live session with a file, and the hotkey just beeps
+              // without one — so say that instead of letting the user press it blindly.
+              hint: "Try it now: open a session (drop a file) and press ⌃⌘E."),
+        .init(icon: "arrow.down.circle.dotted",
+              title: "Pick it up anywhere",
+              body: "On another Mac: ⌃⌘J, enter the Session ID, and the same snapshot opens as a local copy — file included. Multiple colleagues can join until you revoke it or it expires after 24 hours; everyone continues with their own AI provider and key.",
+              trigger: .joinSession,
+              // "Session ID", never "code"/"PIN" — SHARE_ARCHITECTURE.md §10: it is a reusable
+              // access credential, and calling it a PIN implies one-time/second-factor.
+              hint: "Try it now: press ⌃⌘J and enter the Session ID you just got — it works on this Mac too."),
     ]
 }
 

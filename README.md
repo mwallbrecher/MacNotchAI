@@ -10,9 +10,38 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 
 ---
 
+## What's New in v1.1.5
+
+- **Drop complete folders** — Dragaway scans folders locally within strict depth, size, file-count,
+  and time limits. A transparent preview shows supported, omitted, and skipped files before one
+  provider request explains the folder or answers a custom question.
+- **Choose exactly which folder files are analysed** — the folder preview supports Finder-style
+  selection, including Command/Control multi-select, Shift ranges, Command-A, and Space for Quick
+  Look. Selection changes reuse the session's local extraction cache instead of parsing files again.
+- **Far more reliable website understanding** — Safari tabs and URL drops now use Mozilla
+  Readability for structured article extraction, with an isolated ephemeral rendered-page fallback
+  for JavaScript-heavy sites. A fast action waits for that same bounded preparation task.
+- **A navigable model menu** — the native macOS model picker is grouped by provider, model family,
+  and exact model while the fixed Dragaway Free option stays simple.
+- **Stronger session reliability** — overlapping AI turns, stale asynchronous results, renamed web
+  drops, and folder-session restores are guarded so content cannot land in the wrong session.
+
+---
+
+## What's New in v1.1.4
+
+- **Drop Apple Mail messages** — drag one or several inbox messages into the pill. Dragaway materializes them as `.eml`, extracts readable headers and body locally, and offers mail-specific actions such as Summarize, Tell Me What to Do, and Deadlines & Risks.
+- **Redesigned session header** — the file type and active AI model now sit in a compact top row, with the full-width file pill below. Mail and Safari-origin files get contextual icons without changing the underlying files.
+- **Choose the exact BYOK model** — refresh the live model catalogue for OpenAI, Claude, Gemini, Groq, or Ollama and select the precise model Dragaway should call. Missing models stay visible instead of being silently replaced.
+- **Faster Clipboard History workflow** — selection always returns focus to the app you were using. Optional, default-off **Enhanced Access** can paste the selected text, image, or file immediately.
+- **More accurate browser image drops** — image-result drags now preserve the visible image instead of turning a mixed image/URL payload into a page-text file.
+- **Visual polish** — a transparent Dragaway menu-bar icon plus tighter, more responsive card alignment.
+
+---
+
 ## What's New in v1.1.3
 
-- **No permissions needed** — Dragaway no longer requests Accessibility access. Drag detection, hotkeys, and the radial launcher all work out of the box; the app never appears in Privacy & Security. Esc still closes the focused card via the responder chain.
+- **Core features need no permissions** — Drag detection, hotkeys, the radial launcher, and Esc work out of the box. The newer, default-off **Enhanced Access** option requests Accessibility only if you explicitly enable instant Clipboard History paste.
 
 ---
 
@@ -45,7 +74,7 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 ## What's New in v0.9.9
 
 - **Favorite apps — "Open in" row** — Pick your go-to apps in **Settings → Favorite Tools**, then open any dropped file in them with a single click — or press **⌥1 … ⌥9**. The numbered row appears on both the action card and the result card.
-- **Clipboard history** — Dragaway now keeps your **last 20 clipboard items** (text, images, and files). Press **⌃⌘V** for a quick picker of the **last 10** — tap a number key or click an entry to copy it back, then **⌘V** to paste. The full 20 live in the menu bar under **Clipboard History** (⌥-click a row to remove just that one). Items from password managers (anything marked sensitive/concealed) are **never** captured, and your history survives a restart. Turn it off anytime with **Track Clipboard**.
+- **Clipboard history** — Dragaway keeps your **last 20 clipboard items** (text, images, and files). Press **⌃⌘V** for a quick picker of the **last 10**. Selection always returns focus to the app you were using: press **⌘V** yourself in the permission-free mode, or enable **Enhanced Access** for immediate paste-on-pick. The full 20 live in the menu bar under **Clipboard History** (⌥-click a row to remove just that one). Items from password managers (anything marked sensitive/concealed) are **never** captured, and your history survives a restart. Turn it off anytime with **Track Clipboard**.
 - **A local file toolbox — no uploads, no API key** — every file pill's **•••** menu now offers a large set of pure-Apple-framework tools that run entirely on your Mac:
   - **PDF** — Export as Text · Split into Pages · Pages to Images · Stitch PDFs
   - **Images** — Convert to JPEG · Convert to PDF · Resize / Compress · Remove Metadata (EXIF)
@@ -75,7 +104,7 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 - **Prompt tabs** — the action card now has three tabs: **Suggested** (smart actions for the file), **History** (your recently typed prompts), and **Custom** (your own saved prompts). History and custom prompts are saved locally on your Mac.
 - **Custom Prompts in Settings** — add, edit, and remove reusable prompts from the Settings window; they show up instantly in the Custom tab.
 - **Hosted free tier** — start using Dragaway with **no API key**. A built-in Gemini-powered free tier (metered per device) lets you try every action before bringing your own key.
-- **Google Gemini provider** — bring your own **Gemini 2.5 Flash** key alongside Groq, Claude, ChatGPT, and Ollama.
+- **Explicit model selection** — bring your own Groq, Gemini, Claude, ChatGPT, or Ollama setup and choose an exact live model for each provider.
 - **Multi-file sessions** — drop a second file onto an open card to analyse several files together, with a file gallery, per-file remove, and multi-file share.
 - **Movable overlay** — drag the panel to reposition it anywhere on screen.
 - **Snappier animations** — faster, tighter state transitions with reduced overbounce across the whole flow.
@@ -90,7 +119,7 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 4. On first launch, pick your AI provider and paste your API key
 5. Drag any file toward the top of your screen to get started
 
-> **Signed & notarized by Apple** — the DMG opens normally, no Gatekeeper workaround needed. Dragaway requests **no special permissions** — drag detection works out of the box, no Accessibility prompt, nothing to grant.
+> **Signed & notarized by Apple** — the DMG opens normally, no Gatekeeper workaround needed. Dragaway's core features work without special permissions. Accessibility is requested only if you explicitly turn on the default-off **Enhanced Access** option for instant Clipboard History paste.
 
 ---
 
@@ -147,19 +176,21 @@ The entire flow happens in a floating black panel — no app switching, no typin
 ### File Support
 - PDF, DOCX, TXT, Markdown — full text extraction
 - PNG, JPEG, GIF, HEIC, WebP — image analysis via vision models
+- **Folders** — bounded local scan with an exact included/omitted/skipped manifest,
+  a contents preview, and one-request project/folder understanding
 - **Drag-out** — drag the file icon back out of the overlay to drop it anywhere in Finder
 
 ### AI Providers
 | Provider | Model | Cost | Notes |
 |---|---|---|---|
 | **Free tier** | Gemini 2.5 Flash (hosted) | Free, metered | No API key needed; try every action right away |
-| **Groq** | Llama 3.1 8B | ~10,000 interactions / $5 | Cheapest; fastest |
-| **Gemini** | Gemini 2.5 Flash | BYOK | Fast with strong reasoning; image support |
-| **Claude** | Haiku 4.5 | ~385 interactions / $5 | Best quality, coding, long context |
-| **ChatGPT** | GPT-4o mini | ~2,800 interactions / $5 | Best balance; image support |
-| **Ollama** | Any local model | Unlimited, free | Runs 100% on your Mac; no API bill |
+| **Groq** | Your selected live model | BYOK / free tier available | Loaded from your Groq account |
+| **Gemini** | Your selected live model | BYOK | Loaded from Google AI; vision where supported |
+| **Claude** | Your selected live model | BYOK | Haiku, Sonnet, Opus, and other available models |
+| **ChatGPT** | Your selected live model | BYOK | Loaded from your OpenAI account |
+| **Ollama** | Your selected installed model | Unlimited, free | Runs 100% on your Mac; no API bill |
 
-The built-in **free tier** runs through a hosted metering proxy — the host key never ships in the app. Your own API keys are stored in **macOS Keychain** — never in files, never in the app bundle.
+The built-in **free tier** runs through a hosted metering proxy — the host key never ships in the app. BYOK model lists are refreshed from the provider and cached locally for 24 hours; Dragaway sends the exact model you selected and never silently substitutes another. Your own API keys are stored in **macOS Keychain** — never in files, never in the app bundle.
 
 ---
 
@@ -168,7 +199,7 @@ The built-in **free tier** runs through a hosted metering proxy — the host key
 - **macOS 14 Sonoma** or later
 - A Mac with a **notch** (MacBook Pro 14″ / 16″, MacBook Air M2+) — works on non-notch Macs too, pill appears at the top-center of the screen
 - **Xcode 15** or later to build from source
-- **No permissions required** — drag detection, hotkeys, and the radial launcher all use ungated APIs (drag-pasteboard polling, global *mouse* monitors, Carbon hotkeys). Dragaway never appears in Privacy & Security.
+- **No permissions required for core features** — drag detection, hotkeys, and the radial launcher all use ungated APIs (drag-pasteboard polling, global *mouse* monitors, Carbon hotkeys). Optional **Enhanced Access** appears in Privacy & Security only after you enable instant Clipboard History paste.
 
 ---
 
@@ -186,7 +217,7 @@ open MacNotchAI.xcodeproj
 2. Choose **My Mac** as the run destination
 3. Press **⌘R** to build and run
 
-> The app is **not sandboxed** — this is required for `NSEvent` global mouse monitoring. There is no permission prompt at any point: drag detection works out of the box, and Esc dismissal rides the window's responder chain.
+> The app is **not sandboxed** — this is required for `NSEvent` global mouse monitoring. Core behavior never prompts: drag detection works out of the box, and Esc dismissal rides the window's responder chain. The only optional prompt follows an explicit **Enhanced Access** opt-in.
 
 ### First Launch
 
@@ -213,7 +244,8 @@ open MacNotchAI.xcodeproj
 - **SwiftUI + AppKit hybrid** — `MenuBarExtra` for the menu bar icon, `NSPanel` (`OverlayWindow`) for the overlay, `NSHostingView` subclass (`DroppableHostingView`) for drag-and-drop reception
 - **Swift Concurrency** — `async/await` for AI calls and animation sequencing; `@MainActor` throughout
 - **Combine** — `@Published` stage changes flow through a Combine pipeline to resize the window
-- **No third-party dependencies** — pure Apple frameworks only
+- **Small, audited dependency surface** — Apple frameworks for the app itself, Sparkle for updates,
+  and a pinned Mozilla Readability script for local website-text extraction
 
 ### Key Engineering Decisions
 
@@ -240,7 +272,21 @@ During the 0.14 s dismiss fade, both the old and new `WaitingPillView` are live 
 - Oversized sources are truncated to ~12k chars and flagged in the result UI
 
 **Privacy model**
-Files are read only when the user explicitly taps an action chip. Nothing is uploaded speculatively. The only network calls are the AI API completions. API keys never leave the device except in those API calls.
+Ordinary local files are read only when the user explicitly taps an action chip. Website URL drops are
+the exception: Dragaway immediately fetches the target page locally so its text is ready; when static
+HTML is incomplete, a cookie-free ephemeral WebKit view may run the site's first-party rendering code.
+Folder drops are also prepared locally in the background: traversal and text extraction are bounded,
+never follow symlinks, and skip hidden/generated directories plus known key/secret files. The preview
+shows exactly which files entered the context and which were omitted or skipped. DOC/DOCX/RTF files
+remain available as direct drops, but recursive folder analysis lists and skips them because Apple's
+rich-text importer is synchronous and cannot be safely cancelled during background preparation. A
+single session scans at most four distinct folders; additional folders remain visible and are marked
+as omitted instead of starting unbounded concurrent recursive work.
+No document content is sent to an AI provider until the user starts an AI action. API keys never leave
+the device except in their provider requests.
+
+Accessibility is optional and off by default. When enabled, Dragaway uses event-posting access only to
+send one ⌘V after a Clipboard History selection; it does not inspect another app's UI or accessibility tree.
 
 ---
 

@@ -2,6 +2,7 @@ import Foundation
 
 enum AIAction: String, CaseIterable, Identifiable {
     // Document actions
+    case understandFolder   = "What Does This Folder Do?"
     case summariseBullets   = "Summarise into Bullets"
     case summariseShort     = "Summarise in 1 Sentence"
     case extractKeyDates    = "Extract Key Dates"
@@ -37,7 +38,11 @@ enum AIAction: String, CaseIterable, Identifiable {
     case makeReport             = "Make a Report"
 
     // Text / productivity actions
+    case summariseEmail         = "Summarise Email"
+    case emailNextSteps         = "What Do I Need to Do?"
+    case emailDeadlinesRisks    = "Deadlines & Risks"
     case draftReply             = "Draft Email Reply"
+    case emailQuestions         = "Questions to Answer"
     case extractTodos           = "Extract To-Dos"
     case extractContacts        = "Extract Names & Contacts"
     case explainSimply          = "Explain Simply"
@@ -60,6 +65,7 @@ enum AIAction: String, CaseIterable, Identifiable {
     /// picked from symbols available on the macOS 14 deployment target.
     var icon: String {
         switch self {
+        case .understandFolder:     return "folder"
         case .summariseBullets:     return "list.bullet"
         case .summariseShort:       return "text.alignleft"
         case .extractKeyDates:      return "calendar"
@@ -87,7 +93,11 @@ enum AIAction: String, CaseIterable, Identifiable {
         case .findOutliers:         return "exclamationmark.triangle"
         case .suggestCharts:        return "chart.bar.xaxis"
         case .makeReport:           return "doc.richtext"
+        case .summariseEmail:       return "envelope.open"
+        case .emailNextSteps:       return "checklist"
+        case .emailDeadlinesRisks:  return "exclamationmark.triangle"
         case .draftReply:           return "arrowshape.turn.up.left"
+        case .emailQuestions:       return "questionmark.bubble"
         case .extractTodos:         return "checklist"
         case .extractContacts:      return "person.crop.circle"
         case .explainSimply:        return "lightbulb"
@@ -101,6 +111,14 @@ enum AIAction: String, CaseIterable, Identifiable {
 
     var systemPrompt: String {
         switch self {
+        case .understandFolder:
+            return """
+            Explain what this folder appears to do. Describe its purpose, structure, important files, \
+            likely entry points, dependencies, and how the included parts relate. Start with a concise \
+            overview, then use clear Markdown sections. The supplied folder context contains an explicit \
+            coverage summary: distinguish files whose contents were included from omitted or skipped \
+            files, qualify uncertain conclusions, and never imply that excluded content was analysed.
+            """
         case .summariseBullets:
             return "Summarise the following content into concise bullet points. Be brief and extract only the most important information."
         case .summariseShort:
@@ -155,8 +173,16 @@ enum AIAction: String, CaseIterable, Identifiable {
             return "Recommend which chart types best visualise this data and why. For each: name the chart, the columns to map (x / y / series), and what it would reveal. Do not attempt to draw the chart."
         case .makeReport:
             return "Write a short structured report on this data: an overview, key findings as bullet points, and a brief conclusion. Use Markdown headings."
+        case .summariseEmail:
+            return "Summarise this email for its recipient. Cover the sender's purpose, the key information or decisions, any requests, and the context needed to act. Keep it concise, do not draft a reply, and do not invent details."
+        case .emailNextSteps:
+            return "Identify exactly what the recipient needs to do after reading this email. Put required actions first, then clearly implied or optional actions. For each item include the owner, deadline, dependency, and requested response when stated. If no action is needed, say so clearly. Do not invent tasks."
+        case .emailDeadlinesRisks:
+            return "Analyse this email for deadlines, dated commitments, blockers, risks, dependencies, and important ambiguity. Separate explicit facts from reasonable risks or uncertainties, cite the relevant evidence briefly, and say clearly when none are present. Do not invent dates or commitments."
         case .draftReply:
             return "Draft a clear, professional reply to this email or message. Use an appropriate tone, address the key points, and keep it concise."
+        case .emailQuestions:
+            return "List every explicit question in this email plus any clearly implied request for information or a decision. Group them into questions to answer and decisions to make, preserving enough context to respond. If there are none, say so clearly. Do not draft the reply or invent questions."
         case .extractTodos:
             return "Extract every action item, task, and to-do from this content as a checklist. Include any owner or deadline mentioned next to each item."
         case .extractContacts:

@@ -116,7 +116,7 @@ class OverlayViewModel: ObservableObject {
     /// The extracted document context, built once per session and reused for every
     /// turn so the file is never re-read / re-extracted. Cleared when the file set
     /// changes (didSet on additionalFileURLs) or on restart.
-    struct BaseContext {
+    struct BaseContext: Sendable {
         let content: String
         let imageURL: URL?
         let truncated: Bool
@@ -131,6 +131,19 @@ class OverlayViewModel: ObservableObject {
     // non-streaming providers never create the bubble, so the caller falls back to a
     // plain append.
     private var streamingMessageID: UUID?
+
+    /// Exactly one provider turn may own the shared transcript/streaming slot. The
+    /// token also gives reset/back navigation a concrete Task to cancel instead of
+    /// merely ignoring its eventual state writes.
+    private var activeAITurnID: UUID?
+    private var activeAITurnTask: Task<Void, Never>?
+    private var conversationBeforeActiveTurn: [ChatMessage]?
+    @Published private(set) var isAITurnActive = false
+
+    /// Identity of the live interaction session. Async extraction/provider work
+    /// captures this value and must stop writing when a close, reset, restore, or
+    /// fresh drop has replaced the session underneath it.
+    private(set) var sessionRevision = UUID()
 
     /// Append a streamed text delta. First delta: leaves the loading/thinking state
     /// and creates the assistant bubble (flipping to the result stage if needed).
@@ -170,11 +183,66 @@ class OverlayViewModel: ObservableObject {
     /// Stream failed mid-flight: stop tracking the bubble (any partial text stays
     /// visible; the error note is appended separately by the caller).
     func abortStreamedReply() { streamingMessageID = nil }
+
+    /// Claim the single shared streaming slot before any optimistic conversation
+    /// mutation. A second click/submit while a turn is live is deliberately ignored.
+    func beginAITurn() -> UUID? {
+        guard activeAITurnID == nil else { return nil }
+        let id = UUID()
+        activeAITurnID = id
+        conversationBeforeActiveTurn = conversation
+        isAITurnActive = true
+        return id
+    }
+
+    func attachAITurnTask(_ task: Task<Void, Never>, id: UUID) {
+        guard activeAITurnID == id else {
+            task.cancel()
+            return
+        }
+        activeAITurnTask = task
+    }
+
+    func isCurrentAITurn(_ id: UUID, sessionRevision: UUID) -> Bool {
+        self.sessionRevision == sessionRevision && activeAITurnID == id
+    }
+
+    func completeAITurn(_ id: UUID) {
+        guard activeAITurnID == id else { return }
+        activeAITurnID = nil
+        activeAITurnTask = nil
+        conversationBeforeActiveTurn = nil
+        isAITurnActive = false
+    }
+
+    /// Explicit navigation/session replacement owns cancellation. Rolling back keeps
+    /// a cancelled optimistic prompt or partial stream out of the next request.
+    func cancelActiveAITurn(rollbackConversation: Bool) {
+        activeAITurnTask?.cancel()
+        activeAITurnTask = nil
+        activeAITurnID = nil
+        if rollbackConversation, let previous = conversationBeforeActiveTurn {
+            conversation = previous
+        }
+        conversationBeforeActiveTurn = nil
+        streamingMessageID = nil
+        isAwaitingReply = false
+        isAITurnActive = false
+    }
     /// True while a follow-up turn is in flight (transcript already on screen). Drives
     /// the "Thinking…" row. The FIRST turn uses the .loading stage instead.
     @Published var isAwaitingReply = false
     /// Cached extracted document context for the current session (see BaseContext).
     var baseContext: BaseContext? = nil
+    /// Background-prepared drops can finish content extraction while the user is
+    /// reading the chips. A chip tapped before completion awaits this same Task, so
+    /// preparation is never duplicated and no provider request starts with partial
+    /// content. Mail starts this session-level preparation eagerly; web placeholders
+    /// additionally wait on their own file-scoped task inside `buildMultiFileContent`.
+    private var baseContextPreparation: Task<BaseContext, Error>?
+    private var baseContextPreparationID: UUID?
+    private var baseContextPreparationPaths: [String] = []
+    private var baseContextPreparationLimit = 0
 
     @Published var stage: Stage = .waitingForDrop
     // Active tab in the stage-2 prompt section. Reset to .suggested on each fresh
@@ -257,7 +325,7 @@ class OverlayViewModel: ObservableObject {
     /// Cleared on reset() and setChips() (fresh session). Changing the file set
     /// invalidates the cached BaseContext so the next turn re-extracts.
     @Published var additionalFileURLs: [URL] = [] {
-        didSet { baseContext = nil }
+        didSet { invalidateBaseContext() }
     }
 
     /// Every file in the current session — primary (the stage URL) first, then any
@@ -333,6 +401,7 @@ class OverlayViewModel: ObservableObject {
     // MARK: - State
 
     func setChips(url: URL) {
+        beginNewSessionRevision()
         // A genuine new drop supersedes any parked (minimized) session.
         minimizedSnapshot = nil
         hasMinimizedSession = false
@@ -355,6 +424,7 @@ class OverlayViewModel: ObservableObject {
         let base = FileInspector.baseActions(for: url)
         stage = .chips(url: url, actions: base)
         customPrompt = ""
+        FolderAnalysisStore.shared.beginSession(with: [url])
         applySmartActions(base: base, primary: url)
     }
 
@@ -363,9 +433,11 @@ class OverlayViewModel: ObservableObject {
     /// files are skipped; if NONE are supported the stage routes to `.error`. Used by
     /// multi-file drag-drop and the Finder "Add to Dragaway" Quick Action.
     func setChips(urls: [URL]) {
+        beginNewSessionRevision()
         let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
         guard let primary = supported.first else {
             // Nothing analysable in the batch.
+            FolderAnalysisStore.shared.cancelAll()
             let name = urls.first?.lastPathComponent ?? "These files"
             minimizedSnapshot = nil
             hasMinimizedSession = false
@@ -397,24 +469,111 @@ class OverlayViewModel: ObservableObject {
         let base = FileInspector.baseActions(forAll: allURLs)
         stage = .chips(url: primary, actions: base)
         customPrompt = ""
+        FolderAnalysisStore.shared.beginSession(with: allURLs)
         applySmartActions(base: base, primary: primary)
+    }
+
+    /// Start extracting a known, fully materialised session without delaying its UI.
+    /// The result remains inside the Task until the first AI action consumes it.
+    func prepareBaseContext(for urls: [URL], charLimit: Int) {
+        guard let primary = urls.first else { return }
+        let paths = urls.map { $0.standardizedFileURL.path }
+        if baseContextPreparationPaths == paths,
+           baseContextPreparationLimit == charLimit,
+           baseContextPreparation != nil {
+            return
+        }
+
+        baseContextPreparation?.cancel()
+        let preparationID = UUID()
+        baseContextPreparationID = preparationID
+        baseContextPreparationPaths = paths
+        baseContextPreparationLimit = charLimit
+        let additional = Array(urls.dropFirst())
+        baseContextPreparation = Task(priority: .userInitiated) {
+            let prepared = try await buildMultiFileContent(
+                primary: primary,
+                additional: additional,
+                charLimit: charLimit
+            )
+            try Task.checkCancellation()
+            return BaseContext(
+                content: prepared.content,
+                imageURL: prepared.imageURL,
+                truncated: prepared.truncated
+            )
+        }
+    }
+
+    /// Return the in-flight/completed preparation only when it still belongs to the
+    /// exact current file set and extraction ceiling. A changed session falls back to
+    /// the ordinary extraction path in `sendTurn`.
+    func preparedBaseContext(
+        for urls: [URL],
+        charLimit: Int
+    ) async throws -> BaseContext? {
+        let paths = urls.map { $0.standardizedFileURL.path }
+        guard paths == baseContextPreparationPaths,
+              charLimit == baseContextPreparationLimit,
+              let preparation = baseContextPreparation,
+              let preparationID = baseContextPreparationID
+        else { return nil }
+
+        do {
+            let prepared = try await preparation.value
+            guard preparationID == baseContextPreparationID,
+                  paths == baseContextPreparationPaths,
+                  charLimit == baseContextPreparationLimit
+            else { return nil }
+            baseContextPreparation = nil
+            baseContextPreparationID = nil
+            baseContextPreparationPaths = []
+            baseContextPreparationLimit = 0
+            return prepared
+        } catch {
+            if preparationID == baseContextPreparationID,
+               paths == baseContextPreparationPaths,
+               charLimit == baseContextPreparationLimit {
+                baseContextPreparation = nil
+                baseContextPreparationID = nil
+                baseContextPreparationPaths = []
+                baseContextPreparationLimit = 0
+            }
+            throw error
+        }
+    }
+
+    private func invalidateBaseContext() {
+        baseContext = nil
+        baseContextPreparation?.cancel()
+        baseContextPreparation = nil
+        baseContextPreparationID = nil
+        baseContextPreparationPaths = []
+        baseContextPreparationLimit = 0
     }
 
     /// Off-main content peek → main-thread reorder → patch the live chips actions if the
     /// order actually changed and the session is still on the same primary file.
     private func applySmartActions(base: [AIAction], primary: URL) {
-        guard !base.isEmpty, !FileInspector.isMediaFile(primary) else { return }
+        guard !base.isEmpty,
+              !FileInspector.isMediaFile(primary),
+              !sessionFileURLs.contains(where: FileInspector.isDirectory) else { return }
+        let revision = sessionRevision
+        let expectedPaths = sessionFileURLs.map { $0.standardizedFileURL.path }
         Task.detached(priority: .userInitiated) {
             let signals = FileInspector.peekSignals(primary)
             await MainActor.run {
                 // Warm the main-actor peek cache so later synchronous
                 // suggestedActions() calls don't re-peek the file on the main thread.
                 FileInspector.seedPeekCache(for: primary, signals: signals)
-                guard case .chips(let u, let current) = OverlayViewModel.shared.stage,
+                let vm = OverlayViewModel.shared
+                guard vm.sessionRevision == revision,
+                      vm.sessionFileURLs.map({ $0.standardizedFileURL.path }) == expectedPaths,
+                      case .chips(let u, let current) = vm.stage,
                       u == primary else { return }
                 let reordered = FileInspector.smartReorder(base, primary: primary, signals: signals)
                 if reordered != current {
-                    OverlayViewModel.shared.stage = .chips(url: primary, actions: reordered)
+                    vm.stage = .chips(url: primary, actions: reordered)
                 }
             }
         }
@@ -424,8 +583,8 @@ class OverlayViewModel: ObservableObject {
     /// context but keeps the same document(s) and returns to the suggested actions —
     /// a fresh conversation on the same file without re-dropping it.
     func restartConversation(url: URL) {
+        beginNewSessionRevision()
         conversation = []
-        baseContext = nil
         isAwaitingReply = false
         cachedResult = nil
         contentTruncated = false
@@ -451,7 +610,9 @@ class OverlayViewModel: ObservableObject {
     /// Navigate back to the chips stage while keeping the current result cached
     /// so the user can tap → to restore it without re-running the AI.
     func navigateBackToChips(savingResult result: Stage, url: URL) {
-        cachedResult = result
+        let wasActive = isAITurnActive
+        cancelActiveAITurn(rollbackConversation: true)
+        cachedResult = wasActive ? nil : result
         stage = .chips(url: url, actions: FileInspector.suggestedActions(for: url))
         customPrompt = ""
     }
@@ -463,7 +624,7 @@ class OverlayViewModel: ObservableObject {
     func minimizeCurrentSession() -> Bool {
         // No session at waitingForDrop; never park a turn that is still in flight
         // (the async reply would land into a torn-down session).
-        guard stage.tag != 0, !isAwaitingReply else { return false }
+        guard stage.tag != 0, !isAITurnActive else { return false }
         minimizedSnapshot = MinimizedSnapshot(
             stage: stage, chipsTab: chipsTab,
             isChipsExpanded: isChipsExpanded, isFollowupsExpanded: isFollowupsExpanded,
@@ -490,6 +651,9 @@ class OverlayViewModel: ObservableObject {
     /// Re-apply a parked snapshot. `stage` is set LAST so AppDelegate's resize
     /// observer fires with the final stage already in place.
     func applySnapshot(_ s: MinimizedSnapshot) {
+        beginNewSessionRevision()
+        let restoredURLs = s.stage.fileURL.map { [$0] + s.additionalFileURLs } ?? []
+        let restoresFolder = restoredURLs.contains(where: FileInspector.isDirectory)
         isChipsExpanded     = s.isChipsExpanded
         isFollowupsExpanded = s.isFollowupsExpanded
         chipsTab            = s.chipsTab
@@ -500,8 +664,13 @@ class OverlayViewModel: ObservableObject {
         customPrompt        = s.customPrompt
         conversation        = s.conversation
         isAwaitingReply     = false
-        baseContext         = s.baseContext          // …so restore it AFTER the line above
+        // Folder contents may have changed while the session was hidden. Never pair
+        // a freshly re-scanned preview with an old cached folder context.
+        baseContext         = restoresFolder ? nil : s.baseContext
         stage               = s.stage
+        // A restored folder may have moved or changed while hidden. Rebuild the
+        // bounded manifest instead of trusting stale in-memory coverage.
+        FolderAnalysisStore.shared.beginSession(with: restoredURLs)
     }
 
     // MARK: - Session URL remap
@@ -512,6 +681,10 @@ class OverlayViewModel: ObservableObject {
     func remapSessionURL(from old: URL, to new: URL) {
         guard old != new else { return }
         func remap(_ u: URL) -> URL { u == old ? new : u }
+
+        // A materialized website may still be enriching its URL-only placeholder.
+        // Move that pending task's destination before changing the live session URLs.
+        WebDropPreparation.remap(from: old, to: new)
 
         // Keep the active history record's paths in sync (best-effort).
         SessionHistoryStore.shared.remapPath(from: old, to: new)
@@ -559,12 +732,17 @@ class OverlayViewModel: ObservableObject {
             }
             minimizedSnapshot = snap
         }
+
+        // A rename changes multi-file framing and may change the equal context split.
+        // Rebuild every live folder with the exact budget its next request will use.
+        FolderAnalysisStore.shared.beginSession(with: sessionFileURLs)
     }
 
     /// Partial reset: clears transient interaction flags without touching `stage`.
     /// Called at the START of hideOverlay() so the fade animation plays over the
     /// current stage's UI — not over a prematurely-switched WaitingPillView.
     func partialReset() {
+        cancelActiveAITurn(rollbackConversation: false)
         isDragHovering      = false
         isDraggingOut       = false
         pendingDroppedURLs  = []
@@ -577,6 +755,8 @@ class OverlayViewModel: ObservableObject {
     /// Restores isChipsExpanded / isFollowupsExpanded from the persisted preference
     /// so the next session starts in the state the user left it.
     func reset() {
+        beginNewSessionRevision()
+        FolderAnalysisStore.shared.cancelAll()
         stage         = .waitingForDrop
         chipsTab       = .suggested
         isDragHovering = false
@@ -598,6 +778,12 @@ class OverlayViewModel: ObservableObject {
         isChipsExpanded     = UserDefaults.standard.object(forKey: Self.keyChipsExpanded)     as? Bool ?? true
         isFollowupsExpanded = UserDefaults.standard.object(forKey: Self.keyFollowupsExpanded) as? Bool ?? false
     }
+
+    private func beginNewSessionRevision() {
+        cancelActiveAITurn(rollbackConversation: false)
+        sessionRevision = UUID()
+        invalidateBaseContext()
+    }
 }
 
 /// Shared geometry for the stage-2 prompt-tab content. The chips window is sized in
@@ -606,6 +792,10 @@ class OverlayViewModel: ObservableObject {
 /// from the same numbers — any drift would clip content or leave a gap. All values
 /// are UNSCALED; multiply by the UI scale at the call site.
 enum ChipsLayout {
+    /// Context label/control row + gap + file pill, including the same vertical
+    /// slack previously budgeted for the one-row header.
+    static let fileHeaderHeight: CGFloat = 80
+
     static let rowStride:    CGFloat = 36   // per-row height budget (chip + slack)
     static let rowSpacing:   CGFloat = 6
     static let maxVisibleRows = 5           // beyond this the content region scrolls

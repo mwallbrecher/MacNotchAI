@@ -167,6 +167,123 @@
   pasteboard flavours. If a source never sends `draggingEntered`, use a narrowly typed, cached payload
   fallback with explicit AppKit ownership handoff; never weaken the stale-pasteboard guards.
 
+### [DRAG-06] Mixed browser drags must prioritize the visible bitmap over their page URL
+- **What was wrong:** browser image-result drags can expose PNG/TIFF/JPEG data, an image promise, plain
+  text, and a source/page URL at the same time. A URL-first path materialized the page as TXT even though
+  the user visibly dragged an image.
+- **Why:** pasteboard flavours are alternative representations of one gesture, not equally authoritative
+  independent objects. Generic URL extraction loses the user's visible target when bitmap data is also
+  present, and a late-window fallback that caches only a URL repeats the same mistake outside AppKit.
+- **Fix:** centralize payload classification with the order bitmap bytes → image promise when declared
+  bytes are unavailable → HTTP(S) URL → text. Use the same typed image-or-URL decision in both the normal
+  `NSDraggingDestination` path and the Safari late-window fallback while keeping AppKit ownership and
+  one-drop guards intact.
+- **Rule:** for mixed browser pasteboards, materialize the thing visibly dragged. Bitmap/image-promise
+  representations outrank source URLs; tabs and links still resolve to URLs when no image is declared.
+
+### [DRAG-07] A written promised file does not prove a successful receiver callback
+- **What was wrong:** Apple Mail reached `draggingEntered` and wrote complete `.eml` files into the
+  promise destination, but no session opened. The first diagnosis blamed the unsupported-file filter.
+- **Why:** `.eml` already passed that filter through the generic non-empty action pool. The real handoff
+  collected a promised URL only when the `NSFilePromiseReceiver` reader returned with `error == nil`;
+  Mail's legacy promise can leave the file behind without producing that usable completion, so the
+  dispatch group path ends empty or never completes.
+- **Fix:** preserve the normal promise route and add recovery only when the drag declares Mail's exact
+  message-transfer pasteboard type. Handle Mail callbacks without the generic one-enter/one-leave group
+  because one legacy receiver may emit several files. Feed both successful callbacks and recovered files
+  through one batch accumulator so a multi-message drag stays one session. For recovery, inspect only
+  `receiver.fileNames`, require a new-or-changed size/mtime fingerprint to remain stable across
+  observations, validate a regular non-empty `.eml` / `.emlx` with a bounded MIME parse, and dedupe
+  delivery against both the current session and the normal callback.
+- **Rule:** diagnose promised-file drops as three separate gates: destination entry, physical file
+  fulfilment, and reader-callback/session handoff. Never infer the third from the first two, and keep any
+  legacy-source recovery narrowly type-gated so proven Safari/image promise behavior cannot change.
+
+### [MAIL-01] AppKit's HTML-to-text importer can load email tracking resources
+- **What was wrong:** HTML-only mail was converted with `NSAttributedString(data:options:)` and the HTML
+  document type, which looked like a local text conversion.
+- **Why:** AppKit's HTML importer resolves external stylesheets and images. A crafted or ordinary HTML
+  email can therefore issue GET requests for tracking pixels/CSS while Dragaway extracts it, leaking the
+  read event and contradicting the local-extraction privacy boundary.
+- **Fix:** keep MIME/charset decoding in Foundation, remove script/style/head/resource markup with a
+  bounded string pass, preserve basic block/list/table separators, strip all remaining tags, and decode
+  common named/numeric entities. A localhost trap confirmed embedded CSS/image URLs receive zero requests.
+- **Rule:** never feed untrusted email HTML to AppKit/WebKit merely to obtain plain text. Email extraction
+  must use a no-I/O sanitizer/parser, and remote resources must remain inert data.
+
+### [DRAG-08] Asynchronous promise delivery must not open a session mid-collapse
+- **What was wrong:** a complete promised-file batch could arrive after the delayed pill dismissal had
+  set `isCollapsing`, but before teardown reset the waiting stage. Opening chips in that interval could
+  cancel teardown while leaving the new card visually collapsed.
+- **Why:** callback time is independent of the drag-end animation. A nominal elapsed-time guard is not
+  sufficient either: if the main thread stalls, the delayed collapse itself can begin later than planned.
+- **Fix:** centralise Mail batch delivery after the nominal dismiss/collapse window and also gate it on
+  the live `isCollapsing` flag. Retain the complete accumulator and retry after the collapse when either
+  guard says the handoff is unsafe; protect retries with the batch generation token.
+- **Rule:** any asynchronous drop source that opens a session must respect the overlay's live collapse
+  state. Never write a new stage into an in-flight dismiss animation.
+
+### [DRAG-09] Apple Mail inbox rows require the advertised legacy file-promise trigger
+- **What was wrong:** Mail reached `draggingEntered` and `performDragOperation`, but no `.eml` appeared;
+  the recovery loop had nothing to validate and `NSFilePromiseReceiver` eventually timed out with
+  `NSURLErrorDomain -1001`.
+- **Why:** inbox-row drags advertise modern promise flavours *and* legacy `Apple files promise pasteboard
+  type`, but Mail's modern receiver bridge does not necessarily trigger file creation. The destination
+  must call `NSDraggingInfo.namesOfPromisedFilesDropped(atDestination:)` while the drag source is live.
+- **Fix:** for the exact Mail message-transfer flavour only, fingerprint the destination, invoke the
+  legacy fulfilment method inside `performDragOperation`, then feed its returned filenames into the same
+  stable-file/MIME/batch/collapse-safe recovery used by the modern fallback. Use the modern receiver only
+  when the legacy call returns no names.
+- **Rule:** declared pasteboard compatibility does not prove a modern promise API will fulfil a legacy
+  source. When the source advertises `NSFilesPromisePboardType`, trigger that contract during the live
+  drop, and isolate the compatibility path by exact source flavour.
+
+### [DRAG-10] A legacy promise's returned label may not be the written filename
+- **What was wrong:** the Mail legacy call returned one promised name, but recovery still found no file.
+  Filesystem evidence showed complete `.eml` files written at every drop timestamp.
+- **Why:** Mail returned an extensionless display label while writing a subject-named `.eml`. Treating
+  the label as a literal destination filename constructed a nonexistent extensionless path; the strict
+  `.eml/.emlx` validator then correctly rejected it forever.
+- **Fix:** retain the returned array only as the expected message count. For this exact legacy-Mail path,
+  diff the app-private Drops directory against its pre-fulfilment size/mtime snapshot, then apply the
+  existing two-observation stability check, MIME validation, batching, dedupe, and collapse-safe handoff
+  to the real changed `.eml/.emlx` URLs. Modern receiver names remain literal.
+- **Rule:** verify promise APIs against the destination filesystem. Never assume a legacy source's
+  returned display name is byte-for-byte identical to the file it creates.
+
+### [DRAG-11] Do not impose recovery latency on a fulfilled synchronous promise
+- **What was wrong:** working Mail drops still took roughly 1–2 seconds to show their actions because
+  every legacy fulfilment went through the fallback's two stable-fingerprint observations (0.65 s then
+  0.50 s), even when the fulfilment method had already returned with every expected `.eml` on disk.
+- **Why:** stability polling is necessary when callbacks fail or files arrive asynchronously, but it
+  was being treated as the normal path. MIME extraction was not the visible bottleneck.
+- **Fix:** after the exact Mail-only legacy call returns, compare the private Drops directory with the
+  pre-call snapshot. When the delta contains exactly the promised count of regular, non-empty mail
+  files, open the chips immediately and prepare their bounded MIME context in one shared background
+  Task; a fast action click awaits that Task before contacting a provider. Keep the original stable,
+  MIME-validated recovery for incomplete deltas. Central session opening must cancel pending teardown
+  and clear a live `isCollapsing` flag so the early handoff cannot inherit an invisible card state.
+- **Rule:** separate a promised-file happy path from its recovery path. If a synchronous source contract
+  has already produced the exact expected private-directory delta, render from the known URLs now,
+  prepare expensive content once in the background, and retain conservative polling only as fallback.
+
+### [DRAG-12] A fast synchronous promise call can still publish its file just after returning
+- **What was wrong:** the Mail fast path still took almost exactly 1.15 seconds even though the legacy
+  fulfilment method returned in 6 ms. The immediate directory scan saw no delta, so recovery deliberately
+  waited 0.65 seconds for its first fingerprint and another 0.50 seconds for stability.
+- **Why:** synchronous API return only proved that Mail accepted/completed its legacy fulfilment call;
+  it did not guarantee that the destination-directory view had exposed the new `.eml` on that exact
+  runloop turn. The file was already present by the first delayed observation, making the coarse polling
+  cadence—not file writing or MIME extraction—the measured bottleneck.
+- **Fix:** after an empty immediate scan, the exact legacy-Mail branch now observes the private directory
+  after 40 ms and then every 50 ms for a bounded ~590 ms. It still requires the full advertised count,
+  two identical size/mtime fingerprints, a bounded MIME sanity parse, and exact-once delivery. A validated
+  batch uses the collapse-cancelling early session handoff directly; the original six-second recovery
+  remains independently armed for slow or partial writes.
+- **Rule:** measure promise fulfilment, file visibility, stability, and UI handoff separately. Preserve
+  safety invariants, but tune observation cadence to the source's measured publication window instead of
+  turning a fallback interval into unavoidable product latency.
+
 ---
 
 ## Xcode / Build
@@ -181,6 +298,18 @@
   appcast entry for the current DMG lacks `edSignature`.
 - **Rule**: for Sparkle, verify the built/exported `.app/Contents/Info.plist`, not only Xcode build
   settings. `generate_appcast` signs only when the update bundle advertises `SUPublicEDKey`.
+
+### [RELEASE-02] A notarization ticket and staple do not prove the DMG container is signed
+- **What was wrong:** the release helper exported a correctly Developer-ID-signed app, wrapped it in
+  an unsigned DMG, and submitted that DMG to Apple. Notarytool returned `Accepted` and stapler validated
+  the ticket, but `spctl` still reported `source=no usable signature` for the disk image itself.
+- **Why:** Apple can notarize the signed code nested inside an archive and staple its ticket without
+  creating a code signature for the outer disk-image container. `hdiutil create` does not sign a DMG.
+- **Fix:** run `codesign --timestamp --sign "Developer ID Application: …"` on the completed DMG before
+  notary submission, verify that signature, then notarize, staple, and regenerate the Sparkle signature
+  because every change to the DMG changes its bytes.
+- **Rule:** release verification has three separate gates: `codesign` the DMG, notarize/staple the DMG,
+  and verify the app inside it. Passing any one of those does not imply the other two passed.
 
 ### [BUILD-01] INFOPLIST_KEY_* must be added to project.pbxproj with exact tab indentation
 - **Mistake**: Used space indentation in Edit tool when the file uses tabs → string not found
@@ -429,6 +558,25 @@
   "observe our own app's keys, optionally swallow, no system scope" → `addLocalMonitorForEvents`.
   "observe other apps' keys, cannot swallow, needs Accessibility" → `addGlobalMonitorForEvents`.
 
+### [CLIP-03] Restore focus permission-free; gate cross-app paste on intent + live TCC state
+- **What was wrong:** Clipboard History selection copied the entry and closed its panel, but Dragaway
+  had activated itself to receive number keys and never returned activation. The user therefore had
+  to click the original app before pressing ⌘V. Simply posting ⌘V would hide that focus bug behind a
+  mandatory Accessibility permission.
+- **Why:** pasteboard ownership and application activation are separate. `NSPasteboard` can provide
+  data but cannot command another process to consume it. `NSRunningApplication` activation is ungated;
+  synthesizing the Command-V keyboard events is TCC-gated. Activation is also asynchronous, so a fixed
+  delay can paste into Dragaway or into a third app selected during the handoff.
+- **Fix:** capture `NSWorkspace.frontmostApplication` before showing the picker; after selection use
+  macOS 14 cooperative activation (`NSApp.yieldActivation` + `activate(from:options:)`). Default-off
+  `EnhancedAccess` stores user intent separately from `CGPreflightPostEventAccess()` and requests via
+  `CGRequestPostEventAccess()` only on OFF→ON. When both gates pass, a one-shot token waits for the
+  exact target's activation notification, re-checks the frontmost PID and TCC, then posts one ⌘V.
+  Timeout, a third-app activation, revocation, failed payload write, or failed activation cancels it.
+- **Rule:** never conflate focus restoration with auto-paste. Always restore focus without permission;
+  synthesize input only after explicit opt-in + live authorization + exact-target confirmation, and
+  clear one-shot state before posting so competing callbacks cannot double-fire.
+
 ### [SUGG-01] Adding an `AIAction` case ripples into several exhaustive switches
 - **Context:** the heuristic smart-suggestions work added `AIAction.translateEnglish`. The build broke
   at `ModelRouting.swift:63` ("switch must be exhaustive") — `AIAction.routing` switches on every case
@@ -672,6 +820,94 @@
 - **Rule:** when a loop changes demo content between cycles, perform the content swap after the outgoing
   surface is hidden, not at the same moment the transition begins.
 
+### [WEB-17] Keep marketing-page scroll progress spatially deterministic
+- **What was wrong:** the product-page Stage replaced its linear scroll scrub with duration-weighted
+  dwell and then a gate that combined trackpad distance with elapsed video playback.
+- **Why:** media scheduling, looping playback, scroll inertia, and discrete chapter transitions made the
+  same gesture feel inconsistent; users could meet the text before the video, get held between states,
+  or advance at an unexpected point in an ongoing gesture.
+- **Fix:** restore one pinned ScrollTrigger that scrubs the master timeline directly, while keeping the
+  seven recording switch points and settled progress-dot destinations independent of video duration.
+- **Rule:** for a marketing-page narrative, keep chapter position a deterministic function of scroll
+  position. Validate any time-based resistance as an isolated prototype before replacing the baseline.
+
+---
+
+## UI ownership
+
+### [UI-01] Keep object-scoped actions attached to the object's surface
+- **What was wrong:** the first two-row header plan moved Share into the global header-control cluster
+  together with collapse, navigation, minimize, and close.
+- **Why:** Share acts on the file/session represented by the file pill, while the other controls act on
+  the overlay itself. Moving it away weakens that ownership cue and changes a proven interaction even
+  though the request only called for reorganising the surrounding layout.
+- **Fix:** keep Share at the far right inside the full-width file-pill row and move only overlay/session
+  controls into the compact top row.
+- **Rule:** when rearranging a header, classify controls by ownership first. Object actions stay on the
+  object surface unless the user explicitly asks to change that interaction.
+
+### [UI-02] Shared rows can need asymmetric edge alignment
+- **What was wrong:** a symmetric negative horizontal inset pulled both the trailing controls and the
+  leading type label toward the card corners, although the label was meant to align with the file pill.
+- **Why:** the two ends of the row have different visual anchors: the label belongs to the content
+  column, while the window controls belong near the card edge.
+- **Fix:** retain the normal leading inset and pull only the trailing edge outward; keep both distances
+  scaled through `uiScale` and let the flexible spacer absorb width changes.
+- **Rule:** do not assume both sides of a responsive row share an alignment target. Apply directional
+  insets to the side that actually needs them instead of offsetting the entire row.
+
+---
+
+## AI model selection
+
+### [MODEL-01] A live `/models` endpoint is availability data, not a compatibility contract
+- **What was wrong:** treating every ID returned by a provider as a usable Dragaway chat model would
+  expose embeddings, speech, image-generation, moderation, guard, and endpoint-specific models in the
+  same picker as normal text/vision models.
+- **Why:** OpenAI-compatible catalogues often mix several product APIs, and most do not report the
+  request parameters or modalities supported by each ID.
+- **Fix:** fetch the live account catalogue, exclude obvious non-chat families, annotate capabilities
+  where the provider reports them, and place unrecognised but plausible chat IDs under an explicit
+  "Other available models" group.
+- **Rule:** use live catalogues to avoid stale IDs, but keep a small compatibility layer between raw
+  provider data and a production model picker.
+
+### [MODEL-02] Persist exact selections under stable provider keys
+- **What was wrong:** provider `rawValue`s contain old marketing/model copy and the providers themselves
+  hard-coded model IDs, so a UI-only picker would either become stale or silently disagree with the
+  actual request route.
+- **Why:** display labels are not durable identifiers, and replacing a disappeared model automatically
+  breaks user trust and makes cost/quality unpredictable.
+- **Fix:** give every provider a stable storage key, migrate each legacy hard-coded model once into its
+  own persisted selection, inject that exact ID into every request, and keep missing selections visible
+  as unavailable instead of substituting a default.
+- **Rule:** provider/model selection is configuration, not routing advice. Persist exact IDs per provider
+  and require an explicit user action to change them.
+
+### [MODEL-03] Discover models from the same API surface used to execute them
+
+- **What was wrong:** Gemini's first live picker used the native `generateContent` model catalogue
+  while requests were sent through Google's OpenAI-compatible Chat Completions endpoint.
+- **Why:** a provider can expose different model sets and capabilities on native, compatibility, and
+  specialised APIs. "Available somewhere on this account" does not prove compatibility with the
+  endpoint Dragaway actually calls.
+- **Fix:** query Gemini's documented OpenAI-compatible `/models` endpoint, invalidate the old cache,
+  and keep every provider catalogue aligned with its request surface.
+- **Rule:** availability checks and execution must share an API family. If the request endpoint changes,
+  version or invalidate its cached catalogue as part of the same change.
+
+### [MODEL-04] Capability overrides must target documented model profiles
+
+- **What was wrong:** broad family checks treated every Groq `qwen3` ID as supporting the same
+  `reasoning_effort` values and missed newer vision-capable variants; unknown OpenAI aliases could
+  likewise inherit the wrong image or sampling assumptions.
+- **Why:** naming families are not capability schemas. Providers reuse family strings across text,
+  vision, reasoning, preview, and endpoint-specific variants with different accepted parameters.
+- **Fix:** keep live discovery broad, but apply request parameters and vision overrides only to
+  documented exact variants or narrowly stable patterns; unknown models retain provider defaults.
+- **Rule:** never infer a wire parameter from a loose substring when a provider documents support per
+  model. A false negative may disable a feature; a false positive can make every request fail.
+
 ---
 
 ## Git coordination
@@ -700,3 +936,162 @@
 - **Rule:** before every repository mutation run `git branch --show-current`,
   `git status --short --branch`, and `git worktree list`. Never restore, stash, stage, commit, move, or
   delete unexpected changes. In a shared dirty worktree, stage exact reviewed paths—never `git add .`.
+
+---
+
+## Website extraction
+
+### [WEB-01] Background preparation needs both file identity and session identity
+
+- **What was wrong:** a URL enrichment task was keyed only by its initial path, while the AI turn that
+  awaited it could outlive a close/reset. Same-second drops could also share that path.
+- **Why:** an async task can finish after a rename, move, or entirely new overlay session; path and UI
+  state are independent lifetimes.
+- **Fix:** materialize unique filenames, remap pending destinations with file utilities, and gate every
+  post-await provider/UI write plus deferred stage transition on a per-session revision.
+- **Rule:** file-scoped work follows the file; session-scoped work may write only while its captured
+  session revision is still current.
+
+### [WEB-02] A parser label is not evidence that extraction is complete
+
+- **What was wrong:** a short static Readability hit received a huge fixed score and could suppress or
+  beat a much richer rendered page; a nonempty “Loading…” main element could hide full body text.
+- **Why:** reader/semantic/body describe extraction strategies, not completeness, and SPA shells can
+  contain plausible prose before their real content arrives.
+- **Fix:** return all three DOM candidates, make strategy only a bounded tie-breaker, compare static and
+  rendered richness, and give dynamic pages a minimum settle window before extraction.
+- **Rule:** rank website candidates primarily by usable content, and use strategy only to break close
+  calls—never to outweigh thousands of characters.
+
+### [WEB-03] Invisible web views must explicitly fail closed on device permissions
+
+- **What was wrong:** omitting WebKit's media-capture delegate defaults to prompting, so a hidden page
+  could request camera or microphone access during content extraction.
+- **Why:** ephemeral storage and blocked media resources do not change WebKit's permission-delegate
+  default.
+- **Fix:** implement the media-capture permission callback and always return `.deny`; keep popups,
+  dialogs, downloads, authentication challenges, and extra navigations guarded as well.
+- **Rule:** every hidden renderer must deny interactive/device capabilities explicitly, not rely on
+  absent UI or nonpersistent storage.
+
+### [WEB-04] Session identity does not serialize concurrent provider turns
+
+- **What was wrong:** two fast actions in one session shared the same session revision and could append
+  deltas into one streaming bubble; navigating back after the first delta could also be overwritten.
+- **Why:** a session token distinguishes files/conversations, but not concurrent owners of mutable
+  request state such as the transcript, streaming message ID, or deferred result transition.
+- **Fix:** claim one active-turn token before optimistic UI writes, attach the provider Task for
+  cancellation, guard every delta/completion on both tokens, and keep the token until the deferred
+  stage write completes. Back/reset cancels it; Add-to-session waits for it.
+- **Rule:** shared streaming UI needs a single request owner in addition to session identity. Never
+  infer “only one request” from the current stage or from a loading indicator.
+
+---
+
+## Folder analysis
+
+### [FOLDER-01] Bound extraction separately from directory traversal
+
+- **What was wrong:** a 500-entry / 2-second directory scan still allowed every supported entry to
+  reach its extractor. Empty or corrupt documents consumed no character budget, so hundreds of large
+  failed reads could occur after the “bounded” scan had completed.
+- **Why:** metadata traversal, source bytes read, extraction attempts/time, and model-context
+  characters are independent resource axes. Bounding one does not constrain the others.
+- **Fix:** enforce per-file size gates plus cumulative source bytes, extraction-attempt and elapsed-time
+  ceilings; bound the enumerator's error-handler path as well as its normal entry loop; treat unknown
+  sizes as unreadable; mark every unprocessed supported file as omitted with a visible safety reason.
+- **Rule:** recursive ingestion needs explicit limits at every phase—enumeration, extraction, and final
+  request assembly—and the manifest must expose which limit excluded each item.
+
+### [FOLDER-02] Cancellation and budget ownership must reach the actual child work
+
+- **What was wrong:** cancelling an outer preparation Task did not cancel nested detached scans, and
+  per-item context caps ignored headers/separators and multiplied across multi-file sessions.
+- **Why:** unstructured Tasks have independent cancellation, while individually valid slices do not
+  imply a bounded aggregate.
+- **Fix:** wrap detached children in cancellation handlers, eliminate duplicate eager starts, account
+  for every framing character, and allocate one session-wide 24k/48k body budget. The local preview and
+  provider context now share the exact resulting manifest.
+- **Rule:** retain or structurally own every background child, and enforce limits at the same aggregate
+  boundary the provider receives—not merely at each component.
+
+### [FOLDER-03] Secret filtering is a fail-closed path policy, not an extension list
+
+- **What was wrong:** filtering `.env` and key extensions still allowed a visible `secrets/` directory
+  (or `production.env`) to be traversed and included.
+- **Why:** credentials are commonly identified by directory or basename conventions, and skipped
+  filenames themselves can reveal private project information if copied into the model tree.
+- **Fix:** reject sensitive roots/directories before descent, cover common credential basename
+  patterns and `*.env`, and redact every skipped path from the AI-facing tree while retaining it only
+  in the local preview.
+- **Rule:** recursive AI context must treat path metadata as data: fail closed on known secret
+  conventions, never descend, and do not upload the excluded path as a consolation prize.
+
+### [FOLDER-04] Preview claims and request assembly must share one immutable budget
+
+- **What was wrong:** multi-file folders were first prepared at the full context limit, then rescanned
+  with a smaller per-item allowance when the action ran; the preview could therefore claim more
+  included files than the provider received. Files could also be removed while that request was live.
+- **Why:** calculating budgets at two lifecycle points creates two different manifests, and mutating
+  session membership during a provider turn invalidates the request's ownership assumptions.
+- **Fix:** compute one deterministic session-wide split before showing coverage, reuse it during request
+  assembly, recalculate on add/remove/rename, and suppress removal while an AI turn owns the session.
+- **Rule:** any UI that says data is “included” must describe the exact immutable request snapshot—not
+  a best-case preview or a session that users can still mutate mid-flight.
+
+### [FOLDER-05] Recursive preparation may use only cancellable, budget-accounted extractors
+
+- **What was wrong:** Cocoa's DOC/DOCX/RTF importer runs synchronously on the main actor, so one
+  pathological document inside a dropped folder could freeze the chips UI and outlive the advertised
+  preparation timeout. A fixed-size coverage header could also overflow its reservation and silently
+  clip content that the manifest still called included.
+- **Why:** a file format supported for an explicit direct action is not automatically safe for eager
+  recursive ingestion, and character budgets are trustworthy only when every framing byte fits.
+- **Fix:** list but skip main-actor rich-text imports during folder analysis, bound full/compact headers
+  exactly, include scan completeness in provider context, fail closed to zero included files if the
+  final envelope invariant is ever violated, and withhold synchronous whole-folder compression until
+  it has a real async execution path.
+- **Rule:** recursive ingestion requires cancellable off-main readers and exact end-to-end accounting;
+  direct-drop support alone is not sufficient evidence that a format belongs in the folder allowlist.
+
+### [FOLDER-06] File extensions and per-folder limits do not bound a session
+
+- **What was wrong:** allowlisted text/code/data extensions could admit binary plists or mislabeled
+  bytes through the direct extractor's Latin-1 fallback, while a large batch could multiply otherwise
+  valid per-folder scan limits across dozens of concurrent folders.
+- **Why:** an extension is untrusted metadata, and a local limit is not a global resource bound when
+  the parent operation can create an unbounded number of children.
+- **Fix:** UTF-8/control-byte sniff every recursive plain-text candidate, reject binary plists, cap a
+  session at four distinct scanned folders, and mark later or context-starved folders as locally
+  visible omissions without traversing them.
+- **Rule:** fail closed on recursive content classification and enforce the resource ceiling at the
+  user action/session boundary, not only inside each worker.
+
+### [FOLDER-07] Folder selection must not own parsing or mutable filter membership
+
+- **What was wrong:** the first selectable preview put context-omitted and user-deselected files in the
+  same `Skipped` tab as terminal failures. Selecting one could change it to `Included`, remove it from
+  the active filter, and look like an immediate deselection. Every toggle also ran the extractor again.
+- **Why:** provider-envelope status is a mutable output, not a stable file capability, and parsing was
+  coupled to context assembly instead of to the folder session's one preparation phase.
+- **Fix:** classify tabs by immutable capability (`All` / `Supported` / `Skipped`), prepare each
+  supported file once under session-wide attempt/byte/time limits, retain only bounded extracted text
+  or a terminal outcome in memory, and rebuild selection manifests exclusively from that cache.
+- **Rule:** interactive inclusion is a cheap view over one bounded local preparation. Never use mutable
+  inclusion status as filter identity, and never reopen already prepared files merely because the user
+  changes which cached entries may enter the request.
+
+---
+
+## Model menu
+
+### [MODEL-MENU-01] Fixed hosted routes should not inherit BYOK catalogue depth
+
+- **What was wrong:** the first hierarchical menu placed Dragaway Free behind Provider → Family →
+  Model submenus even though its hosted routing is automatic and has no user-selectable final model.
+- **Why:** a uniform data structure was allowed to dictate the interaction hierarchy; it added clicks
+  without exposing a real choice and hid useful routing context behind redundant navigation.
+- **Fix:** keep Dragaway Free as one direct native menu item, expose its Flash-Lite / Flash / Pro
+  ladder through hover help, and reserve nested provider/family/model menus for configurable routes.
+- **Rule:** menu depth must represent an actual decision. Fixed or automatically routed choices stay
+  flat, with explanatory metadata available on demand.

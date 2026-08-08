@@ -400,6 +400,7 @@ private struct ChipsColumnView: View {
                     ))
 
                 chipsTabContent
+                    .disabled(vm.isAITurnActive)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .move(edge: .top))
                                            .animation(.spring(response: 0.28, dampingFraction: 0.7).delay(0.15)),
@@ -418,6 +419,7 @@ private struct ChipsColumnView: View {
             // model can never be invoked for it (zero operator token cost).
             if !isMediaSession {
                 PromptField(text: $vm.customPrompt, onSubmit: runCustomPrompt)
+                    .disabled(vm.isAITurnActive)
             }
 
         }
@@ -1005,18 +1007,13 @@ private struct ChipsColumnView: View {
         defer { editingOutputPath = false; outputFieldFocused = false }
         let typed = outputPathDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if typed.isEmpty { vm.sessionOutputOverride = .sibling; return }
-        let expanded = (typed as NSString).expandingTildeInPath
-        let fm = FileManager.default
-        var isDir: ObjCBool = false
-        if fm.fileExists(atPath: expanded, isDirectory: &isDir), isDir.boolValue {
-            vm.sessionOutputOverride = .folder(URL(fileURLWithPath: expanded))
-            return
-        }
-        // Not an existing directory — fall back to the parent if that's a real folder (so the
-        // user can edit the trailing name; producers derive the actual filename themselves).
-        let parent = (expanded as NSString).deletingLastPathComponent
-        if !parent.isEmpty, fm.fileExists(atPath: parent, isDirectory: &isDir), isDir.boolValue {
-            vm.sessionOutputOverride = .folder(URL(fileURLWithPath: parent))
+
+        // PathInput strips what real paste sources add — quotes (straight and curly),
+        // file:// URLs, Terminal-style `\ ` escapes, invisible characters — and falls back
+        // to the parent folder. Previously a pasted '…' path failed silently and the input
+        // was discarded, which looked like the field ignoring valid input.
+        if let dir = PathInput.resolveDirectory(typed) {
+            vm.sessionOutputOverride = .folder(dir)
             return
         }
         NSSound.beep()
@@ -1145,6 +1142,7 @@ private struct TwoColumnView: View {
                     ) { runAction(action) }
                 }
             }
+            .disabled(vm.isAITurnActive)
 
             Spacer(minLength: 0)
 
@@ -1179,7 +1177,11 @@ private struct TwoColumnView: View {
                 HStack(spacing: 5 * scale) {
                     Image(systemName: "scissors")
                         .font(.system(size: 9 * scale, weight: .semibold))
-                    Text("Large file — analysed the first part only.")
+                    Text(!vm.additionalFileURLs.isEmpty
+                         ? "Session coverage was limited to the shared context budget."
+                         : FileInspector.isDirectory(fileURL)
+                            ? "Folder coverage was limited — open its preview for details."
+                            : "Large file — analysed the first part only.")
                         .font(.system(size: 10 * scale, weight: .medium))
                 }
                 .foregroundColor(.white.opacity(0.45))
@@ -1187,6 +1189,7 @@ private struct TwoColumnView: View {
             }
 
             PromptField(text: $vm.customPrompt, onSubmit: runCustomPrompt)
+                .disabled(vm.isAITurnActive)
 
             if case .result = vm.stage {
                 // ── Follow-up header + collapse toggle ───────────────────────
@@ -1222,6 +1225,7 @@ private struct TwoColumnView: View {
                             }
                         }
                     }
+                    .disabled(vm.isAITurnActive)
                     .transition(.asymmetric(
                         // Delay so chips pop in after the ScrollView has shrunk
                         // to its capped height and the layout has stabilised.
@@ -1269,7 +1273,7 @@ private struct TwoColumnView: View {
             }
 
             // Go deeper — Pro-only manual escalation to the most capable model. Hosted
-            // only: BYOK uses a fixed model per provider, so it can't escalate.
+            // only: BYOK honours the user's exact model, so it can't auto-escalate.
             if provider is HostedProvider, EntitlementStore.shared.isPremiumUnlocked {
                 ResultIconButton(systemName: "sparkles",
                                  tooltip: "Go deeper — re-answer with the most capable model") {
@@ -1415,6 +1419,7 @@ private struct FileResultView: View {
     /// Output-vs-original size delta ("73% smaller"), once both facts are loaded.
     private var deltaText: String? {
         guard let o = outFacts, let s = origFacts else { return nil }
+        guard !o.isSizePartial, !s.isSizePartial else { return nil }
         return FileFacts.deltaText(output: o.sizeBytes, original: s.sizeBytes)
     }
 
@@ -1580,7 +1585,9 @@ private struct ExpandedFilePill: View {
         if let d = f.dimensions { rows.append(("Dimensions", d)) }
         if let p = f.pageCount  { rows.append(("Pages", p.formatted())) }
         if let d = f.duration   { rows.append(("Duration", d)) }
-        if let n = f.itemCount  { rows.append(("Items", n.formatted())) }
+        if let n = f.itemCount  {
+            rows.append(("Items", (f.isSizePartial ? "≥ " : "") + n.formatted()))
+        }
         return rows
     }
 }
@@ -1671,106 +1678,236 @@ private struct ThinkingRow: View {
 
 // MARK: - Shared subviews
 
-/// File header: unified file-info pill on the left, collapse toggle + close on the right.
-/// The entire pill (icon + name + share) is drag-source for moving the file out.
+/// File header: contextual type + session controls above a full-width file-info pill.
+/// Share stays inside the pill; the pill remains the drag source for moving the file out.
 /// In stage 3 (result) the close button is hidden here — it lives in the icon bar
 /// above the ScrollView instead, and animates there via matchedGeometryEffect.
 private struct FileHeaderView: View {
     let fileURL: URL
     let closeNS: Namespace.ID
     @ObservedObject private var vm = OverlayViewModel.shared
+    @ObservedObject private var entitlementStore = EntitlementStore.shared
+    @ObservedObject private var modelCatalog = AIModelCatalogStore.shared
+    @AppStorage("selectedProvider") private var selectedProvider = AIProviderType.groq.rawValue
     @State private var isHoveringCollapse = false
+    @State private var configurationRevision = 0
     @Environment(\.uiScale) private var scale
 
     var body: some View {
-        HStack(spacing: 8 * scale) {
+        let ai = currentAISelectionDisplay(
+            selectedProviderRaw: selectedProvider,
+            entitlement: entitlementStore.tier
+        )
 
-            // ── File pill(s) ─────────────────────────────────────────────────
-            // One icon-only pill per file; carousel kicks in beyond two files.
+        VStack(alignment: .leading, spacing: 8 * scale) {
+            HStack(spacing: 4 * scale) {
+                Text(FilePresentation.typeLabel(for: fileURL))
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
+
+                Menu {
+                    if hostedChoice == nil, modelGroups.isEmpty {
+                        Button("No configured models") {}
+                            .disabled(true)
+                    } else {
+                        if let hostedChoice {
+                            Picker("", selection: modelSelection) {
+                                Text("Dragaway Free")
+                                    .help("Automatically uses Gemini 2.5 Flash-Lite, Flash, and Pro.")
+                                    .tag(hostedChoice.id)
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.inline)
+                            .help("Automatically uses Gemini 2.5 Flash-Lite, Flash, and Pro.")
+
+                            if !modelGroups.isEmpty {
+                                Divider()
+                            }
+                        }
+
+                        ForEach(modelGroups) { provider in
+                            Menu(provider.name) {
+                                ForEach(provider.families) { family in
+                                    Menu(family.name) {
+                                        Picker("", selection: modelSelection) {
+                                            ForEach(family.choices) { choice in
+                                                Text(choice.leafMenuTitle).tag(choice.id)
+                                            }
+                                        }
+                                        .labelsHidden()
+                                        .pickerStyle(.inline)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    Button("Provider Settings") {
+                        NotificationCenter.default.post(name: .showAIProvider, object: nil)
+                    }
+                } label: {
+                    HStack(spacing: 3 * scale) {
+                        Text(ai.model)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .minimumScaleFactor(0.75)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 4 * scale, weight: .bold))
+                    }
+                    .font(.system(size: 4.5 * scale, weight: .medium))
+                    .foregroundColor(.white.opacity(0.40))
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .help("Switch AI model")
+
+                Spacer(minLength: 8 * scale)
+
+                // ── Collapse suggestions toggle (chips stage only) ───────────
+                // Hidden for media: there's no prompt field to collapse down to, so the
+                // toggle would have nothing to do.
+                if vm.stage.tag == 1, !FileInspector.isMediaFile(fileURL) {
+                    Button {
+                        // Height reflow stays monotonic (no Y-jump). The elastic
+                        // overbounce is the keyframeAnimator on the card (triggered by
+                        // isChipsExpanded) — it holds, then squashes when the bottom
+                        // edge lands and rebounds. See the .keyframeAnimator below.
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            vm.isChipsExpanded.toggle()
+                        }
+                    } label: {
+                        Image(systemName: vm.isChipsExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 8 * scale, weight: .bold))
+                            .foregroundColor(.white.opacity(isHoveringCollapse ? 1.0 : 0.60))
+                            .frame(width: 22 * scale, height: 22 * scale)
+                            .background(
+                                Circle()
+                                    .fill(Color.white.opacity(isHoveringCollapse ? 0.12 : 0.06))
+                                    .overlay(Circle().strokeBorder(
+                                        Color.white.opacity(isHoveringCollapse ? 0.22 : 0.12),
+                                        lineWidth: 0.5
+                                    ))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isHoveringCollapse = $0 }
+                    .animation(.easeInOut(duration: 0.12), value: isHoveringCollapse)
+                    .help(vm.isChipsExpanded ? "Hide suggestions" : "Show suggestions")
+                }
+
+                // ── Forward to cached result (chips stage only) ──────────────
+                // Shown after the user navigated back with ← so they can restore
+                // the previous AI answer without re-running the request.
+                if vm.stage.tag == 1, let cached = vm.cachedResult {
+                    Button {
+                        withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
+                            OverlayViewModel.shared.stage = cached
+                            OverlayViewModel.shared.cachedResult = nil
+                        }
+                    } label: {
+                        Image(systemName: "arrow.right")
+                            .font(.system(size: 8 * scale, weight: .bold))
+                            .foregroundColor(.white.opacity(0.70))
+                            .frame(width: 22 * scale, height: 22 * scale)
+                            .background(
+                                Circle()
+                                    .fill(Color.white.opacity(0.08))
+                                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help(cached.tag == 5 ? "Back to result" : "Back to AI reply")
+                    .transition(.asymmetric(
+                        insertion: .scale(scale: 0.7).combined(with: .opacity)
+                                                   .animation(.spring(response: 0.26, dampingFraction: 0.68)),
+                        removal:   .scale(scale: 0.7).combined(with: .opacity)
+                                                   .animation(.easeIn(duration: 0.10))
+                    ))
+                }
+
+                // ── Minimize ─────────────────────────────────────────────────
+                // Parks the session and hides the overlay; the menu-bar icon restores it.
+                // Shown for chips (1) and error (4) only: result (3) has its own button in
+                // the stage-3 icon bar, and loading (2) is excluded so an in-flight request
+                // can't complete into a hidden, reset stage (the reply would be lost).
+                if vm.stage.tag == 1 || vm.stage.tag == 4 {
+                    MinimizeButton()
+                }
+
+                // ── Close ────────────────────────────────────────────────────
+                // Hidden in result stage — the button lives in the icon bar above
+                // the ScrollView there, animating to its new position via
+                // matchedGeometryEffect. In all other stages it stays here.
+                if vm.stage.tag != 3 {
+                    CloseButton()
+                        .matchedGeometryEffect(id: "closeBtn", in: closeNS)
+                }
+            }
+            // The type stays aligned with the file pill's leading edge, while the
+            // lightweight controls sit closer to the top-right card corner.
+            .padding(.trailing, -8 * scale)
+            .padding(.top, -8 * scale)
+
+            // ── Full-width file pill(s) ─────────────────────────────────────
+            // Share deliberately remains inside this row at the far right.
             FilePillsRow(primaryURL: fileURL)
-
-            Spacer(minLength: 0)
-
-            // ── Collapse suggestions toggle (chips stage only) ───────────────
-            // Hidden for media: there's no prompt field to collapse down to, so the
-            // toggle would have nothing to do.
-            if vm.stage.tag == 1, !FileInspector.isMediaFile(fileURL) {
-                Button {
-                    // Height reflow stays monotonic (no Y-jump). The elastic
-                    // overbounce is the keyframeAnimator on the card (triggered by
-                    // isChipsExpanded) — it holds, then squashes when the bottom
-                    // edge lands and rebounds. See the .keyframeAnimator below.
-                    withAnimation(.easeInOut(duration: 0.22)) {
-                        vm.isChipsExpanded.toggle()
-                    }
-                } label: {
-                    Image(systemName: vm.isChipsExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 8 * scale, weight: .bold))
-                        .foregroundColor(.white.opacity(isHoveringCollapse ? 1.0 : 0.60))
-                        .frame(width: 22 * scale, height: 22 * scale)
-                        .background(
-                            Circle()
-                                .fill(Color.white.opacity(isHoveringCollapse ? 0.12 : 0.06))
-                                .overlay(Circle().strokeBorder(
-                                    Color.white.opacity(isHoveringCollapse ? 0.22 : 0.12),
-                                    lineWidth: 0.5
-                                ))
-                        )
-                }
-                .buttonStyle(.plain)
-                .onHover { isHoveringCollapse = $0 }
-                .animation(.easeInOut(duration: 0.12), value: isHoveringCollapse)
-                .help(vm.isChipsExpanded ? "Hide suggestions" : "Show suggestions")
-            }
-
-            // ── Forward to cached result (chips stage only) ──────────────────
-            // Shown after the user navigated back with ← so they can restore
-            // the previous AI answer without re-running the request.
-            if vm.stage.tag == 1, let cached = vm.cachedResult {
-                Button {
-                    withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
-                        OverlayViewModel.shared.stage = cached
-                        OverlayViewModel.shared.cachedResult = nil
-                    }
-                } label: {
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 8 * scale, weight: .bold))
-                        .foregroundColor(.white.opacity(0.70))
-                        .frame(width: 22 * scale, height: 22 * scale)
-                        .background(
-                            Circle()
-                                .fill(Color.white.opacity(0.08))
-                                .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
-                        )
-                }
-                .buttonStyle(.plain)
-                .help(cached.tag == 5 ? "Back to result" : "Back to AI reply")
-                .transition(.asymmetric(
-                    insertion: .scale(scale: 0.7).combined(with: .opacity)
-                                               .animation(.spring(response: 0.26, dampingFraction: 0.68)),
-                    removal:   .scale(scale: 0.7).combined(with: .opacity)
-                                               .animation(.easeIn(duration: 0.10))
-                ))
-            }
-
-            // ── Minimize ───────────────────────────────────────────────────────
-            // Parks the session and hides the overlay; the menu-bar icon restores it.
-            // Shown for chips (1) and error (4) only: result (3) has its own button in
-            // the stage-3 icon bar, and loading (2) is excluded so an in-flight request
-            // can't complete into a hidden, reset stage (the reply would be lost).
-            if vm.stage.tag == 1 || vm.stage.tag == 4 {
-                MinimizeButton()
-            }
-
-            // ── Close ────────────────────────────────────────────────────────
-            // Hidden in result stage — the button lives in the icon bar above
-            // the ScrollView there, animating to its new position via
-            // matchedGeometryEffect. In all other stages it stays here.
-            if vm.stage.tag != 3 {
-                CloseButton()
-                    .matchedGeometryEffect(id: "closeBtn", in: closeNS)
-            }
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .aiProviderConfigurationChanged)) { _ in
+            configurationRevision &+= 1
+        }
+    }
+
+    private var modelChoices: [AIModelChoice] {
+        // The revision covers key/config changes that do not mutate the observed model
+        // catalogue itself; @AppStorage and EntitlementStore cover route changes.
+        _ = configurationRevision
+        _ = modelCatalog.modelsByProvider
+        return enabledAIModelChoices(
+            selectedProviderRaw: selectedProvider,
+            entitlement: entitlementStore.tier
+        )
+    }
+
+    private var modelGroups: [AIModelProviderGroup] {
+        groupedAIModelChoices(modelChoices.filter { $0.id != AIModelChoice.hostedID })
+    }
+
+    private var hostedChoice: AIModelChoice? {
+        modelChoices.first { $0.id == AIModelChoice.hostedID }
+    }
+
+    private var modelSelection: Binding<String> {
+        Binding(
+            get: {
+                AIModelChoice.selectedID(
+                    selectedProviderRaw: selectedProvider,
+                    entitlement: entitlementStore.tier
+                )
+            },
+            set: { selectModel(id: $0) }
+        )
+    }
+
+    private func selectModel(id: String) {
+        if id == AIModelChoice.hostedID {
+            // Preserve a real Pro entitlement; a BYOK user choosing Hosted enters Free.
+            if entitlementStore.tier == .byok { entitlementStore.tier = .freeHosted }
+            return
+        }
+
+        guard let choice = modelChoices.first(where: { $0.id == id }),
+              let type = choice.providerType,
+              let modelID = choice.modelID
+        else { return }
+        modelCatalog.setSelectedModelID(modelID, for: type)
+        selectedProvider = type.rawValue
+        entitlementStore.tier = .byok
     }
 }
 
@@ -1830,6 +1967,8 @@ private struct FilePillsRow: View {
                             .transition(.scale(scale: 0.7).combined(with: .opacity))
                     }
 
+                    Spacer(minLength: 0)
+
                     // Share button — shares all files in the session together
                     ShareButton(fileURLs: allFiles)
                 }
@@ -1845,6 +1984,7 @@ private struct FilePillsRow: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .animation(.spring(response: 0.28, dampingFraction: 0.72), value: allFiles.count)
     }
 
@@ -1853,29 +1993,35 @@ private struct FilePillsRow: View {
     /// - Primary file: promotes the first additional to primary, keeping the rest.
     private func removeAction(for url: URL) -> () -> Void {
         {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
-                if url == primaryURL {
-                    // Promote first additional to primary
-                    guard let newPrimary = vm.additionalFileURLs.first else { return }
-                    let remaining = Array(vm.additionalFileURLs.dropFirst())
-                    let allNew = [newPrimary] + remaining
+            guard !vm.isAITurnActive else { return }
+            let remainingSessionURLs: [URL]
+            if url == primaryURL {
+                // Promote first additional to primary
+                guard let newPrimary = vm.additionalFileURLs.first else { return }
+                let remaining = Array(vm.additionalFileURLs.dropFirst())
+                remainingSessionURLs = [newPrimary] + remaining
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
                     vm.stage = .chips(
                         url: newPrimary,
-                        actions: FileInspector.suggestedActions(forAll: allNew)
+                        actions: FileInspector.suggestedActions(forAll: remainingSessionURLs)
                     )
                     vm.additionalFileURLs = remaining
-                } else {
+                }
+            } else {
+                let remaining = vm.additionalFileURLs.filter { $0 != url }
+                remainingSessionURLs = [primaryURL] + remaining
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
                     vm.additionalFileURLs.removeAll { $0 == url }
                     // Recalculate chip actions with updated file list
                     if case .chips(let primary, _) = vm.stage {
-                        let allNew = [primary] + vm.additionalFileURLs
                         vm.stage = .chips(
                             url: primary,
-                            actions: FileInspector.suggestedActions(forAll: allNew)
+                            actions: FileInspector.suggestedActions(forAll: remainingSessionURLs)
                         )
                     }
                 }
             }
+            FolderAnalysisStore.shared.beginSession(with: remainingSessionURLs)
         }
     }
 
@@ -1907,10 +2053,31 @@ private struct FilePillsRow: View {
 private struct SingleFilePill: View {
     let fileURL: URL
     @ObservedObject private var vm = OverlayViewModel.shared
+    @ObservedObject private var folderStore = FolderAnalysisStore.shared
     @Environment(\.uiScale) private var scale
 
     @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
     @State private var isHovering = false
+    @State private var isShowingFolderContents = false
+
+    private var isFolder: Bool { FileInspector.isDirectory(fileURL) }
+
+    private var subtitle: String {
+        guard isFolder else { return "Click to preview · drag to move" }
+        switch folderStore.snapshot(for: fileURL) {
+        case .idle, .scanning:
+            return "Scanning folder…"
+        case .failed:
+            return "Could not inspect · click for details"
+        case .ready(let analysis):
+            let manifest = analysis.manifest
+            var parts = ["\(manifest.includedCount) included in AI"]
+            if manifest.omittedCount > 0 { parts.append("\(manifest.omittedCount) omitted") }
+            if manifest.skippedCount > 0 { parts.append("\(manifest.skippedCount) skipped") }
+            if manifest.wasLimited { parts.append("scan limited") }
+            return parts.joined(separator: " · ")
+        }
+    }
 
     var body: some View {
         HStack(spacing: 8 * scale) {
@@ -1929,7 +2096,7 @@ private struct SingleFilePill: View {
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text("Click to preview · drag to move")
+                    Text(subtitle)
                         .font(.system(size: 9 * scale, weight: .regular))
                         .foregroundColor(.white.opacity(0.35))
                         .lineLimit(1)
@@ -1937,7 +2104,18 @@ private struct SingleFilePill: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
             .contentShape(Rectangle())
-            .onTapGesture { QuickLookController.shared.present(urls: vm.sessionFileURLs, current: 0) }
+            .onTapGesture {
+                if isFolder {
+                    isShowingFolderContents = true
+                } else {
+                    QuickLookController.shared.present(urls: vm.sessionFileURLs, current: 0)
+                }
+            }
+            .popover(isPresented: $isShowingFolderContents) {
+                FolderContentsPopover(rootURL: fileURL)
+            }
+
+            Spacer(minLength: 8 * scale)
 
             // Share the file via the native macOS share sheet. File utilities now
             // live in the chips-stage "Utilities" tab, not behind a ••• menu here.
@@ -1945,6 +2123,7 @@ private struct SingleFilePill: View {
         }
         .padding(.horizontal, 9 * scale)
         .padding(.vertical, 7 * scale)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
                 .fill(Color.white.opacity(isHovering ? 0.08 : 0.05))
@@ -1992,6 +2171,7 @@ private struct SingleFilePill: View {
         }
         .onAppear {
             FileThumbnail.load(for: fileURL, size: 24) { fileIcon = $0 }
+            if isFolder { folderStore.prepare(fileURL) }
         }
     }
 }
@@ -2006,10 +2186,14 @@ private struct FilePill: View {
     /// when it is the only remaining file, though that case uses SingleFilePill).
     let onRemove: (() -> Void)?
     @ObservedObject private var vm = OverlayViewModel.shared
+    @ObservedObject private var folderStore = FolderAnalysisStore.shared
     @Environment(\.uiScale) private var scale
 
     @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
     @State private var isHovering = false
+    @State private var isShowingFolderContents = false
+
+    private var isFolder: Bool { FileInspector.isDirectory(fileURL) }
 
     var body: some View {
         Image(nsImage: fileIcon)
@@ -2038,7 +2222,7 @@ private struct FilePill: View {
             }
             // × remove badge — top-trailing corner, visible on hover
             .overlay(alignment: .topTrailing) {
-                if isHovering, let onRemove {
+                if isHovering, !vm.isAITurnActive, let onRemove {
                     Button(action: onRemove) {
                         Image(systemName: "xmark")
                             .font(.system(size: 6 * scale, weight: .bold))
@@ -2060,9 +2244,18 @@ private struct FilePill: View {
             // Bare click → Quick Look this file (the carousel's other files stay
             // reachable via the panel's ◀ ▶). Drag still moves the file out.
             .onTapGesture {
-                let urls = vm.sessionFileURLs
-                QuickLookController.shared.present(urls: urls,
-                                                   current: urls.firstIndex(of: fileURL) ?? 0)
+                if isFolder {
+                    isShowingFolderContents = true
+                } else {
+                    let urls = vm.sessionFileURLs
+                    QuickLookController.shared.present(
+                        urls: urls,
+                        current: urls.firstIndex(of: fileURL) ?? 0
+                    )
+                }
+            }
+            .popover(isPresented: $isShowingFolderContents) {
+                FolderContentsPopover(rootURL: fileURL)
             }
             .onHover { isHovering = $0 }
             .animation(.easeInOut(duration: 0.12), value: isHovering)
@@ -2105,7 +2298,8 @@ private struct FilePill: View {
             }
             .onAppear {
                 Task { @MainActor in
-                    fileIcon = NSWorkspace.shared.icon(forFile: fileURL.path)
+                    fileIcon = FilePresentation.icon(for: fileURL)
+                    if isFolder { folderStore.prepare(fileURL) }
                 }
             }
     }
@@ -2461,12 +2655,20 @@ struct ActionChip: View {
 /// per-view setStage(): never mutate `stage` inside an active layout pass. Entering
 /// .result collapses follow-ups so the section starts closed.
 @MainActor
-private func applyStage(_ stage: OverlayViewModel.Stage) {
+private func applyStage(
+    _ stage: OverlayViewModel.Stage,
+    ifSession sessionRevision: UUID,
+    turnID: UUID,
+    completesTurn: Bool = false
+) {
     DispatchQueue.main.async {
-        if case .result = stage { OverlayViewModel.shared.isFollowupsExpanded = false }
+        let vm = OverlayViewModel.shared
+        guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
+        if case .result = stage { vm.isFollowupsExpanded = false }
         withAnimation(.spring(response: 0.32, dampingFraction: 1.0)) {
-            OverlayViewModel.shared.stage = stage
+            vm.stage = stage
         }
+        if completesTurn { vm.completeAITurn(turnID) }
     }
 }
 
@@ -2484,6 +2686,8 @@ private func sendTurn(provider: any AIProvider,
                       forceTier: AITier? = nil,
                       regenerate: Bool = false) {
     let vm = OverlayViewModel.shared
+    guard let turnID = vm.beginAITurn() else { return }
+    let sessionRevision = vm.sessionRevision
 
     // What the user's bubble shows vs. what the model receives as this turn's text.
     let display     = typedPrompt ?? action.rawValue
@@ -2514,7 +2718,11 @@ private func sendTurn(provider: any AIProvider,
     if showsTranscript {
         vm.isAwaitingReply = true            // thinking row appears beneath transcript
     } else {
-        applyStage(.loading(url: fileURL, action: action))
+        applyStage(
+            .loading(url: fileURL, action: action),
+            ifSession: sessionRevision,
+            turnID: turnID
+        )
     }
 
     let additionalURLs = vm.additionalFileURLs
@@ -2528,23 +2736,34 @@ private func sendTurn(provider: any AIProvider,
     // and is why "Dragaway Free" requests were still hitting the stored BYOK key (flash).
     let liveProvider = resolveProvider()
 
-    Task {
+    let turnTask = Task {
         do {
             // Extract the document ONCE per session; reuse for every turn.
             let base: OverlayViewModel.BaseContext
+            // Pro/subscribers read twice as much of a file before truncation.
+            // Resolved on the main actor here; the Worker enforces a matching
+            // server-verified ceiling so this can't be spoofed for spend.
+            let charLimit = EntitlementStore.shared.isPremiumUnlocked
+                ? FileContentExtractor.maxCharsPro : FileContentExtractor.maxChars
             if let cached = vm.baseContext {
                 base = cached
+            } else if let prepared = try await vm.preparedBaseContext(
+                for: [fileURL] + additionalURLs,
+                charLimit: charLimit
+            ) {
+                // A background-prepared drop started this extraction as soon as its
+                // chips appeared. If the user clicked first, awaiting the shared task
+                // queues this turn locally; the provider is not contacted until the
+                // complete staged content exists.
+                base = prepared
             } else {
-                // Pro/subscribers read twice as much of a file before truncation.
-                // Resolved on the main actor here; the Worker enforces a matching
-                // server-verified ceiling so this can't be spoofed for spend.
-                let charLimit = EntitlementStore.shared.isPremiumUnlocked
-                    ? FileContentExtractor.maxCharsPro : FileContentExtractor.maxChars
                 let (content, imageURL, truncated) = try await buildMultiFileContent(
                     primary: fileURL, additional: additionalURLs, charLimit: charLimit)
                 base = .init(content: content, imageURL: imageURL, truncated: truncated)
-                vm.baseContext = base
             }
+
+            guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
+            vm.baseContext = base
 
             let turns = buildChatTurns(conversation: vm.conversation,
                                        baseContent: base.content,
@@ -2559,9 +2778,11 @@ private func sendTurn(provider: any AIProvider,
             let text = try await liveProvider.replyStream(
                 messages: turns, imageURL: base.imageURL, plan: plan
             ) { delta in
+                guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
                 vm.appendStreamDelta(delta, url: fileURL, action: action)
             }
 
+            guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
             vm.contentTruncated = base.truncated
             vm.isAwaitingReply  = false
             // Swap the streamed bubble for the definitive text; if the provider
@@ -2575,8 +2796,14 @@ private func sendTurn(provider: any AIProvider,
                     primary: fileURL, additional: additionalURLs,
                     action: action, prompt: typedPrompt, result: text)
             }
-            applyStage(.result(url: fileURL, action: action, text: text))
+            applyStage(
+                .result(url: fileURL, action: action, text: text),
+                ifSession: sessionRevision,
+                turnID: turnID,
+                completesTurn: true
+            )
         } catch {
+            guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
             vm.abortStreamedReply()   // keep any partial text; stop tracking the bubble
             vm.isAwaitingReply = false
             let msg = error.localizedDescription
@@ -2584,14 +2811,25 @@ private func sendTurn(provider: any AIProvider,
                 // Keep the transcript — surface the failure as an assistant note.
                 let note = "⚠️ \(msg)"
                 vm.conversation.append(.init(role: .assistant, display: note, modelText: note))
-                applyStage(.result(url: fileURL, action: action, text: note))
+                applyStage(
+                    .result(url: fileURL, action: action, text: note),
+                    ifSession: sessionRevision,
+                    turnID: turnID,
+                    completesTurn: true
+                )
             } else {
                 // Nothing on screen yet — show the error stage (drops the lone bubble).
                 vm.conversation.removeAll()
-                applyStage(.error(url: fileURL, message: msg))
+                applyStage(
+                    .error(url: fileURL, message: msg),
+                    ifSession: sessionRevision,
+                    turnID: turnID,
+                    completesTurn: true
+                )
             }
         }
     }
+    vm.attachAITurnTask(turnTask, id: turnID)
 }
 
 /// Serialise the transcript into provider ChatTurns. A leading system turn sets the
@@ -2636,12 +2874,30 @@ private func buildChatTurns(conversation: [OverlayViewModel.ChatMessage],
 /// Returns (content, imageURL, truncated): imageURL is only set for a SINGLE-image
 /// session (no additionals) so vision models work; `truncated` is true when any
 /// file's content was cut to fit the extractor's char/page cap.
-private func buildMultiFileContent(
+func buildMultiFileContent(
     primary fileURL: URL,
     additional additionalURLs: [URL],
     charLimit: Int = FileContentExtractor.maxChars
 ) async throws -> (content: String, imageURL: URL?, truncated: Bool) {
     let allURLs = [fileURL] + additionalURLs
+
+    // Web URLs are materialized immediately as tiny TXT placeholders so the pill never
+    // waits on network/rendering. Before any extractor reads those files, await only the
+    // matching file-scoped preparations. No entry means an immediate no-op (native TXT,
+    // image, PDF, Mail, etc. stay on their existing paths).
+    await WebDropPreparation.waitForPending(files: allURLs)
+
+    // ── Single folder ─────────────────────────────────────────────────────────
+    // The stage is already visible while FolderAnalysisStore prepares this exact
+    // bounded manifest in the background. A fast first action simply awaits the
+    // same task; no second traversal and no extra provider request.
+    if allURLs.count == 1, FileInspector.isDirectory(allURLs[0]) {
+        let analysis = try await FolderAnalysisStore.shared.analysis(
+            for: allURLs[0],
+            characterLimit: charLimit
+        )
+        return (analysis.content, nil, analysis.truncated)
+    }
 
     // ── Single image (no additionals) ─────────────────────────────────────────
     if allURLs.count == 1, FileInspector.isImageFile(allURLs[0]) {
@@ -2659,27 +2915,74 @@ private func buildMultiFileContent(
         return (result.text, nil, result.truncated)
     }
 
-    // ── Multiple files ────────────────────────────────────────────────────────
+    // ── Multiple files — one SESSION-wide context budget ─────────────────────
+    // Reserve every filename header and separator first, then use the same fixed,
+    // deterministic split that eager folder preparation received. A short file may
+    // leave some room unused, but the preview and provider coverage stay identical.
+    let headers = allURLs.map { SessionContextBudget.header(for: $0) }
+    let framingCharacters = SessionContextBudget.framingCharacterCount(for: allURLs)
+    let bodyLimits = SessionContextBudget.bodyLimits(
+        for: allURLs,
+        characterLimit: charLimit
+    )
+    if framingCharacters >= charLimit {
+        // Keep folder-preview coverage honest even in the pathological case where
+        // filenames alone exhaust the request.
+        for url in allURLs where FileInspector.isDirectory(url) {
+            _ = try? await FolderAnalysisStore.shared.analysis(
+                for: url,
+                characterLimit: 0
+            )
+        }
+        let namesOnly = headers.joined(separator: "\n\n")
+        return (String(namesOnly.prefix(charLimit)), nil, true)
+    }
+
     var sections: [String] = []
     var anyTruncated = false
-    for url in allURLs {
-        let body: String
-        if FileInspector.isMediaFile(url) {
+    for (index, url) in allURLs.enumerated() {
+        let bodyLimit = bodyLimits[index]
+        let fullBody: String
+        if FileInspector.isDirectory(url) {
+            do {
+                let analysis = try await FolderAnalysisStore.shared.analysis(
+                    for: url,
+                    characterLimit: bodyLimit
+                )
+                fullBody = analysis.content
+                anyTruncated = anyTruncated || analysis.truncated
+            } catch {
+                fullBody = "[Could not inspect this folder]"
+                anyTruncated = true
+            }
+        } else if FileInspector.isMediaFile(url) {
             // Never feed raw audio/video to the model — name it and move on.
-            body = "[Media: \(url.lastPathComponent) — audio/video is not analysed]"
+            fullBody = "[Media: \(url.lastPathComponent) — audio/video is not analysed]"
         } else if FileInspector.isImageFile(url) {
             // Vision analysis is only available for single-image sessions;
             // in multi-file mode describe the image by name / context.
-            body = "[Image: \(url.lastPathComponent) — visual description not available in multi-file mode]"
-        } else if let result = try? await FileContentExtractor.extract(from: url, limit: charLimit) {
-            body = result.text
+            fullBody = "[Image: \(url.lastPathComponent) — visual description not available in multi-file mode]"
+        } else if bodyLimit <= 0 {
+            fullBody = ""
+            anyTruncated = true
+        } else if let result = try? await FileContentExtractor.extract(from: url, limit: bodyLimit) {
+            fullBody = result.text
             anyTruncated = anyTruncated || result.truncated
         } else {
-            body = "[Could not read: \(url.lastPathComponent)]"
+            fullBody = "[Could not read this file]"
+            anyTruncated = true
         }
-        sections.append("=== \(url.lastPathComponent) ===\n\(body)")
+
+        let body = String(fullBody.prefix(bodyLimit))
+        if fullBody.count > bodyLimit { anyTruncated = true }
+        sections.append(headers[index] + body)
     }
-    return (sections.joined(separator: "\n\n"), nil, anyTruncated)
+    let joined = sections.joined(separator: "\n\n")
+    if joined.count > charLimit {
+        // Defensive backstop; framing/body accounting above should make this unreachable.
+        return (String(joined.prefix(charLimit)), nil, true)
+    }
+    return (joined, nil, anyTruncated)
 }
 
 // MARK: - Second-file drag overlay
@@ -2795,7 +3098,11 @@ private struct SecondFilePromptBanner: View {
                             .clipShape(Capsule(style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    .help("Analyse all files together in the current session")
+                    .disabled(vm.isAITurnActive)
+                    .opacity(vm.isAITurnActive ? 0.45 : 1)
+                    .help(vm.isAITurnActive
+                        ? "Wait for the current AI reply, or start a new session"
+                        : "Analyse all files together in the current session")
 
                     // New session
                     Button { startNewSession(urls: urls) } label: {
@@ -2850,6 +3157,7 @@ private struct SecondFilePromptBanner: View {
                 )
             }
         }
+        FolderAnalysisStore.shared.beginSession(with: vm.sessionFileURLs)
     }
 
     private func startNewSession(urls: [URL]) {
