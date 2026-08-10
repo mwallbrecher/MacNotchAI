@@ -56,13 +56,13 @@ final class ShareController: ObservableObject {
             case .ownerRecordCouldNotBeActivated:
                 return "The share was accepted, but its local Session ID state could not be saved. Dragaway retained the revoke capability and attempted cleanup."
             case .dropsQuotaExceeded:
-                return "The shared file does not fit Dragaway's 512 MB private Drops limit without deleting a saved session. Remove an older session and try again."
+                return "The shared files do not fit Dragaway's 512 MB private Drops limit without deleting a saved session. Remove an older session and try again."
             }
         }
     }
 
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var pendingFileName = ""
+    @Published private(set) var pendingFileNames: [String] = []
     @Published private(set) var pendingSize = ""
 
     private var operation: Task<Void, Never>?
@@ -72,17 +72,21 @@ final class ShareController: ObservableObject {
 
     /// Populates disclosure copy from local metadata only. No file bytes are read and no request is
     /// made before the user presses “Expose Session”.
-    func prepare(fileURL: URL, turns: [SessionTurn]) {
+    func prepare(fileURLs: [URL]) {
         operation?.cancel()
         operation = nil
         currentShare = nil
-        pendingFileName = fileURL.lastPathComponent
-        let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-        pendingSize = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+        pendingFileNames = fileURLs.map(\.lastPathComponent)
+        let totalSize = fileURLs.reduce(Int64(0)) { total, url in
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let (sum, overflow) = total.addingReportingOverflow(Int64(max(0, size)))
+            return overflow ? Int64.max : sum
+        }
+        pendingSize = ByteCountFormatter.string(fromByteCount: totalSize, countStyle: .file)
         phase = .idle
     }
 
-    func expose(fileURL: URL, turns: [SessionTurn], password: String?) {
+    func expose(fileURLs: [URL], turns: [SessionTurn], password: String?) {
         guard let endpoint = BackendConfig.shareBaseURL else {
             phase = .failed(ControllerError.noEndpoint.localizedDescription)
             return
@@ -99,15 +103,18 @@ final class ShareController: ObservableObject {
         }
         let passwordCopy = password
         let exposedAt = Date()
+        let fileURLsCopy = fileURLs
 
         operation = Task { [weak self] in
             guard let self else { return }
             var trackedCreate: ActiveShareRecord?
             do {
                 let sealed = try await Task.detached(priority: .userInitiated) {
-                    let bundle = try ShareBundle.load(from: fileURL, turns: wireTurns,
+                    let bundle = try ShareBundle.load(from: fileURLsCopy, turns: wireTurns,
                                                       exposedAt: exposedAt)
-                    _ = try ShareImportPolicy.validatedFileName(bundle.fileName)
+                    for file in bundle.files {
+                        _ = try ShareImportPolicy.validatedFileName(file.fileName)
+                    }
                     return try ShareCrypto.seal(bundle, password: passwordCopy)
                 }.value
                 try Task.checkCancellation()
@@ -120,7 +127,9 @@ final class ShareController: ObservableObject {
                     state: .creating,
                     shareID: intent.shareID,
                     sessionID: nil,
-                    fileName: fileURL.lastPathComponent,
+                    fileName: fileURLsCopy.count == 1
+                        ? fileURLsCopy[0].lastPathComponent
+                        : "\(fileURLsCopy.count) files",
                     endpoint: endpoint.absoluteString,
                     expiresAt: exposedAt.addingTimeInterval(26 * 60 * 60),
                     createdAt: exposedAt
@@ -290,54 +299,73 @@ final class ShareController: ObservableObject {
                     key: pending.claim.key,
                     password: password?.isEmpty == false ? password : nil
                 )
-                _ = try ShareImportPolicy.validatedFileName(opened.fileName)
+                for file in opened.files {
+                    _ = try ShareImportPolicy.validatedFileName(file.fileName)
+                }
                 return opened
             }.value
             try Task.checkCancellation()
 
-            guard let reservation = DropMaterializer.reserveShareImport(
-                fileName: bundle.fileName, byteCount: bundle.fileData.count) else {
-                throw ControllerError.dropsQuotaExceeded
-            }
-            var reservationIsActive = true
-            var uncommittedFileURL: URL?
+            var reservations: [DropMaterializer.ShareImportReservation] = []
+            var reservationsAreActive = true
+            var uncommittedFileURLs: [URL] = []
             defer {
-                if let uncommittedFileURL {
-                    try? FileManager.default.removeItem(at: uncommittedFileURL)
+                for url in uncommittedFileURLs {
+                    try? FileManager.default.removeItem(at: url)
                 }
-                if reservationIsActive {
-                    DropMaterializer.releaseShareImport(reservation)
+                if reservationsAreActive {
+                    for reservation in reservations {
+                        DropMaterializer.releaseShareImport(reservation)
+                    }
                 }
             }
 
-            let destination = try await Task.detached(priority: .userInitiated) {
-                try ShareImportPolicy.persist(
-                    bundle,
-                    in: dropsDirectory,
-                    reservedDestinationAttempt: reservation.destinationAttempt,
-                    tempIdentifier: reservation.id
-                )
-            }.value
-            uncommittedFileURL = destination
-            let imported = ImportedSnapshot(bundle: bundle, fileURL: destination)
+            for file in bundle.files {
+                guard let reservation = DropMaterializer.reserveShareImport(
+                    fileName: file.fileName,
+                    byteCount: file.fileData.count
+                ) else {
+                    throw ControllerError.dropsQuotaExceeded
+                }
+                reservations.append(reservation)
+            }
 
-            // After an atomic file write succeeds, always persist its local history identity even
-            // if the Join window closed meanwhile. This avoids an invisible orphan file; the user
-            // can reopen the completed fork from Recent Sessions.
-            let turns = imported.bundle.turns.map {
+            let batch = zip(bundle.files, reservations).map { pair in
+                ShareImportPolicy.ReservedBatchMember(
+                    file: pair.0,
+                    destinationAttempt: pair.1.destinationAttempt,
+                    tempIdentifier: pair.1.id
+                )
+            }
+            uncommittedFileURLs = try await Task.detached(priority: .userInitiated) {
+                try ShareImportPolicy.persistBatch(batch, in: dropsDirectory)
+            }.value
+
+            guard let primary = uncommittedFileURLs.first else {
+                throw ShareBundle.BundleError.invalidFileCount
+            }
+
+            // Once the batch starts writing, always persist its local History identity even if the
+            // Join window closes. The all-or-nothing cleanup below prevents partial/orphan sessions.
+            let turns = bundle.turns.map {
                 SessionTurn(actionRaw: $0.actionRaw, promptTitle: $0.promptTitle,
                             resultText: $0.resultText, date: $0.date)
             }
             let localID = try SessionHistoryStore.shared.createImportedSession(
-                primary: imported.fileURL,
+                primary: primary,
+                additional: Array(uncommittedFileURLs.dropFirst()),
                 turns: turns,
-                updatedAt: imported.bundle.turns.last?.date ?? imported.bundle.exposedAt
+                updatedAt: bundle.turns.last?.date ?? bundle.exposedAt
             )
-            // History now owns the final path. Only now may a later prune stop treating the temp/
-            // destination pair as an in-flight reservation.
-            DropMaterializer.releaseShareImport(reservation, preserving: [imported.fileURL])
-            reservationIsActive = false
-            uncommittedFileURL = nil
+            // History now owns every final path. Only now may the batch leases be released.
+            for reservation in reservations {
+                DropMaterializer.releaseShareImport(
+                    reservation,
+                    preserving: uncommittedFileURLs
+                )
+            }
+            reservationsAreActive = false
+            uncommittedFileURLs.removeAll(keepingCapacity: false)
             // Posted only once the fork is durably in History — not on download or decrypt.
             NotificationCenter.default.post(name: .tutorialEvent, object: "joinSession")
             return .success(localID)
@@ -351,9 +379,4 @@ final class ShareController: ObservableObject {
             return .failure(error.localizedDescription)
         }
     }
-}
-
-private struct ImportedSnapshot: Sendable {
-    let bundle: ShareBundle
-    let fileURL: URL
 }

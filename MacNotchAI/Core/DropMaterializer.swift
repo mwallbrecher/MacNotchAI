@@ -7,10 +7,42 @@ import UniformTypeIdentifiers
 ///
 /// Capture happens at `draggingEntered` (the drag pasteboard is fully open and fast
 /// while the drag is in flight); the file is only WRITTEN at drop time. Files land in
-/// Application Support/<bundle>/Drops, newest 50 kept, so session history can reopen
-/// them later.
+/// Application Support/<bundle>/Drops. Retention is shared with imported snapshots: at most 50
+/// entries / 512 MiB, removing only old files that no saved or live session still references.
 @MainActor
 enum DropMaterializer {
+
+    /// Private materialisations are bounded by both count and bytes. Persisted/reopened session
+    /// files are never silently deleted to satisfy the quota; a large incoming share is refused
+    /// instead when only referenced files remain.
+    static let maximumDropFiles = 50
+    static let maximumDropBytes: Int64 = 512 * 1_024 * 1_024
+
+    /// Main-actor lease held from quota preflight through atomic write and History commit. The
+    /// reserved destination and its predictable private temp name stay protected from every normal
+    /// Drops prune while detached file I/O yields the main actor.
+    struct ShareImportReservation: Sendable, Equatable {
+        let id: UUID
+        let destinationAttempt: Int
+        fileprivate let destinationFileName: String
+        fileprivate let byteCount: Int64
+
+        fileprivate var temporaryFileName: String {
+            ".dragaway-share-\(id.uuidString).tmp"
+        }
+    }
+
+    private static var shareImportReservations: [UUID: ShareImportReservation] = [:]
+
+    /// External file promises write into Drops outside our actor. While any lease is active,
+    /// retention may measure but must not delete unknown new paths. Once a callback identifies a
+    /// path, a handoff ref-count protects it until the ViewModel owns it.
+    struct PromisedFileDeliveryLease: Sendable, Hashable {
+        fileprivate let id: UUID
+    }
+
+    private static var activePromisedFileDeliveries: Set<UUID> = []
+    private static var promisedHandoffPathRefCounts: [String: Int] = [:]
 
     /// A non-file drag payload captured mid-drag.
     enum Payload {
@@ -114,7 +146,7 @@ enum DropMaterializer {
                     dir.appendingPathComponent("Dropped Image \(stamp).png")
                 )
                 try png.write(to: url)
-                prune(dir)
+                _ = prune(dir, preserving: [url])
                 return url
             case .webURL(let link):
                 let name = (link.host ?? "Link").replacingOccurrences(of: "www.", with: "")
@@ -123,7 +155,7 @@ enum DropMaterializer {
                 )
                 try link.absoluteString.data(using: .utf8)?.write(to: url)
                 FilePresentation.markAsWebDrop(url)
-                prune(dir)
+                _ = prune(dir, preserving: [url])
                 // The drop stays instant. The file-scoped task upgrades this URL-only
                 // placeholder in the background; a fast AI action awaits that exact
                 // task at the shared content-builder choke point.
@@ -134,7 +166,7 @@ enum DropMaterializer {
                     dir.appendingPathComponent("\(titleWords(text)) \(stamp).txt")
                 )
                 try text.data(using: .utf8)?.write(to: url)
-                prune(dir)
+                _ = prune(dir, preserving: [url])
                 return url
             }
         } catch {
@@ -179,6 +211,85 @@ enum DropMaterializer {
     /// Destination for received file PROMISES (Safari tabs, Photos, Mail) — the
     /// promising app writes the real file here on drop.
     static func dropsDirectory() -> URL { dropsDir() }
+
+    /// Reserve count, bytes, final path, and temp path before detached import I/O begins. Selecting
+    /// the collision suffix here lets retention protect a concrete destination throughout the await;
+    /// an external writer racing that filename makes the exclusive rename fail safely.
+    static func reserveShareImport(fileName: String, byteCount: Int) -> ShareImportReservation? {
+        guard byteCount >= 0, Int64(byteCount) <= maximumDropBytes,
+              let safeName = try? ShareImportPolicy.validatedFileName(fileName) else { return nil }
+
+        let dir = dropsDir()
+        let fm = FileManager.default
+        let reservedNames = Set(shareImportReservations.values.map(\.destinationFileName))
+        guard let allocation = (0..<ShareImportPolicy.maxCollisionAttempts).lazy.compactMap({ attempt in
+            let name = ShareImportPolicy.destinationFileName(for: safeName, attempt: attempt)
+            let url = dir.appendingPathComponent(name, isDirectory: false)
+            return !reservedNames.contains(name) && !fm.fileExists(atPath: url.path)
+                ? (attempt, name) : nil
+        }).first else { return nil }
+
+        let reservation = ShareImportReservation(
+            id: UUID(), destinationAttempt: allocation.0,
+            destinationFileName: allocation.1, byteCount: Int64(byteCount)
+        )
+        shareImportReservations[reservation.id] = reservation
+        guard prune(dir) else {
+            shareImportReservations.removeValue(forKey: reservation.id)
+            return nil
+        }
+        return reservation
+    }
+
+    /// End an import lease only after the new History record exists (or after persistence failed).
+    /// `preserving` is used on success as an additional same-pass guard while the lease is removed.
+    static func releaseShareImport(_ reservation: ShareImportReservation,
+                                   preserving: [URL] = []) {
+        guard shareImportReservations[reservation.id] == reservation else { return }
+        shareImportReservations.removeValue(forKey: reservation.id)
+        _ = prune(dropsDir(), preserving: preserving)
+    }
+
+    static func beginPromisedFileDelivery() -> PromisedFileDeliveryLease {
+        let lease = PromisedFileDeliveryLease(id: UUID())
+        activePromisedFileDeliveries.insert(lease.id)
+        return lease
+    }
+
+    /// Bridge the gap between an external writer finishing and the receiving URLs becoming live
+    /// `sessionFileURLs` / `pendingDroppedURLs`. Calls are balanced per delivered batch.
+    static func protectPromisedFilesForHandoff(_ urls: [URL]) {
+        for path in Set(urls.map { $0.standardizedFileURL.path }) {
+            promisedHandoffPathRefCounts[path, default: 0] += 1
+        }
+    }
+
+    static func promisedFilesDidEnterSession(_ urls: [URL]) {
+        var releasedAnyPath = false
+        for path in Set(urls.map { $0.standardizedFileURL.path }) {
+            guard let count = promisedHandoffPathRefCounts[path] else { continue }
+            releasedAnyPath = true
+            if count <= 1 {
+                promisedHandoffPathRefCounts.removeValue(forKey: path)
+            } else {
+                promisedHandoffPathRefCounts[path] = count - 1
+            }
+        }
+        if releasedAnyPath {
+            _ = prune(dropsDir(), preserving: urls)
+        }
+    }
+
+    static func finishPromisedFileDelivery(_ lease: PromisedFileDeliveryLease) {
+        guard activePromisedFileDeliveries.remove(lease.id) != nil else { return }
+        _ = prune(dropsDir())
+    }
+
+    /// Best-effort pass after an abandoned receiver eventually stops writing. Current, pending,
+    /// saved, imported, and other promised paths remain protected by the normal retention rules.
+    static func sweepRetention() {
+        _ = prune(dropsDir())
+    }
 
     /// Post-process a promised file: Safari tabs deliver a `.webloc` — unwrap it to
     /// the link and route through the normal web path (materialize + page fetch), so
@@ -246,17 +357,111 @@ enum DropMaterializer {
         }
     }
 
-    /// Keep the newest 50 drops so the folder can't grow forever.
-    private static func prune(_ dir: URL, keep: Int = 50) {
+    /// Delete oldest unreferenced entries until both quotas (plus any proposed incoming file) fit.
+    /// Returning false means satisfying the quota would require deleting a saved/live session file.
+    @discardableResult
+    private static func prune(_ dir: URL,
+                              preserving: [URL] = []) -> Bool {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
-        guard files.count > keep else { return }
-        let dated = files.compactMap { url -> (URL, Date)? in
-            let d = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                .contentModificationDate
-            return d.map { (url, $0) }
-        }.sorted { $0.1 > $1.1 }
-        for (url, _) in dated.dropFirst(keep) { try? fm.removeItem(at: url) }
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey,
+                                          .isRegularFileKey]) else { return false }
+
+        struct Entry {
+            let url: URL
+            let date: Date
+            let bytes: Int64
+        }
+        var entries: [Entry] = []
+        entries.reserveCapacity(files.count)
+        for url in files {
+            let values = try? url.resourceValues(
+                forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey])
+            // Unknown regular-file sizes fail closed: retain a quota-sized weight unless the entry
+            // can be safely removed. Directories count as entries but not as guessed file bytes.
+            let bytes: Int64
+            if values?.isRegularFile == true {
+                bytes = Int64(values?.fileSize ?? Int(maximumDropBytes))
+            } else {
+                bytes = 0
+            }
+            entries.append(Entry(url: url,
+                                 date: values?.contentModificationDate ?? .distantPast,
+                                 bytes: max(0, bytes)))
+        }
+
+        var protected = Set(preserving.map { $0.standardizedFileURL.path })
+        protected.formUnion(promisedHandoffPathRefCounts.keys)
+        let entriesByPath = Dictionary(uniqueKeysWithValues: entries.map {
+            ($0.url.standardizedFileURL.path, $0)
+        })
+        var reservedIncomingCount = 0
+        var reservedIncomingBytes: Int64 = 0
+        for reservation in shareImportReservations.values {
+            let finalPath = dir.appendingPathComponent(
+                reservation.destinationFileName, isDirectory: false
+            ).standardizedFileURL.path
+            let temporaryPath = dir.appendingPathComponent(
+                reservation.temporaryFileName, isDirectory: false
+            ).standardizedFileURL.path
+            protected.insert(finalPath)
+            protected.insert(temporaryPath)
+
+            // Before the temp exists, project the full reserved file. While it is being written,
+            // count the entry already on disk plus the remaining bytes up to its declared size.
+            let present = [entriesByPath[finalPath], entriesByPath[temporaryPath]].compactMap { $0 }
+            if present.isEmpty {
+                reservedIncomingCount += 1
+                reservedIncomingBytes = saturatingAdd(reservedIncomingBytes, reservation.byteCount)
+            } else {
+                let observedBytes = present.reduce(Int64(0)) {
+                    saturatingAdd($0, $1.bytes)
+                }
+                reservedIncomingBytes = saturatingAdd(
+                    reservedIncomingBytes,
+                    max(0, reservation.byteCount - observedBytes)
+                )
+            }
+        }
+        protected.formUnion(OverlayViewModel.shared.sessionFileURLs.map {
+            $0.standardizedFileURL.path
+        })
+        protected.formUnion(OverlayViewModel.shared.pendingDroppedURLs.map {
+            $0.standardizedFileURL.path
+        })
+        for session in SessionHistoryStore.shared.sessions {
+            protected.insert(URL(fileURLWithPath: session.primaryPath).standardizedFileURL.path)
+            protected.formUnion(session.additionalPaths.map {
+                URL(fileURLWithPath: $0).standardizedFileURL.path
+            })
+        }
+
+        var count = entries.count + reservedIncomingCount
+        var bytes = entries.reduce(reservedIncomingBytes) { partial, entry in
+            saturatingAdd(partial, entry.bytes)
+        }
+
+        for entry in entries.sorted(by: { $0.date < $1.date }) {
+            guard count > maximumDropFiles || bytes > maximumDropBytes else { break }
+            // Promise filenames are source-controlled and may not be known until the callback.
+            // Deleting anything during that interval could remove a just-written file before its
+            // URL reaches the ViewModel; defer all destructive retention until the final callback.
+            guard activePromisedFileDeliveries.isEmpty else { break }
+            guard !protected.contains(entry.url.standardizedFileURL.path) else { continue }
+            do {
+                try fm.removeItem(at: entry.url)
+                count -= 1
+                bytes = max(0, bytes - entry.bytes)
+            } catch {
+                continue
+            }
+        }
+        return count <= maximumDropFiles && bytes <= maximumDropBytes
+    }
+
+    private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int64.max : sum
     }
 }

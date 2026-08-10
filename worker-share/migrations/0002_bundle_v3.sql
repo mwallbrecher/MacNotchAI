@@ -1,8 +1,10 @@
--- Fresh-install schema for Dragaway Share protocol v2.
--- Existing installations should use `wrangler d1 migrations apply` instead.
-PRAGMA foreign_keys = ON;
+-- Preserve every protocol-v2 row while widening only the authenticated bundle-format check.
+-- SQLite cannot alter a CHECK constraint in place, so the parent table is rebuilt with identical
+-- columns/constraints and bundle_version IN (2, 3). Existing claim_v2 rows continue to reference
+-- the recreated share_v2 table by name.
+PRAGMA foreign_keys = OFF;
 
-CREATE TABLE IF NOT EXISTS share_v2 (
+CREATE TABLE share_v2_bundle_v3 (
   share_id                TEXT PRIMARY KEY,
   session_verifier        TEXT NOT NULL UNIQUE,
   owner_token_verifier    TEXT NOT NULL UNIQUE,
@@ -37,27 +39,24 @@ CREATE TABLE IF NOT EXISTS share_v2 (
       AND wrapped_key IS NULL AND wrapped_key_nonce IS NULL)
   )
 );
-CREATE INDEX IF NOT EXISTS idx_share_v2_expiry_state ON share_v2 (expires_at, state);
-CREATE INDEX IF NOT EXISTS idx_share_v2_state_created ON share_v2 (state, created_at);
 
-CREATE TABLE IF NOT EXISTS claim_v2 (
-  token_verifier TEXT PRIMARY KEY,
-  share_id TEXT NOT NULL REFERENCES share_v2(share_id) ON DELETE CASCADE,
-  fetches INTEGER NOT NULL DEFAULT 0 CHECK (fetches BETWEEN 0 AND 3),
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL,
-  last_used_at INTEGER,
-  CHECK (expires_at > created_at)
-);
-CREATE INDEX IF NOT EXISTS idx_claim_v2_share ON claim_v2 (share_id);
-CREATE INDEX IF NOT EXISTS idx_claim_v2_expiry ON claim_v2 (expires_at);
+INSERT INTO share_v2_bundle_v3 (
+  share_id, session_verifier, owner_token_verifier, tier, state, r2_key,
+  payload_size, payload_etag, crypto_version, bundle_version, cipher, kdf,
+  kdf_iterations, kdf_salt, wrapped_key, wrapped_key_nonce, claim_count,
+  payload_fetch_count, created_at, expires_at, revoked_at
+)
+SELECT
+  share_id, session_verifier, owner_token_verifier, tier, state, r2_key,
+  payload_size, payload_etag, crypto_version, bundle_version, cipher, kdf,
+  kdf_iterations, kdf_salt, wrapped_key, wrapped_key_nonce, claim_count,
+  payload_fetch_count, created_at, expires_at, revoked_at
+FROM share_v2;
 
-CREATE TABLE IF NOT EXISTS abuse_budget_v2 (
-  subject_verifier TEXT NOT NULL,
-  operation TEXT NOT NULL CHECK (operation IN ('create', 'claim', 'payload', 'revoke')),
-  window_start INTEGER NOT NULL,
-  count INTEGER NOT NULL CHECK (count >= 0),
-  expires_at INTEGER NOT NULL,
-  PRIMARY KEY (subject_verifier, operation, window_start)
-);
-CREATE INDEX IF NOT EXISTS idx_abuse_budget_v2_expiry ON abuse_budget_v2 (expires_at);
+DROP TABLE share_v2;
+ALTER TABLE share_v2_bundle_v3 RENAME TO share_v2;
+
+CREATE INDEX idx_share_v2_expiry_state ON share_v2 (expires_at, state);
+CREATE INDEX idx_share_v2_state_created ON share_v2 (state, created_at);
+
+PRAGMA foreign_keys = ON;

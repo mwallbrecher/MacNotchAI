@@ -1,137 +1,149 @@
-# Dragaway Share
+# Dragaway Share Worker
 
-A deliberately dumb relay for exposed Dragaway sessions. It stores an opaque ciphertext blob
-and some metadata, hands it back on the correct 6-digit code, and deletes it. That is all.
+The small, self-hostable relay behind Dragaway's **Expose Session** feature. Protocol v2 keeps the
+product's deliberate low-friction baseline: a colleague enters only the reusable six-digit session
+ID for ordinary files, or the same ID plus a password for confidential files.
 
-**MIT licensed and self-hostable** — because it is this dumb, you can run your own instance and
-point the app at it. See `../docs/SHARE_ARCHITECTURE.md` for the full design.
+The service never receives a file name, conversation text, device identifier, or plaintext file.
+It stores a bounded AES-GCM ciphertext in private R2 and opaque coordination metadata in D1.
 
-The server never sees plaintext. In the password tier it holds **no key material at all**.
+The HTTP/crypto protocol remains v2. It accepts the legacy single-file bundle v2 and the ordered
+2–5-file bundle v3; both retain the same 28 MiB transport cap and 25 MiB aggregate file-byte limit.
 
----
+Read these before operating it:
 
-## Deploy (≈ 5 minutes)
+- [`PROTOCOL_V2.md`](./PROTOCOL_V2.md) — exact HTTP contract and state transitions.
+- [`SECURITY.md`](./SECURITY.md) — threat model, honest limits, and why each control exists.
 
-Everything below runs **inside this `worker-share/` folder**.
+## What changed from v1, and why
 
-```bash
-cd worker-share
-```
+Protocol v1 used the six digits as locator, download authorisation, acknowledgement, and revoke
+credential. It also stored the code-only AES key openly beside metadata, trusted a caller-provided
+device header for rate limiting, buffered double-Base64 JSON, and deleted a session after one import.
+Those properties made enumeration, deletion, races, and size-limit failures possible.
 
-### 1 · Wrangler
+Protocol v2 preserves the visible six-digit workflow while separating internal capabilities:
 
-```bash
-npm install -g wrangler
-wrangler login
-```
-
-### 2 · Create the two stores
-
-```bash
-wrangler kv namespace create SHARES
-wrangler d1 create dragaway-share
-```
-
-Each command prints an id. Paste them into `wrangler.toml`, replacing
-`PASTE_KV_NAMESPACE_ID` and `PASTE_D1_DATABASE_ID`.
-
-### 3 · Create the tables
-
-```bash
-wrangler d1 execute dragaway-share --remote --file=./schema.sql
-```
-
-### 4 · Deploy
-
-```bash
-wrangler deploy
-```
-
-Wrangler prints the deployed address, e.g.
-
-```
-Published dragaway-share
-  https://dragaway-share.<your-subdomain>.workers.dev
-```
-
-**That printed `https://…` address is the URL** you need in the next step. It is the address of
-your running service — nothing you have to buy or register; Cloudflare generates it from the
-Worker name plus your account subdomain.
-
-### 5 · Point the app at it
-
-In `MacNotchAI/Core/BackendConfig.swift`:
-
-```swift
-static let shareBaseURL = URL(string: "https://dragaway-share.<your-subdomain>.workers.dev")
-```
-
-While this is `nil`, the whole sharing feature stays hidden: no menu items, no ⌃⌘E / ⌃⌘J
-registration. Filling it in is what turns the feature on.
-
-Rebuild the app and the sharing UI appears.
-
-### 6 · Check it responds
-
-```bash
-curl -i https://dragaway-share.<your-subdomain>.workers.dev/v1/share/000000
-```
-
-Expect `HTTP/2 404` with `{"error":"Not found"}` — that means routing, KV and D1 are wired.
-A 500 means a binding id is still a placeholder.
-
----
-
-## Operating it
-
-**Retention** is layered so no single failure keeps data alive:
-
-| Layer | What it does |
-|---|---|
-| ack | the app confirms a successful decrypt+write, then the share is deleted |
-| fetch cap | stops serving after 5 downloads |
-| KV TTL | the value expires itself after 24 h |
-| cron | hourly sweep of expired metadata (`[triggers]` in `wrangler.toml`) |
-| revoke | the sender can delete at any time |
-
-Deletion is **never** triggered by the download itself — a dropped connection or an app crash
-must not destroy a share the recipient never actually received.
-
-**Tunables** live at the top of `src/index.js`: `TTL_SECONDS`, `MAX_BYTES`, `MAX_ATTEMPTS`,
-`MAX_FETCHES`. `MAX_BYTES` must stay in sync with `ShareBundle.maxFileBytes` in the app.
-
-**Costs.** Well inside Cloudflare's free tier for normal use: KV and D1 both have generous free
-allowances, and payloads are capped at 25 MB and deleted within a day.
-
----
-
-## Self-hosting elsewhere
-
-The app talks to four endpoints:
-
-| Method | Path | Purpose |
+| Value | Visible to | Purpose |
 |---|---|---|
-| `POST` | `/v1/share` | store ciphertext, return a code |
-| `GET` | `/v1/share/{code}` | return the ciphertext |
-| `POST` | `/v1/share/{code}/ack` | delete after a confirmed import |
-| `DELETE` | `/v1/share/{code}` | sender revokes |
+| six-digit `session_id` | sender and recipients | reusable human lookup until revoke/24 h |
+| random 128-bit `share_id` | sender app before create; recipients after claim | non-guessable R2/API locator |
+| random 256-bit `claim_token` | one recipient | ten-minute payload access, max three transfer attempts |
+| random 256-bit `owner_token` | sender app before create | revoke only; never accepted as a claim token |
 
-Implement those against any storage and point `shareBaseURL` at it. Inside `src/index.js` all
-storage access goes through `put / get / del`, so porting off Cloudflare means replacing three
-functions.
+Every recipient gets an independent claim token for the same snapshot. There is deliberately no
+recipient count or global fetch cap. The session remains available until the owner revokes it or the
+24-hour server expiry passes.
 
-There is deliberately **no Docker image**: the documented protocol is what enables self-hosting,
-not a container. One will be added if a deployment actually needs it.
+The sender persists `share_id` and `owner_token` before upload, then supplies both as strict request
+headers. The relay stores only the owner's HMAC verifier and never echoes the bearer token. Thus even
+if the upload commits but its HTTP response is lost, the Mac retains the capability needed to retry
+revoke. Caller-generated capability collisions are rejected generically and never overwrite data.
 
----
+## Local verification
 
-## A note on the two security tiers
+Requires Node.js 20+.
 
-- **Code only** — the server stores the AES key and releases it on the correct code. This
-  protects against a storage breach and network interception, but the operator *could*
-  technically decrypt. The app never calls this end-to-end encrypted, and neither should you.
-- **Code + password** — the key is derived from the user's password on their Mac and never
-  uploaded. Genuine end-to-end encryption; the operator cannot read the data.
+```bash
+npm install
+cp .dev.vars.example .dev.vars
+# Replace both placeholders with independent 32-byte base64url secrets.
+npm run types
+npm run check
+```
 
-A 6-digit code carries about 20 bits of entropy and therefore can never be a cryptographic key —
-its safety in the first tier comes from the attempt limit enforced here, not from cryptography.
+Tests run inside the Workers runtime with local D1 and R2 bindings. `npm run check` also validates
+the generated binding types, runs strict TypeScript, and performs a Wrangler dry-run bundle. It does
+not deploy or access production data.
+
+## Self-host deployment
+
+The checked-in `wrangler.jsonc` contains no Dragaway production resource IDs. Wrangler 4 can
+automatically provision the named D1 database and R2 bucket on a new account; alternatively create
+them explicitly and add the resulting `database_id` to your private deployment config.
+
+1. Install dependencies and authenticate:
+
+   ```bash
+   npm install
+   npx wrangler login
+   ```
+
+2. Generate two independent 32-byte secrets in unpadded base64url form and place them in a local
+   ignored `.env.production` file:
+
+   ```bash
+   openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+   openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+   ```
+
+   ```dotenv
+   VERIFIER_HMAC_SECRET="FIRST_VALUE"
+   KEY_WRAP_SECRET="SECOND_VALUE"
+   ```
+
+3. Create the stores. Paste the D1 command's `database_id` into a private deployment copy of
+   `wrangler.jsonc`; the checked-in self-host example deliberately has no account identifier:
+
+   ```bash
+   npx wrangler d1 create dragaway-share
+   npx wrangler r2 bucket create dragaway-share-payloads
+   ```
+
+4. Apply the D1 migration. **This intentionally invalidates any still-live v1 invitations.** The v1
+   endpoint returns HTTP 410; old KV values remain inaccessible and expire under their existing TTL.
+
+   ```bash
+   npx wrangler d1 migrations apply dragaway-share --remote
+   ```
+
+5. Install the R2 lifecycle backstop and deploy both encrypted secrets with the same version. Using
+   `--secrets-file` avoids the partially configured deployment that two sequential `secret put`
+   commands could create:
+
+   ```bash
+   npx wrangler r2 bucket lifecycle set dragaway-share-payloads --file r2-lifecycle.json
+   npx wrangler deploy --secrets-file .env.production
+   ```
+
+   A Worker already running protocol v2 must first apply `0002_bundle_v3.sql` with the migration
+   command from step 4, then deploy this code. The migration preserves existing share rows and only
+   widens the bundle-version check; the R2 bucket, lifecycle rule, and secrets remain unchanged.
+   Deploy both pieces before releasing a Mac client that creates multi-file shares.
+
+6. Verify the non-sensitive health endpoint:
+
+   ```bash
+   curl -i https://YOUR-WORKER.workers.dev/healthz
+   ```
+
+   Expected body: `{"status":"ok","protocol":"v2"}`.
+
+No deployment is performed by this repository change. Resource creation, secret installation,
+migration, lifecycle configuration, and deployment are explicit operator actions.
+
+## Retention and deletion semantics
+
+- Every claim and payload lookup requires `expires_at > now`, so a share becomes inaccessible at
+  24 hours even if cleanup has not run yet.
+- Owner revoke first atomically transitions D1 to `revoking`, immediately blocking new claims and
+  payload authorisations, then deletes R2 and D1 data. An already authorised in-flight transfer may
+  finish; plaintext already received cannot be recalled.
+- Hourly cron atomically marks expired, revoked, or abandoned-upload rows as `revoking`, removes R2,
+  then deletes D1 metadata in bounded set-based chunks. This closes upload-finalisation races and
+  remains below the D1 Free per-invocation query limit.
+- The two-day R2 lifecycle is a disaster-recovery backstop, not the primary 24-hour timer. Cloudflare
+  lifecycle deletion can occur after its nominal time, so documentation must say “inaccessible after
+  24 hours, physically cleaned afterward,” not promise destruction at an exact second.
+
+## Secret rotation
+
+`VERIFIER_HMAC_SECRET` protects lookup/token/IP verifiers; `KEY_WRAP_SECRET` protects code-only
+content keys. Rotating either immediately invalidates affected live shares. Because shares live at
+most 24 hours, the simple safe procedure is to stop creating shares, wait 24 hours, rotate both
+secrets, then resume. A future key-version column can support overlapping rotations if zero downtime
+becomes necessary.
+
+## Licence
+
+MIT — see [`LICENSE`](./LICENSE).

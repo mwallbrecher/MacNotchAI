@@ -73,6 +73,19 @@ final class SessionHistoryStore: ObservableObject {
     /// record itself isn't created until the first turn is recorded.
     private var pendingSessionID: UUID?
 
+    /// Exact identity currently receiving new turns. A normal fresh drop exposes
+    /// its pending identity before it has a persisted record; an imported or resumed
+    /// session points at the already-persisted record instead.
+    var activeSessionID: UUID? { pendingSessionID }
+
+    /// The exact active record, avoiding filename/path matching when the same file
+    /// has been used in multiple sessions. `nil` is intentional for a normal pending
+    /// drop until its first AI turn preserves the existing lazy-history behaviour.
+    var activeSessionRecord: SessionRecord? {
+        guard let id = pendingSessionID else { return nil }
+        return sessions.first { $0.id == id }
+    }
+
     private let fileURL: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
                                             in: .userDomainMask).first!
@@ -96,6 +109,40 @@ final class SessionHistoryStore: ObservableObject {
     /// turns append to it instead of spawning a duplicate record.
     func resumeSession(id: UUID) {
         pendingSessionID = sessions.contains { $0.id == id } ? id : nil
+    }
+
+    /// Persist an already-decoded shared transcript as exactly one local session and
+    /// make it the active destination for later turns. Unlike `beginSession`, imports
+    /// are intentionally eager: even a valid zero-turn snapshot must remain reopenable.
+    ///
+    /// `turns` is stored verbatim, so action values, prompts, results, dates, and order
+    /// are not reconstructed or timestamped again. `updatedAt` is supplied by the
+    /// bundle when available; otherwise the final original turn date (or now for an
+    /// empty transcript) is used.
+    @discardableResult
+    func createImportedSession(primary: URL, additional: [URL] = [],
+                               turns: [SessionTurn], updatedAt: Date? = nil) throws -> UUID {
+        let id = UUID()
+        let rec = SessionRecord(
+            id: id,
+            primaryPath: primary.path,
+            additionalPaths: additional.map(\.path),
+            turns: turns,
+            updatedAt: updatedAt ?? turns.last?.date ?? Date())
+
+        var committedSessions = sessions.filter { $0.id != id }
+        committedSessions.insert(rec, at: 0)
+        if committedSessions.count > maxSessions {
+            committedSessions.removeLast(committedSessions.count - maxSessions)
+        }
+
+        // Imported files become retention-protected only after this durable write succeeds. Do not
+        // publish the in-memory identity first: a swallowed disk error would release the file lease
+        // while Recent Sessions could not restore it after relaunch.
+        try write(committedSessions)
+        sessions = committedSessions
+        pendingSessionID = id
+        return id
     }
 
     /// Append a turn to the current session, creating the record if this is the
@@ -128,8 +175,28 @@ final class SessionHistoryStore: ObservableObject {
             sessions.insert(rec, at: 0)
         }
 
-        if sessions.count > maxSessions { sessions.removeLast(sessions.count - maxSessions) }
-        save()
+        trimAndSave()
+    }
+
+    /// Replace only the answer of the active record's last turn. Regenerate changes the assistant
+    /// reply already visible on screen; keeping the original prompt/action preserves turn identity
+    /// while ensuring reopen and Session Sharing receive the exact replacement rather than stale
+    /// history. Path matching is deliberately avoided because one file may back many sessions.
+    func replaceActiveLastTurnResult(_ result: String, at date: Date = Date()) {
+        guard let id = pendingSessionID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == id }),
+              let previous = sessions[sessionIndex].turns.last else { return }
+
+        var record = sessions.remove(at: sessionIndex)
+        record.turns[record.turns.count - 1] = SessionTurn(
+            actionRaw: previous.actionRaw,
+            promptTitle: previous.promptTitle,
+            resultText: result,
+            date: date
+        )
+        record.updatedAt = date
+        sessions.insert(record, at: 0)
+        trimAndSave()
     }
 
     /// Keep the active record's paths fresh after a rename/move (best-effort).
@@ -139,6 +206,19 @@ final class SessionHistoryStore: ObservableObject {
         var rec = sessions[idx]
         if rec.primaryPath == old.path { rec.primaryPath = new.path }
         rec.additionalPaths = rec.additionalPaths.map { $0 == old.path ? new.path : $0 }
+        sessions[idx] = rec
+        save()
+    }
+
+    /// Keep the exact active file set aligned with the live session after the user
+    /// removes one file. A still-pending session has no durable record yet, so there
+    /// is intentionally nothing to write in that case.
+    func replaceActivePaths(primary: URL, additional: [URL]) {
+        guard let id = pendingSessionID,
+              let idx = sessions.firstIndex(where: { $0.id == id }) else { return }
+        var rec = sessions[idx]
+        rec.primaryPath = primary.path
+        rec.additionalPaths = additional.map(\.path)
         sessions[idx] = rec
         save()
     }
@@ -169,9 +249,18 @@ final class SessionHistoryStore: ObservableObject {
     }
 
     private func save() {
+        try? write(sessions)
+    }
+
+    private func write(_ records: [SessionRecord]) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
-        guard let data = try? encoder.encode(sessions) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        let data = try encoder.encode(records)
+        try data.write(to: fileURL, options: .atomic)
+    }
+
+    private func trimAndSave() {
+        if sessions.count > maxSessions { sessions.removeLast(sessions.count - maxSessions) }
+        save()
     }
 }

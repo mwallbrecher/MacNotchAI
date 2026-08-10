@@ -128,6 +128,7 @@ struct CompressVideosSheet: View {
                 Task { await runner.runVideos(urls, options: options) }
             }
             .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
             .disabled(chosen.isEmpty)
         }
     }

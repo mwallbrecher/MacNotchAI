@@ -3,7 +3,7 @@ import Carbon.HIToolbox
 import Combine
 import SwiftUI
 
-class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     private var overlayWindow: OverlayWindow?
     private var onboardingWindow: NSWindow?
     private var hotkeyPickerWindow: NSWindow?
@@ -111,6 +111,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleCaptureSettingsChanged),
             name: .captureSettingsChanged, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleShareServiceConfigurationChanged),
+            name: .shareServiceConfigurationChanged, object: nil
         )
 
         NotificationCenter.default.addObserver(
@@ -387,6 +391,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addItem(to: menu, title: "Custom Prompts", action: #selector(menuCustomPrompts))
         addItem(to: menu, title: "Favorite Tools", action: #selector(menuFavoriteTools))
         addItem(to: menu, title: "Enhanced Access", action: #selector(menuEnhancedAccess))
+        addItem(to: menu, title: "Session Sharing", action: #selector(menuSessionSharing))
 
         // ── Recent sessions (file + AI conversation, last 10) ───────────────────
         let historyItem = NSMenuItem(title: "Recent Sessions", action: nil, keyEquivalent: "")
@@ -432,14 +437,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let updateItem = addItem(to: menu, title: "Check for Updates…", action: #selector(menuCheckUpdates))
         updateItem.isEnabled = UpdaterController.shared.canCheckForUpdates
 
-        // ── Session sharing (hidden entirely until a share service is configured) ──
-        if BackendConfig.isSharingAvailable {
+        // ── Session sharing ────────────────────────────────────────────────────
+        // Active sender-owned shares remain manageable even if the user changes (or temporarily
+        // breaks) the endpoint setting; each record retains its original service URL.
+        ActiveShareStore.shared.pruneExpired()
+        let ownedShares = ActiveShareStore.shared.ownedShares
+        if BackendConfig.isSharingAvailable || !ownedShares.isEmpty {
             menu.addItem(.separator())
-            let expose = addItem(to: menu, title: "Expose Session…  ⌃⌘E",
-                                 action: #selector(menuExposeSession))
-            // Only meaningful when a session with a real file is on screen.
-            expose.isEnabled = currentSessionFileURL() != nil
-            addItem(to: menu, title: "Join Session…  ⌃⌘J", action: #selector(menuJoinSession))
+            if BackendConfig.isSharingAvailable {
+                let expose = addItem(to: menu, title: "Expose Session…  ⌃⌘E",
+                                     action: #selector(menuExposeSession))
+                // Keep invalid folder/6+ sessions actionable so selecting the item can explain the
+                // supported boundary instead of silently disabling the command.
+                expose.isEnabled = !OverlayViewModel.shared.sessionFileURLs.isEmpty
+                addItem(to: menu, title: "Join Session…  ⌃⌘J", action: #selector(menuJoinSession))
+            }
+            if !ownedShares.isEmpty {
+                let active = NSMenuItem(title: "Active Exposed Sessions", action: nil,
+                                        keyEquivalent: "")
+                active.submenu = buildActiveSharesSubmenu(ownedShares)
+                menu.addItem(active)
+            }
         }
 
         menu.addItem(.separator())
@@ -503,6 +521,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         addItem(to: menu, title: "Clear History", action: #selector(menuClearHistory))
         addInfoItem(to: menu, title: "Hold ⌥ to remove a single session")
+        return menu
+    }
+
+    /// Sender-side management uses the owner capability stored in Keychain. The visible menu only
+    /// carries the public Session ID and the internal local record identifier; no owner token is
+    /// ever attached to an NSMenuItem or copied to the pasteboard.
+    private func buildActiveSharesSubmenu(_ records: [ActiveShareRecord]) -> NSMenu {
+        let menu = NSMenu()
+        for record in records {
+            let detail: String
+            if let rawID = record.sessionID,
+               let sessionID = ShareSessionID(rawValue: rawID) {
+                detail = sessionID.formatted
+            } else {
+                detail = "Unconfirmed — cleanup retained"
+            }
+            let parent = NSMenuItem(title: "\(record.fileName) · \(detail)",
+                                    action: nil, keyEquivalent: "")
+            parent.image = NSWorkspace.shared.icon(forFile: record.fileName)
+            parent.image?.size = NSSize(width: 16, height: 16)
+
+            let actions = NSMenu()
+            let status = record.state == .active ? "Available" : "Cleanup retained"
+            addInfoItem(to: actions, title: "\(status) until \(record.expiresAt.formatted(date: .abbreviated, time: .shortened))")
+            actions.addItem(.separator())
+            if record.sessionID != nil {
+                addItem(to: actions, title: "Copy Session ID",
+                        action: #selector(menuCopyActiveShareID(_:)), represented: record.id)
+            }
+            addItem(to: actions, title: "Revoke Share…",
+                    action: #selector(menuRevokeActiveShare(_:)), represented: record.id)
+            parent.submenu = actions
+            menu.addItem(parent)
+        }
         return menu
     }
 
@@ -724,6 +776,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func menuCustomPrompts() { showSettings(section: .customPrompt) }
     @objc private func menuFavoriteTools() { showSettings(section: .favoriteTools) }
     @objc private func menuEnhancedAccess() { showSettings(section: .enhancedAccess) }
+    @objc private func menuSessionSharing() { showSettings(section: .sessionSharing) }
     @objc private func menuReEnable()     { UserDefaults.standard.set(0, forKey: "disabledUntil") }
     @objc private func menuDisableUntil(_ sender: NSMenuItem) {
         guard let ts = sender.representedObject as? TimeInterval else { return }
@@ -746,8 +799,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Reopen a stored session (menu row + the Search Sessions window both land here).
     func openHistorySession(id: UUID) {
-        guard let rec = SessionHistoryStore.shared.record(for: id),
-              let last = rec.lastTurn else { return }
+        guard let rec = SessionHistoryStore.shared.record(for: id) else { return }
+
+        // An exposed snapshot may legitimately contain no AI turn yet. It is still a real imported
+        // session and must retain its imported history identity for the recipient's first action.
+        guard let last = rec.lastTurn else {
+            let urls = [rec.fileURL] + rec.additionalPaths.map { URL(fileURLWithPath: $0) }
+            openSessionWithFiles(urls.filter { FileManager.default.fileExists(atPath: $0.path) })
+            SessionHistoryStore.shared.resumeSession(id: id)
+            return
+        }
 
         let primary = rec.fileURL
         let lastAction = AIAction(rawValue: last.actionRaw) ?? .freeform
@@ -815,6 +876,62 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func menuExposeSession() { showExposeSession() }
     @objc private func menuJoinSession()   { showJoinSession() }
 
+    @objc private func menuCopyActiveShareID(_ sender: NSMenuItem) {
+        guard let localID = sender.representedObject as? String,
+              let record = ActiveShareStore.shared.ownedShares
+                .first(where: { $0.id == localID }),
+              let sessionID = record.sessionID else { return }
+        copySessionID(sessionID)
+    }
+
+    @objc private func menuRevokeActiveShare(_ sender: NSMenuItem) {
+        guard let localID = sender.representedObject as? String,
+              let record = ActiveShareStore.shared.ownedShares
+                .first(where: { $0.id == localID }) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Revoke this exposed session?"
+        if let rawID = record.sessionID,
+           let sessionID = ShareSessionID(rawValue: rawID) {
+            alert.informativeText = "The Session ID \(sessionID.formatted) will stop working for every colleague. Copies already imported onto their Macs are unaffected."
+        } else {
+            alert.informativeText = "Dragaway did not receive a definitive create response, but retained the owner capability. Revoke confirms cleanup when the service can be reached."
+        }
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Revoke Share")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        Task { @MainActor [weak self] in
+            do {
+                try await ShareController.shared.revoke(record)
+            } catch {
+                self?.showShareError(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Marks the public ID as transient so Dragaway's own Clipboard History and compatible
+    /// clipboard managers do not persist a bearer credential, while keeping ordinary paste intact.
+    private func copySessionID(_ sessionID: String) {
+        let item = NSPasteboardItem()
+        item.setString(sessionID, forType: .string)
+        item.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([item])
+    }
+
+    private func showShareError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Session Sharing"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
     /// Claim ⌃⌘E / ⌃⌘J only while sharing is actually available. Both are Carbon
     /// hotkeys: they consume the keystroke system-wide, so an unusable registration
     /// would break those combinations everywhere else on the Mac.
@@ -834,69 +951,78 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// The file backing the session currently on screen, if any. Sharing needs a real
-    /// on-disk file — a session that never received one cannot be exposed.
-    private func currentSessionFileURL() -> URL? {
-        guard let url = OverlayViewModel.shared.stage.fileURL,
-              FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return url
-    }
-
     /// Turns of the session on screen, so the recipient inherits the AI history.
     private func currentSessionTurns() -> [SessionTurn] {
-        guard let url = currentSessionFileURL() else { return [] }
-        return SessionHistoryStore.shared.sessions
-            .first { $0.primaryPath == url.path }?.turns ?? []
+        SessionHistoryStore.shared.activeSessionRecord?.turns ?? []
+    }
+
+    /// Capture the exact ordered files represented by the visible session. The immutable array is
+    /// passed through disclosure and packing so files added later cannot silently join the share.
+    private func exposableCurrentFileURLs() -> [URL]? {
+        let urls = OverlayViewModel.shared.sessionFileURLs
+        guard (1...ShareBundle.maxFiles).contains(urls.count) else { return nil }
+        for url in urls {
+            guard url.isFileURL,
+                  FileManager.default.fileExists(atPath: url.path),
+                  !FileInspector.isDirectory(url),
+                  let values = try? url.resourceValues(
+                    forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+                  ),
+                  values.isRegularFile == true,
+                  values.isSymbolicLink != true else {
+                return nil
+            }
+        }
+        return urls
     }
 
     func showExposeSession() {
-        guard let fileURL = currentSessionFileURL() else { NSSound.beep(); return }
+        guard let fileURLs = exposableCurrentFileURLs() else {
+            let alert = NSAlert()
+            alert.messageText = "This session cannot be exposed yet"
+            alert.informativeText = "Session Sharing supports up to five regular files. Folders, symbolic links, and sessions with more than five files stay local so Dragaway never presents an incomplete shared snapshot."
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return
+        }
         let turns = currentSessionTurns()
 
-        if exposeWindow == nil {
-            let hosting = NSHostingController(rootView: ExposeSessionView(
-                fileURL: fileURL, turns: turns) { [weak self] in
-                    self?.exposeWindow?.close()
-                    self?.exposeWindow = nil
-                })
-            let win = NSWindow(contentViewController: hosting)
-            win.title = "Expose Session"
-            win.styleMask = [.titled, .closable]
-            // Above the notch overlay: OverlayWindow is .floating, so a .normal window of our
-            // own app would open BEHIND it. Utility windows must sit on top when opened.
-            win.level = .floating + 1
-            win.isReleasedWhenClosed = false
-            win.center()
-            exposeWindow = win
-        }
+        // Re-root on every presentation. Even if another session opened while this window was
+        // already retained, no stale file URL, transcript or password state may be reused.
+        exposeWindow?.close()
+        ShareController.shared.reset()
+        let hosting = NSHostingController(rootView: ExposeSessionView(
+            fileURLs: fileURLs, turns: turns) { [weak self] in self?.exposeWindow?.close() })
+        let win = NSWindow(contentViewController: hosting)
+        win.title = "Expose Session"
+        win.styleMask = [.titled, .closable]
+        win.level = .floating + 1
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        win.center()
+        exposeWindow = win
         exposeWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(name: .tutorialEvent, object: "expose")
     }
 
     func showJoinSession() {
-        if joinWindow == nil {
-            let hosting = NSHostingController(rootView: JoinSessionView(
-                onImported: { [weak self] url in
-                    // Land the imported file in a normal session — from here it is an
-                    // ordinary Dragaway session on the recipient's own provider/key.
-                    self?.openSessionWithFiles([url])
-                },
-                onClose: { [weak self] in
-                    self?.joinWindow?.close()
-                    self?.joinWindow = nil
-                }))
-            let win = NSWindow(contentViewController: hosting)
-            win.title = "Join Session"
-            win.styleMask = [.titled, .closable]
-            // Above the notch overlay: OverlayWindow is .floating, so a .normal window of our
-            // own app would open BEHIND it. Utility windows must sit on top when opened.
-            win.level = .floating + 1
-            win.isReleasedWhenClosed = false
-            win.center()
-            joinWindow = win
-        }
+        joinWindow?.close()
+        let hosting = NSHostingController(rootView: JoinSessionView(
+            onImported: { [weak self] sessionID in self?.openHistorySession(id: sessionID) },
+            onClose: { [weak self] in self?.joinWindow?.close() }))
+        let win = NSWindow(contentViewController: hosting)
+        win.title = "Join Session"
+        win.styleMask = [.titled, .closable]
+        win.level = .floating + 1
+        win.isReleasedWhenClosed = false
+        win.delegate = self
+        win.center()
+        joinWindow = win
         joinWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        NotificationCenter.default.post(name: .tutorialEvent, object: "joinSession")
     }
 
     func showFeedback() {
@@ -1233,6 +1359,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func handleCaptureSettingsChanged() { armCaptureFeatures() }
 
+    @objc private func handleShareServiceConfigurationChanged() { armSharingHotkeys() }
+
     /// (Re)arm both capture features from their persisted toggles. Idempotent.
     private func armCaptureFeatures() {
         if Self.clipboardSessionHotkeyEnabled {
@@ -1535,7 +1663,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// the dragged file(s). Reuses the same proven path as the Finder Quick Action.
     @objc private func handleRadialOpenSession(_ note: Notification) {
         guard let urls = note.object as? [URL], !urls.isEmpty else { return }
-        Task { @MainActor in self.openSessionWithFiles(urls) }
+        Task { @MainActor in
+            self.openSessionWithFiles(urls)
+            // No-op for ordinary radial/screenshot launches. Promise deliveries register these
+            // paths before posting and release them only after `setChips` has made them live.
+            DropMaterializer.promisedFilesDidEnterSession(urls)
+        }
     }
 
     func hideOverlay() {
@@ -1657,7 +1790,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
 
         case .loading:
-            return (CGSize(width: 500 * s, height: 310 * s), true)
+            return (CGSize(width: 500 * s, height: 330 * s), true)
 
         case .result:
             // Window is always sized to fit the full expanded layout (transcript card +
@@ -1669,11 +1802,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let totalChars = convo.reduce(0) { $0 + $1.display.count }
             let lines = max(convo.count * 2, totalChars / 55)
             let resultH = min(CGFloat(lines) * 20, 260)
-            let h = (18 + 44 + resultH + 44 + 20 + 3 * 40 + 44 + 18) * s
+            let h = (18 + 64 + resultH + 44 + 20 + 3 * 40 + 44 + 18) * s
             return (CGSize(width: 500 * s, height: min(max(h, 410 * s), 600 * s)), true)
 
         case .error:
-            return (CGSize(width: 500 * s, height: 250 * s), true)
+            return (CGSize(width: 500 * s, height: 270 * s), true)
 
         case .fileResult:
             // Utility "second result stage": single column with two stacked file-detail
@@ -1806,6 +1939,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .aiProvider:      h = 640
         case .clipboard:       h = 320
         case .enhancedAccess:  h = 360
+        case .sessionSharing:  h = 360
         case .help:            h = 520
         }
         return NSSize(width: 460, height: h)
@@ -1879,6 +2013,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === exposeWindow {
+            ShareController.shared.reset()
+            exposeWindow = nil
+        } else if window === joinWindow {
+            joinWindow = nil
+        }
+    }
+
 }
 
 // MARK: - Notification names
@@ -1899,6 +2043,9 @@ extension Notification.Name {
     static let addFilesFromShare = Notification.Name("com.aidrop.addFilesFromShare")
     static let radialOpenSession = Notification.Name("com.aidrop.radialOpenSession")
     static let captureSettingsChanged = Notification.Name("com.aidrop.captureSettingsChanged")
+    static let shareServiceConfigurationChanged = Notification.Name(
+        "com.aidrop.shareServiceConfigurationChanged"
+    )
     static let showTutorial  = Notification.Name("com.aidrop.showTutorial")
     /// Feature-usage pings for the interactive tutorial (object = TutorialStep.Trigger raw).
     static let tutorialEvent = Notification.Name("com.aidrop.tutorialEvent")

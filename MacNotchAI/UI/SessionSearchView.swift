@@ -23,6 +23,7 @@ struct SessionSearchView: View {
                 TextField("Search file names, prompts, answers…", text: $query)
                     .textFieldStyle(.plain)
                     .focused($searchFocused)
+                    .onSubmit(openFirstResult)
                 if !query.isEmpty {
                     Button {
                         query = ""
@@ -64,6 +65,11 @@ struct SessionSearchView: View {
         }
         .frame(width: 440, height: 380)
         .onAppear { searchFocused = true }
+    }
+
+    private func openFirstResult() {
+        guard let first = results.first else { return }
+        onPick(first.id)
     }
 }
 

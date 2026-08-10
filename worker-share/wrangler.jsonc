@@ -1,0 +1,85 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "dragaway-share",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-08-06",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	// Wrangler 4 can provision these resources for a new self-host automatically.
+	// An existing installation should add its own database_id/bucket name locally;
+	// no Dragaway production resource identifier is committed to this public example.
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "dragaway-share",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "PAYLOADS",
+			"bucket_name": "dragaway-share-payloads"
+		}
+	],
+	// These names are the source of truth for generated Env types. Values must be
+	// installed with `wrangler secret put`; they are never plaintext config vars.
+	"secrets": {
+		"required": [
+			"VERIFIER_HMAC_SECRET",
+			"KEY_WRAP_SECRET"
+		]
+	},
+	// Fast, location-local burst brakes. Exact global fixed-window accounting is
+	// additionally enforced in D1 using an HMAC of CF-Connecting-IP.
+	"ratelimits": [
+		{
+			"name": "CREATE_BURST",
+			"namespace_id": "41001",
+			"simple": {
+				"limit": 10,
+				"period": 60
+			}
+		},
+		{
+			"name": "CLAIM_BURST",
+			"namespace_id": "41002",
+			"simple": {
+				"limit": 8,
+				"period": 60
+			}
+		},
+		{
+			"name": "PAYLOAD_BURST",
+			"namespace_id": "41003",
+			"simple": {
+				"limit": 30,
+				"period": 60
+			}
+		},
+		{
+			"name": "OWNER_BURST",
+			"namespace_id": "41004",
+			"simple": {
+				"limit": 10,
+				"period": 60
+			}
+		}
+	],
+	"triggers": {
+		"crons": [
+			"0 * * * *"
+		]
+	},
+	"observability": {
+		"enabled": true,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.05
+		}
+	}
+}

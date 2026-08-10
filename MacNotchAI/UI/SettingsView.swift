@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 /// `.aiProvider` / `.enhancedAccess`); the system ⌘, Settings scene still shows
 /// everything (`.all`).
 enum SettingsSection: String {
-    case all, windowSize, customPrompt, favoriteTools, outputDirectory, scripts, aiProvider, clipboard, enhancedAccess, help
+    case all, windowSize, customPrompt, favoriteTools, outputDirectory, scripts, aiProvider, clipboard, enhancedAccess, sessionSharing, help
 
     /// Title for the settings window when opened scoped to this section.
     var windowTitle: String {
@@ -22,6 +22,7 @@ enum SettingsSection: String {
         case .aiProvider:      return "AI Provider"
         case .clipboard:       return "Clipboard & Capture"
         case .enhancedAccess:  return "Enhanced Access"
+        case .sessionSharing:  return "Session Sharing"
         case .help:            return "Help"
         }
     }
@@ -71,6 +72,9 @@ struct SettingsView: View {
     @State private var saved = false
     @State private var newCustomPrompt = ""
     @State private var enhancedAccessAuthorized = false
+    @State private var shareEndpoint = ""
+    @State private var shareEndpointMessage: String?
+    @State private var shareEndpointIsError = false
     /// Which favorite-tools tab is showing. `.general` = the shared list; a category
     /// case = that file type's own list (with its Use-General toggle).
     @State private var favTab: FavTab = .general
@@ -265,6 +269,66 @@ struct SettingsView: View {
             }
             }
 
+            if shows(.sessionSharing) {
+            Section("Session Sharing") {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Share service")
+                            .font(.caption.weight(.semibold))
+                        TextField("https://…", text: $shareEndpoint)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit(saveShareEndpoint)
+                        Text("Dragaway's hosted service is the default. Organisations can use any compatible v2 endpoint. Public endpoints must use HTTPS; HTTP is accepted only on localhost for development.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    HStack(spacing: 8) {
+                        Button("Save Endpoint") { saveShareEndpoint() }
+                            .disabled(shareEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Button("Use Dragaway Service") {
+                            _ = BackendConfig.setShareBaseURLOverride(nil)
+                            shareEndpoint = BackendConfig.hostedShareBaseURL.absoluteString
+                            shareEndpointIsError = false
+                            shareEndpointMessage = "Using Dragaway's hosted service."
+                            NotificationCenter.default.post(
+                                name: .shareServiceConfigurationChanged, object: nil)
+                        }
+                        Spacer()
+                    }
+
+                    if let shareEndpointMessage {
+                        Label(shareEndpointMessage,
+                              systemImage: shareEndpointIsError
+                                ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(shareEndpointIsError ? .orange : .green)
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Label("Session ID only: reusable basic sharing. Anyone with the ID can open a copy; the service holds the decryption key.",
+                              systemImage: "person.2")
+                        Label("Session ID + password: end-to-end encrypted. The password and key never leave either Mac.",
+                              systemImage: "lock.fill")
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                    Divider()
+
+                    Text("This setting affects only Session Sharing. BYOK AI requests still go directly to the provider selected under AI Provider. Existing exposed sessions remember their original endpoint so their revoke credentials are never sent to a different server.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 4)
+            }
+            }
+
             if shows(.help) {
             Section("Hotkeys") {
                 VStack(alignment: .leading, spacing: 8) {
@@ -272,7 +336,7 @@ struct SettingsView: View {
                     helpRow("⌃⌘N",       "New session from the current clipboard")
                     if BackendConfig.isSharingAvailable {
                         helpRow("⌃⌘E",   "Expose the current session — share it with a colleague")
-                        helpRow("⌃⌘J",   "Join a session with a 6-digit code")
+                        helpRow("⌃⌘J",   "Join a reusable session with its 6-digit Session ID")
                     }
                     helpRow("⌥1 … ⌥9",   "Open the dropped file in a favorite app")
                     helpRow("Tab / ⇧Tab", "Cycle the session card's tabs")
@@ -408,22 +472,10 @@ struct SettingsView: View {
             if selectedType != .ollama {
                 Section("API Key (stored securely in Keychain)") {
                     SecureField(placeholder(for: selectedType), text: $apiKey)
+                        .onSubmit(saveAPIKey)
 
                     HStack {
-                        Button("Save Key") {
-                            let type = selectedType
-                            KeychainManager.shared.save(
-                                key: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
-                                service: type.keychainService
-                            )
-                            entitlementStore.tier = .byok
-                            NotificationCenter.default.post(
-                                name: .aiProviderConfigurationChanged,
-                                object: type
-                            )
-                            saved = true
-                            Task { await modelCatalog.refresh(type, force: true) }
-                        }
+                        Button("Save Key", action: saveAPIKey)
                         .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                         if saved {
@@ -553,6 +605,9 @@ struct SettingsView: View {
         .padding()
         .onAppear {
             apiKey = KeychainManager.shared.load(service: selectedType.keychainService) ?? ""
+            shareEndpoint = UserDefaults.standard.string(
+                forKey: BackendConfig.shareBaseURLOverrideKey
+            ) ?? BackendConfig.hostedShareBaseURL.absoluteString
         }
         .task(id: selectedProvider) {
             guard shows(.aiProvider) else { return }
@@ -563,6 +618,36 @@ struct SettingsView: View {
             }
             await refreshSelectedModelCatalogue(force: false)
         }
+    }
+
+    private func saveShareEndpoint() {
+        guard !shareEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        guard BackendConfig.setShareBaseURLOverride(shareEndpoint) else {
+            shareEndpointIsError = true
+            shareEndpointMessage = "Enter an HTTPS URL, or a localhost HTTP URL for development."
+            return
+        }
+        shareEndpoint = BackendConfig.shareBaseURL?.absoluteString ?? shareEndpoint
+        shareEndpointIsError = false
+        shareEndpointMessage = "Session Sharing endpoint saved."
+        NotificationCenter.default.post(name: .shareServiceConfigurationChanged, object: nil)
+    }
+
+    private func saveAPIKey() {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+
+        let type = selectedType
+        KeychainManager.shared.save(key: key, service: type.keychainService)
+        entitlementStore.tier = .byok
+        NotificationCenter.default.post(
+            name: .aiProviderConfigurationChanged,
+            object: type
+        )
+        saved = true
+        Task { await modelCatalog.refresh(type, force: true) }
     }
 
     private var selectedModelBinding: Binding<String> {

@@ -125,11 +125,9 @@ struct OverlayView: View {
                                        spring: Spring(response: 0.26, dampingRatio: 0.62))
                     }
                 }
-                // Whole card is a window-drag handle (low-priority gesture, so
-                // buttons / prompt field / scroll view / file drag-out still win).
-                .windowDrag()
-                // Movable-window grabber — thin line at top center that expands on
-                // hover/drag. A visible affordance on top of the whole-card drag.
+                // The card itself is deliberately NOT a window-drag handle. File fields contain
+                // native drag sources, and overlapping the two gestures can move the overlay while
+                // a file is being pulled out. Window movement belongs only to this explicit handle.
                 .overlay(alignment: .top) { WindowGrabber() }
                 .transition(.identity)
             }
@@ -231,8 +229,7 @@ private struct WindowGrabber: View {
 
 // MARK: - Window-drag gesture
 
-/// Drags the overlay window by writing vm.userDragOffset. Attach to the grabber
-/// AND the whole card so the user can move the window from anywhere on it.
+/// Drags the overlay window by writing vm.userDragOffset. Attached only to the explicit grabber.
 ///
 /// Tracks the ABSOLUTE cursor position via NSEvent.mouseLocation (screen coords,
 /// y-up) rather than the DragGesture's translation. SwiftUI's .global translation
@@ -240,9 +237,7 @@ private struct WindowGrabber: View {
 /// created a feedback loop (jitter/glitch). Screen coordinates are independent of
 /// the window, so the move tracks the cursor 1:1 with no drift.
 ///
-/// Uses .gesture (low priority), so child controls — buttons, the prompt field, the
-/// scroll view, and file-pill drag-out — keep their own gestures; the window only
-/// moves when the drag starts on empty card surface.
+/// Keeping this gesture off the card body guarantees that file drag-out never competes with it.
 private struct WindowDragModifier: ViewModifier {
     @ObservedObject private var vm = OverlayViewModel.shared
     @Binding var isDragging: Bool
@@ -1561,7 +1556,7 @@ private struct ExpandedFilePill: View {
         }
         .help(url.lastPathComponent)
         .onAppear {
-            FileThumbnail.load(for: url, size: 30) { fileIcon = $0 }
+            FileThumbnail.load(for: url, size: 30 * scale) { fileIcon = $0 }
         }
     }
 
@@ -1688,7 +1683,7 @@ private struct FileHeaderView: View {
 
         VStack(alignment: .leading, spacing: 8 * scale) {
             HStack(spacing: 4 * scale) {
-                Text(FilePresentation.typeLabel(for: fileURL))
+                Text(sessionTypeLabel)
                     .font(.system(size: 11 * scale, weight: .semibold))
                     .foregroundColor(.white.opacity(0.55))
                     .lineLimit(1)
@@ -1740,13 +1735,13 @@ private struct FileHeaderView: View {
                 } label: {
                     HStack(spacing: 3 * scale) {
                         Text(ai.model)
+                            .font(.system(size: 8.5 * scale, weight: .medium))
                             .lineLimit(1)
                             .truncationMode(.tail)
                             .minimumScaleFactor(0.75)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 4 * scale, weight: .bold))
                     }
-                    .font(.system(size: 4.5 * scale, weight: .medium))
                     .foregroundColor(.white.opacity(0.40))
                 }
                 .menuStyle(.borderlessButton)
@@ -1861,6 +1856,12 @@ private struct FileHeaderView: View {
         )
     }
 
+    private var sessionTypeLabel: String {
+        let labels = Set(vm.sessionFileURLs.map(FilePresentation.typeLabel(for:)))
+        if labels.count > 1 { return "Multiple" }
+        return labels.first ?? FilePresentation.typeLabel(for: fileURL)
+    }
+
     private var modelGroups: [AIModelProviderGroup] {
         groupedAIModelChoices(modelChoices.filter { $0.id != AIModelChoice.hostedID })
     }
@@ -1900,396 +1901,547 @@ private struct FileHeaderView: View {
 
 // MARK: - File pills row
 
-/// Horizontal gallery of icon-only draggable file pills.
-/// - 1–2 files: shown side by side.
-/// - 3+ files:  shows 2 at a time with prev/next chevrons and a "+N" overflow badge.
+/// One stable, full-width file field. A multi-file session is intentionally one transfer unit:
+/// native Share and drag-out always receive every staged URL in canonical session order.
 private struct FilePillsRow: View {
     let primaryURL: URL
     @ObservedObject private var vm = OverlayViewModel.shared
-    @Environment(\.uiScale) private var scale
-
-    /// Index of the first visible file in the carousel window.
-    @State private var offset = 0
 
     private var allFiles: [URL] { [primaryURL] + vm.additionalFileURLs }
 
-    /// The 1 or 2 files currently visible in the carousel window.
-    private var visibleFiles: [URL] {
-        let start = min(offset, max(0, allFiles.count - 2))
-        let end   = min(start + 2, allFiles.count)
-        return Array(allFiles[start..<end])
-    }
-
-    /// How many files are hidden beyond the right edge of the window.
-    private var hiddenCount: Int { max(0, allFiles.count - (offset + 2)) }
-
     var body: some View {
-        Group {
-            if allFiles.count == 1 {
-                // ── Single file: restore full pill (icon + name + share) ─────
-                SingleFilePill(fileURL: primaryURL)
-            } else {
-                // ── Multi-file: icon-only carousel ──────────────────────────
-                HStack(spacing: 5 * scale) {
-                    // Left arrow — shown once user has scrolled right
-                    if offset > 0 {
-                        carouselArrow(forward: false)
-                            .transition(.scale(scale: 0.7).combined(with: .opacity))
-                    }
-
-                    // Visible file pills (max 2)
-                    ForEach(visibleFiles, id: \.absoluteString) { url in
-                        FilePill(fileURL: url, onRemove: removeAction(for: url))
-                            .transition(.asymmetric(
-                                insertion: .scale(scale: 0.80).combined(with: .opacity),
-                                removal:   .scale(scale: 0.80).combined(with: .opacity)
-                            ))
-                    }
-
-                    // Overflow control — a right arrow to reveal the hidden files.
-                    // (No "+N" badge: it read as a stray blue bar and crowded the
-                    // header's trailing buttons against the window edge.)
-                    if allFiles.count > 2, hiddenCount > 0 {
-                        carouselArrow(forward: true)
-                            .transition(.scale(scale: 0.7).combined(with: .opacity))
-                    }
-
-                    Spacer(minLength: 0)
-
-                    // Share button — shares all files in the session together
-                    ShareButton(fileURLs: allFiles)
-                }
-                .animation(.spring(response: 0.28, dampingFraction: 0.72), value: offset)
-                // Clamp offset when files are removed
-                .onChange(of: allFiles.count, initial: false) { _, count in
-                    let maxOffset = max(0, count - 2)
-                    if offset > maxOffset {
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
-                            offset = maxOffset
-                        }
-                    }
-                }
-            }
+        if allFiles.count == 1 {
+            SingleFilePill(fileURL: primaryURL)
+        } else {
+            MultiFilePill(fileURLs: allFiles)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .animation(.spring(response: 0.28, dampingFraction: 0.72), value: allFiles.count)
-    }
-
-    /// Returns the remove closure for a given pill URL.
-    /// - Additional file: removes it from `additionalFileURLs`.
-    /// - Primary file: promotes the first additional to primary, keeping the rest.
-    private func removeAction(for url: URL) -> () -> Void {
-        {
-            guard !vm.isAITurnActive else { return }
-            let remainingSessionURLs: [URL]
-            if url == primaryURL {
-                // Promote first additional to primary
-                guard let newPrimary = vm.additionalFileURLs.first else { return }
-                let remaining = Array(vm.additionalFileURLs.dropFirst())
-                remainingSessionURLs = [newPrimary] + remaining
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
-                    vm.stage = .chips(
-                        url: newPrimary,
-                        actions: FileInspector.suggestedActions(forAll: remainingSessionURLs)
-                    )
-                    vm.additionalFileURLs = remaining
-                }
-            } else {
-                let remaining = vm.additionalFileURLs.filter { $0 != url }
-                remainingSessionURLs = [primaryURL] + remaining
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
-                    vm.additionalFileURLs.removeAll { $0 == url }
-                    // Recalculate chip actions with updated file list
-                    if case .chips(let primary, _) = vm.stage {
-                        vm.stage = .chips(
-                            url: primary,
-                            actions: FileInspector.suggestedActions(forAll: remainingSessionURLs)
-                        )
-                    }
-                }
-            }
-            FolderAnalysisStore.shared.beginSession(with: remainingSessionURLs)
-        }
-    }
-
-    @ViewBuilder
-    private func carouselArrow(forward: Bool) -> some View {
-        Button {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.72)) {
-                offset = max(0, min(offset + (forward ? 1 : -1), allFiles.count - 2))
-            }
-        } label: {
-            Image(systemName: forward ? "chevron.right" : "chevron.left")
-                .font(.system(size: 8 * scale, weight: .bold))
-                .foregroundColor(.white.opacity(0.75))
-                .frame(width: 18 * scale, height: 18 * scale)
-                .background(
-                    Circle()
-                        .fill(Color.white.opacity(0.08))
-                        .overlay(Circle().strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5))
-                )
-        }
-        .buttonStyle(.plain)
     }
 }
 
-// MARK: - Single file pill (full — icon + name + share)
+// MARK: - Single-file field
 
-/// Original full pill shown when exactly one file is in the session.
-/// Reverts to the pre-multi-file design: icon + truncated name + ShareButton + drag hint.
 private struct SingleFilePill: View {
     let fileURL: URL
     @ObservedObject private var vm = OverlayViewModel.shared
-    @ObservedObject private var folderStore = FolderAnalysisStore.shared
     @Environment(\.uiScale) private var scale
 
-    @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
-    @State private var isHovering = false
+    @State private var fileIcon = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
     @State private var isShowingFolderContents = false
+    @State private var metadata: FilePresentationMetadata?
 
-    private var isFolder: Bool { FileInspector.isDirectory(fileURL) }
-
-    private var subtitle: String {
-        guard isFolder else { return "Click to preview · drag to move" }
-        switch folderStore.snapshot(for: fileURL) {
-        case .idle, .scanning:
-            return "Scanning folder…"
-        case .failed:
-            return "Could not inspect · click for details"
-        case .ready(let analysis):
-            let manifest = analysis.manifest
-            var parts = ["\(manifest.includedCount) included in AI"]
-            if manifest.omittedCount > 0 { parts.append("\(manifest.omittedCount) omitted") }
-            if manifest.skippedCount > 0 { parts.append("\(manifest.skippedCount) skipped") }
-            if manifest.wasLimited { parts.append("scan limited") }
-            return parts.joined(separator: " · ")
-        }
+    private var isFolder: Bool {
+        metadata?.isDirectory ?? FileInspector.isDirectory(fileURL)
     }
 
     var body: some View {
-        HStack(spacing: 8 * scale) {
-            // Icon + name = a click target that opens Quick Look (the pill's drag
-            // still works — a drag needs movement, a bare click previews).
-            HStack(spacing: 8 * scale) {
+        ZStack {
+            NativeFileDragSurface(
+                tooltip: fileURL.lastPathComponent,
+                onClick: preview,
+                onPreview: preview,
+                dragURLs: beginDrag
+            )
+
+            HStack(spacing: 11 * scale) {
                 Image(nsImage: fileIcon)
                     .resizable()
                     .interpolation(.high)
-                    .scaledToFit()                       // keep thumbnail aspect (no stretch)
-                    .frame(width: 24 * scale, height: 24 * scale)
+                    .scaledToFit()
+                    .frame(width: 42 * scale, height: 42 * scale)
+                    .allowsHitTesting(false)
 
-                VStack(alignment: .leading, spacing: 1 * scale) {
+                VStack(alignment: .leading, spacing: 2 * scale) {
                     Text(fileURL.lastPathComponent)
-                        .font(.system(size: 12 * scale, weight: .semibold))
+                        .font(.system(size: 12.5 * scale, weight: .semibold))
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(subtitle)
-                        .font(.system(size: 9 * scale, weight: .regular))
-                        .foregroundColor(.white.opacity(0.35))
+                    Text(metadata?.detail ?? "—")
+                        .font(.system(size: 9.5 * scale, weight: .medium))
+                        .foregroundColor(.white.opacity(0.42))
                         .lineLimit(1)
                 }
-                .fixedSize(horizontal: false, vertical: true)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                if isFolder {
-                    isShowingFolderContents = true
-                } else {
-                    QuickLookController.shared.present(urls: vm.sessionFileURLs, current: 0)
-                }
-            }
-            .popover(isPresented: $isShowingFolderContents) {
-                FolderContentsPopover(rootURL: fileURL)
-            }
+                .allowsHitTesting(false)
 
-            Spacer(minLength: 8 * scale)
-
-            // Share the file via the native macOS share sheet. File utilities now
-            // live in the chips-stage "Utilities" tab, not behind a ••• menu here.
-            ShareButton(fileURL: fileURL)
-        }
-        .padding(.horizontal, 9 * scale)
-        .padding(.vertical, 7 * scale)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
-                .fill(Color.white.opacity(isHovering ? 0.08 : 0.05))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
-                )
-        )
-        .onDrag {
-            vm.isDraggingOut = true
-            return NSItemProvider(object: fileURL as NSURL)
-        }
-        .onHover { isHovering = $0 }
-        .animation(.easeInOut(duration: 0.12), value: isHovering)
-        .help("Drag to move file elsewhere")
-        // Floating full-name badge on hover
-        .overlay(alignment: .bottomLeading) {
-            if isHovering {
-                Text(fileURL.lastPathComponent)
-                    .font(.system(size: 11 * scale, weight: .medium))
-                    .foregroundColor(.white.opacity(0.92))
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 9 * scale)
-                    .padding(.vertical, 6 * scale)
-                    .frame(maxWidth: 220 * scale, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                            .fill(Color(white: 0.10).opacity(0.96))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
-                            )
-                            .shadow(color: .black.opacity(0.40), radius: 8, x: 0, y: 3)
-                    )
-                    .fixedSize()
-                    .offset(y: 38 * scale)
-                    .zIndex(200)
-                    .transition(
-                        .scale(scale: 0.90, anchor: .topLeading)
-                         .combined(with: .opacity)
-                         .animation(.spring(response: 0.22, dampingFraction: 0.72))
-                    )
+                Spacer(minLength: 38 * scale)
             }
+            .padding(.horizontal, 10 * scale)
+            .padding(.vertical, 7 * scale)
+            .allowsHitTesting(false)
+
+            HStack {
+                Spacer(minLength: 0)
+                ShareButton(fileURL: fileURL)
+            }
+            .padding(.horizontal, 10 * scale)
+        }
+        .frame(maxWidth: .infinity, minHeight: 58 * scale, alignment: .leading)
+        .background(fileFieldBackground(scale: scale))
+        .popover(isPresented: $isShowingFolderContents) {
+            FolderContentsPopover(rootURL: fileURL)
         }
         .onAppear {
-            FileThumbnail.load(for: fileURL, size: 24) { fileIcon = $0 }
-            if isFolder { folderStore.prepare(fileURL) }
+            FileThumbnail.load(for: fileURL, size: 44 * scale) { fileIcon = $0 }
         }
+        .task(id: FilePresentationMetadataCache.key(for: fileURL)) {
+            metadata = nil
+            let loaded = await FilePresentationMetadataCache.shared.metadata(for: fileURL)
+            guard !Task.isCancelled else { return }
+            metadata = loaded
+            if loaded.isDirectory {
+                FolderAnalysisStore.shared.prepare(fileURL)
+            }
+        }
+    }
+
+    private func preview() {
+        if isFolder {
+            isShowingFolderContents = true
+        } else {
+            QuickLookController.shared.present(urls: [fileURL], current: 0)
+        }
+    }
+
+    private func beginDrag() -> [URL] {
+        vm.isDraggingOut = true
+        return [fileURL]
     }
 }
 
-// MARK: - Single file pill (icon-only)
+// MARK: - Unified multi-file field
 
-/// Icon-only draggable pill for one file.
-/// Shows a floating filename tooltip and an × remove button on hover.
-private struct FilePill: View {
-    let fileURL: URL
-    /// Called when the user clicks the × badge. Nil = no × shown (e.g. primary file
-    /// when it is the only remaining file, though that case uses SingleFilePill).
-    let onRemove: (() -> Void)?
+private struct MultiFilePill: View {
+    let fileURLs: [URL]
     @ObservedObject private var vm = OverlayViewModel.shared
-    @ObservedObject private var folderStore = FolderAnalysisStore.shared
+    @Environment(\.uiScale) private var scale
+    @State private var isShowingSessionFiles = false
+    @State private var hoveredFileIndex: Int?
+    @State private var metadataByPath: [String: FilePresentationMetadata] = [:]
+
+    private var displayedFile: URL {
+        guard let hoveredFileIndex, fileURLs.indices.contains(hoveredFileIndex) else {
+            return fileURLs[0]
+        }
+        return fileURLs[hoveredFileIndex]
+    }
+
+    private var usesStackedLayout: Bool { fileURLs.count >= 6 }
+
+    private var fileSetKey: String {
+        fileURLs.map(FilePresentationMetadataCache.key(for:)).joined(separator: "\u{1F}")
+    }
+
+    var body: some View {
+        ZStack(alignment: usesStackedLayout ? .topTrailing : .trailing) {
+            // This native view covers the complete field. The Share button below is layered above
+            // it and keeps its own hit target; every other pixel begins the same multi-file drag.
+            NativeFileDragSurface(
+                tooltip: fileURLs.first?.lastPathComponent ?? "Files",
+                onClick: showSessionFiles,
+                onPreview: showSessionFiles,
+                dragURLs: beginDrag,
+                hoverFileCount: fileURLs.count,
+                hoverScale: scale,
+                hoverFileNames: fileURLs.map(\.lastPathComponent),
+                hoverFanIsTopAligned: usesStackedLayout,
+                onClickFileIndex: { previewFile(at: $0) },
+                onHoverFileIndex: { hoveredFileIndex = $0 }
+            )
+
+            Group {
+                if usesStackedLayout {
+                    VStack(alignment: .leading, spacing: 3 * scale) {
+                        HStack(spacing: 0) {
+                            fileFan
+                            Spacer(minLength: 38 * scale)
+                        }
+
+                        fileMetadata
+                            .padding(.trailing, 38 * scale)
+                    }
+                    .padding(.horizontal, 10 * scale)
+                    .padding(.vertical, 5 * scale)
+                } else {
+                    HStack(spacing: 11 * scale) {
+                        fileFan
+                        fileMetadata
+                        Spacer(minLength: 38 * scale)
+                    }
+                    .padding(.horizontal, 10 * scale)
+                    .padding(.vertical, 7 * scale)
+                }
+            }
+            .allowsHitTesting(false)
+
+            ShareButton(fileURLs: fileURLs)
+            .padding(.horizontal, 10 * scale)
+            .padding(.top, usesStackedLayout ? 5 * scale : 0)
+        }
+        .frame(
+            maxWidth: .infinity,
+            minHeight: (usesStackedLayout ? 78 : 58) * scale,
+            alignment: .leading
+        )
+        .background(fileFieldBackground(scale: scale))
+        .popover(isPresented: $isShowingSessionFiles, arrowEdge: .top) {
+            SessionFilesPopover()
+        }
+        .onChange(of: fileURLs.map(\.standardizedFileURL.path), initial: false) { _, _ in
+            hoveredFileIndex = nil
+        }
+        .task(id: fileSetKey) {
+            let loaded = await FilePresentationMetadataCache.shared.metadata(for: fileURLs)
+            guard !Task.isCancelled else { return }
+            metadataByPath = loaded
+        }
+    }
+
+    private func showSessionFiles() {
+        isShowingSessionFiles = true
+    }
+
+    private func previewFile(at index: Int) {
+        guard fileURLs.indices.contains(index) else { return }
+        QuickLookController.shared.present(urls: [fileURLs[index]], current: 0)
+    }
+
+    private func beginDrag() -> [URL] {
+        vm.isDraggingOut = true
+        return fileURLs
+    }
+
+    private var fileFan: some View {
+        SessionFileFan(
+            fileURLs: fileURLs,
+            hoveredFileIndex: hoveredFileIndex
+        )
+        .frame(
+            width: SessionFileFanMetrics.width(count: fileURLs.count, scale: scale),
+            height: SessionFileFanMetrics.iconSize * scale
+        )
+    }
+
+    private var fileMetadata: some View {
+        VStack(alignment: .leading, spacing: 2 * scale) {
+            Text(displayedFile.lastPathComponent)
+                .font(.system(size: 12.5 * scale, weight: .semibold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Text(metadataByPath[FilePresentationMetadataCache.key(for: displayedFile)]?.detail ?? "—")
+                .font(.system(size: 9.5 * scale, weight: .medium))
+                .foregroundColor(.white.opacity(0.42))
+                .lineLimit(1)
+        }
+        .id(displayedFile.standardizedFileURL.path)
+        .transition(.opacity)
+        .animation(.easeInOut(duration: 0.12), value: displayedFile.standardizedFileURL.path)
+    }
+}
+
+private enum SessionFileFanMetrics {
+    static let iconSize: CGFloat = 42
+    static let horizontalInset: CGFloat = 10
+    private static let preferredStep: CGFloat = 16
+    private static let maxWidth: CGFloat = 110
+
+    static func step(count: Int, scale: CGFloat) -> CGFloat {
+        guard count > 1 else { return 0 }
+        let available = (maxWidth - iconSize) / CGFloat(count - 1)
+        return min(preferredStep, max(0.75, available)) * scale
+    }
+
+    static func width(count: Int, scale: CGFloat) -> CGFloat {
+        guard count > 0 else { return 0 }
+        return iconSize * scale + CGFloat(count - 1) * step(count: count, scale: scale)
+    }
+}
+
+private struct SessionFileFan: View {
+    let fileURLs: [URL]
+    let hoveredFileIndex: Int?
     @Environment(\.uiScale) private var scale
 
-    @State private var fileIcon: NSImage = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
-    @State private var isHovering = false
-    @State private var isShowingFolderContents = false
+    var body: some View {
+        let step = SessionFileFanMetrics.step(count: fileURLs.count, scale: scale)
+        HStack(
+            alignment: .center,
+            spacing: step - SessionFileFanMetrics.iconSize * scale
+        ) {
+            ForEach(Array(fileURLs.enumerated()), id: \.element.standardizedFileURL.path) { index, url in
+                let isHovered = hoveredFileIndex == index
+                FanFileIcon(fileURL: url)
+                    .frame(
+                        width: SessionFileFanMetrics.iconSize * scale,
+                        height: SessionFileFanMetrics.iconSize * scale
+                    )
+                    .offset(y: isHovered ? -4 * scale : 0)
+                    .shadow(
+                        color: .black.opacity(isHovered ? 0.42 : 0),
+                        radius: isHovered ? 4 * scale : 0,
+                        y: isHovered ? 2 * scale : 0
+                    )
+                    .animation(.easeOut(duration: 0.16), value: isHovered)
+                    .zIndex(isHovered ? Double(fileURLs.count) : Double(index))
+            }
+        }
+        .frame(
+            width: SessionFileFanMetrics.width(count: fileURLs.count, scale: scale),
+            height: SessionFileFanMetrics.iconSize * scale,
+            alignment: .leading
+        )
+    }
+}
 
-    private var isFolder: Bool { FileInspector.isDirectory(fileURL) }
+private struct FanFileIcon: View {
+    let fileURL: URL
+    @Environment(\.uiScale) private var scale
+    @State private var fileIcon = NSImage(named: NSImage.multipleDocumentsName) ?? NSImage()
 
     var body: some View {
         Image(nsImage: fileIcon)
             .resizable()
             .interpolation(.high)
-            .scaledToFit()                       // keep thumbnail aspect (no stretch)
-            .frame(width: 24 * scale, height: 24 * scale)
-            .padding(.horizontal, 8 * scale)
-            .padding(.vertical, 7 * scale)
+            .scaledToFit()
+            .frame(width: 34 * scale, height: 34 * scale)
+            .frame(
+                width: SessionFileFanMetrics.iconSize * scale,
+                height: SessionFileFanMetrics.iconSize * scale
+            )
             .background(
                 RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
-                    .fill(Color.white.opacity(isHovering ? 0.10 : 0.06))
+                    .fill(Color(white: 0.12).opacity(0.96))
                     .overlay(
                         RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
-                            .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.7)
                     )
             )
-            // Share badge — top-leading corner, visible on hover
-            .overlay(alignment: .topLeading) {
-                if isHovering {
-                    ShareButton(fileURL: fileURL, compact: true)
-                        .offset(x: -4 * scale, y: -4 * scale)
-                        .transition(.scale(scale: 0.5).combined(with: .opacity)
-                            .animation(.spring(response: 0.20, dampingFraction: 0.68)))
-                }
-            }
-            // × remove badge — top-trailing corner, visible on hover
-            .overlay(alignment: .topTrailing) {
-                if isHovering, !vm.isAITurnActive, let onRemove {
-                    Button(action: onRemove) {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 6 * scale, weight: .bold))
-                            .foregroundColor(.white)
-                            .frame(width: 13 * scale, height: 13 * scale)
-                            .background(Circle().fill(Color(white: 0.20).opacity(0.95)))
-                            .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5))
-                    }
-                    .buttonStyle(.plain)
-                    .offset(x: 4 * scale, y: -4 * scale)
-                    .transition(.scale(scale: 0.5).combined(with: .opacity)
-                        .animation(.spring(response: 0.20, dampingFraction: 0.68)))
-                }
-            }
-            .onDrag {
-                vm.isDraggingOut = true
-                return NSItemProvider(object: fileURL as NSURL)
-            }
-            // Bare click → Quick Look this file (the carousel's other files stay
-            // reachable via the panel's ◀ ▶). Drag still moves the file out.
-            .onTapGesture {
-                if isFolder {
-                    isShowingFolderContents = true
-                } else {
-                    let urls = vm.sessionFileURLs
-                    QuickLookController.shared.present(
-                        urls: urls,
-                        current: urls.firstIndex(of: fileURL) ?? 0
-                    )
-                }
-            }
-            .popover(isPresented: $isShowingFolderContents) {
-                FolderContentsPopover(rootURL: fileURL)
-            }
-            .onHover { isHovering = $0 }
-            .animation(.easeInOut(duration: 0.12), value: isHovering)
-            .help(fileURL.lastPathComponent)
-            // Floating filename tooltip
-            .overlay(alignment: .bottomLeading) {
-                if isHovering {
-                    VStack(alignment: .leading, spacing: 2 * scale) {
-                        Text(fileURL.lastPathComponent)
-                            .font(.system(size: 11 * scale, weight: .medium))
-                            .foregroundColor(.white.opacity(0.92))
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Text("Drag to move")
-                            .font(.system(size: 9 * scale, weight: .regular))
-                            .foregroundColor(.white.opacity(0.45))
-                    }
-                    .padding(.horizontal, 9 * scale)
-                    .padding(.vertical, 6 * scale)
-                    .frame(maxWidth: 200 * scale, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                            .fill(Color(white: 0.10).opacity(0.96))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8 * scale, style: .continuous)
-                                    .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.5)
-                            )
-                            .shadow(color: .black.opacity(0.40), radius: 8, x: 0, y: 3)
-                    )
-                    // fixedSize lets the tooltip escape the narrow pill's layout bounds
-                    .fixedSize()
-                    .offset(y: 38 * scale)
-                    .zIndex(200)
-                    .transition(
-                        .scale(scale: 0.90, anchor: .topLeading)
-                         .combined(with: .opacity)
-                         .animation(.spring(response: 0.22, dampingFraction: 0.72))
-                    )
-                }
-            }
             .onAppear {
-                Task { @MainActor in
-                    fileIcon = FilePresentation.icon(for: fileURL)
-                    if isFolder { folderStore.prepare(fileURL) }
-                }
+                FileThumbnail.load(for: fileURL, size: 38 * scale) { fileIcon = $0 }
             }
     }
+}
+
+// MARK: - Native multi-item drag surface
+
+/// SwiftUI's `.onDrag` returns one item provider. Finder-compatible multi-file drags require one
+/// pasteboard writer per URL, so the visual cards use this small AppKit source instead.
+private struct NativeFileDragSurface: NSViewRepresentable {
+    let tooltip: String
+    let onClick: () -> Void
+    let onPreview: () -> Void
+    let dragURLs: () -> [URL]
+    var hoverFileCount: Int = 0
+    var hoverScale: CGFloat = 1
+    var hoverFileNames: [String] = []
+    var hoverFanIsTopAligned = false
+    var onClickFileIndex: ((Int) -> Void)? = nil
+    var onHoverFileIndex: ((Int?) -> Void)? = nil
+
+    func makeNSView(context: Context) -> NativeFileDragView {
+        let view = NativeFileDragView()
+        update(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NativeFileDragView, context: Context) {
+        update(nsView)
+    }
+
+    private func update(_ view: NativeFileDragView) {
+        view.defaultToolTip = tooltip
+        view.onClick = onClick
+        view.onPreview = onPreview
+        view.dragURLs = dragURLs
+        view.hoverFileCount = hoverFileCount
+        view.hoverScale = hoverScale
+        view.hoverFileNames = hoverFileNames
+        view.hoverFanIsTopAligned = hoverFanIsTopAligned
+        view.onClickFileIndex = onClickFileIndex
+        view.onHoverFileIndex = onHoverFileIndex
+        view.refreshToolTip()
+    }
+}
+
+private final class NativeFileDragView: NSView, NSDraggingSource {
+    var onClick: (() -> Void)?
+    var onPreview: (() -> Void)?
+    var dragURLs: (() -> [URL])?
+    var onClickFileIndex: ((Int) -> Void)?
+    var onHoverFileIndex: ((Int?) -> Void)?
+    var defaultToolTip = ""
+    var hoverFileNames: [String] = []
+    var hoverFileCount = 0 {
+        didSet {
+            if hoverFileCount != oldValue {
+                lastHoverIndex = nil
+            }
+        }
+    }
+    var hoverScale: CGFloat = 1
+    var hoverFanIsTopAligned = false
+
+    private var downPoint: NSPoint?
+    private var startedDrag = false
+    private var hoverTrackingArea: NSTrackingArea?
+    private var lastHoverIndex: Int?
+
+    override var acceptsFirstResponder: Bool { true }
+    /// Belt-and-suspenders with OverlayWindow.isMovableByWindowBackground = false: AppKit must
+    /// never reinterpret a press in this native file source as a window-background drag.
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.acceptsMouseMovedEvents = true
+    }
+
+    override func updateTrackingAreas() {
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let tracking = NSTrackingArea(
+            rect: .zero,
+            options: [.inVisibleRect, .mouseEnteredAndExited, .mouseMoved, .activeAlways],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(tracking)
+        hoverTrackingArea = tracking
+        super.updateTrackingAreas()
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        updateHover(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateHover(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        publishHover(nil)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        updateHover(with: event)
+        window?.makeFirstResponder(self)
+        downPoint = convert(event.locationInWindow, from: nil)
+        startedDrag = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !startedDrag, let downPoint else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard hypot(point.x - downPoint.x, point.y - downPoint.y) >= 3 else { return }
+        guard let urls = dragURLs?(), !urls.isEmpty else { return }
+
+        startedDrag = true
+        publishHover(nil)
+        let items = urls.enumerated().map { index, url -> NSDraggingItem in
+            let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+            let size = NSSize(width: 32, height: 32)
+            let cascade = CGFloat(min(index, 4)) * 3
+            let origin = NSPoint(
+                x: bounds.midX - size.width / 2 + cascade,
+                y: bounds.midY - size.height / 2 - cascade
+            )
+            let image = (FilePresentation.icon(for: url).copy() as? NSImage)
+                ?? NSWorkspace.shared.icon(forFile: url.path)
+            image.size = size
+            item.setDraggingFrame(NSRect(origin: origin, size: size), contents: image)
+            return item
+        }
+        beginDraggingSession(with: items, event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            downPoint = nil
+            startedDrag = false
+        }
+        guard !startedDrag else { return }
+        updateHover(with: event)
+        if let lastHoverIndex, let onClickFileIndex {
+            onClickFileIndex(lastHoverIndex)
+        } else {
+            onClick?()
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 {
+            onPreview?()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    private func updateHover(with event: NSEvent) {
+        guard hoverFileCount > 1 else {
+            publishHover(nil)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        let iconHeight = SessionFileFanMetrics.iconSize * hoverScale
+        let lift = 4 * hoverScale
+        let fanLowerEdge = hoverFanIsTopAligned
+            ? bounds.height - iconHeight - 5 * hoverScale
+            : (bounds.height - iconHeight) / 2
+        let fanUpperEdge = min(bounds.height, fanLowerEdge + iconHeight + lift)
+        guard point.y >= fanLowerEdge, point.y <= fanUpperEdge else {
+            publishHover(nil)
+            return
+        }
+        let localX = point.x - SessionFileFanMetrics.horizontalInset * hoverScale
+        let width = SessionFileFanMetrics.width(count: hoverFileCount, scale: hoverScale)
+        guard localX >= 0, localX <= width else {
+            publishHover(nil)
+            return
+        }
+        let step = SessionFileFanMetrics.step(count: hoverFileCount, scale: hoverScale)
+        guard step > 0 else {
+            publishHover(0)
+            return
+        }
+        publishHover(min(Int(localX / step), hoverFileCount - 1))
+    }
+
+    private func publishHover(_ index: Int?) {
+        guard lastHoverIndex != index else { return }
+        lastHoverIndex = index
+        refreshToolTip()
+        onHoverFileIndex?(index)
+    }
+
+    func refreshToolTip() {
+        if let lastHoverIndex, hoverFileNames.indices.contains(lastHoverIndex) {
+            toolTip = hoverFileNames[lastHoverIndex]
+        } else {
+            toolTip = defaultToolTip
+        }
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        .copy
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
+}
+
+// MARK: - File transfer presentation helpers
+
+private func fileFieldBackground(scale: CGFloat) -> some View {
+    RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
+        .fill(Color.white.opacity(0.06))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9 * scale, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.13), lineWidth: 0.5)
+        )
 }
 
 // MARK: - Share button
@@ -2311,7 +2463,11 @@ private struct ShareButton: View {
     init(fileURLs: [URL], compact: Bool = false) { self.fileURLs = fileURLs; self.compact = compact }
 
     private var tooltip: String {
-        fileURLs.count == 1 ? "Share file" : "Share \(fileURLs.count) files"
+        switch fileURLs.count {
+        case 0: return "Select files to share"
+        case 1: return "Share file"
+        default: return "Share \(fileURLs.count) files"
+        }
     }
 
     var body: some View {
@@ -2341,6 +2497,8 @@ private struct ShareButton: View {
             }
         }
         .buttonStyle(.plain)
+        .disabled(fileURLs.isEmpty)
+        .opacity(fileURLs.isEmpty ? 0.35 : 1.0)
         .fixedSize()
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.12), value: isHovered)
@@ -2777,8 +2935,11 @@ private func sendTurn(provider: any AIProvider,
             if !vm.finalizeStreamedReply(text) {
                 vm.conversation.append(.init(role: .assistant, display: text, modelText: text))
             }
-            // Don't double-log a regeneration — it answers an already-recorded turn.
-            if !regenerate {
+            // Regenerate replaces the visible reply for the same logical turn. Keep persisted
+            // history in lockstep so reopen and Session Sharing cannot expose the stale answer.
+            if regenerate {
+                SessionHistoryStore.shared.replaceActiveLastTurnResult(text)
+            } else {
                 SessionHistoryStore.shared.recordTurn(
                     primary: fileURL, additional: additionalURLs,
                     action: action, prompt: typedPrompt, result: text)
@@ -2791,21 +2952,37 @@ private func sendTurn(provider: any AIProvider,
             )
         } catch {
             guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
-            vm.abortStreamedReply()   // keep any partial text; stop tracking the bubble
             vm.isAwaitingReply = false
             let msg = error.localizedDescription
             if priorTurns > 0 {
-                // Keep the transcript — surface the failure as an assistant note.
+                // Keep one definitive assistant result. If streaming already produced text, fold
+                // the warning into that same bubble so UI, History, reopen, and Share stay exact.
                 let note = "⚠️ \(msg)"
-                vm.conversation.append(.init(role: .assistant, display: note, modelText: note))
+                let failedResult: String
+                if let finalized = vm.finalizeFailedStream(with: note) {
+                    failedResult = finalized
+                } else {
+                    vm.conversation.append(.init(role: .assistant, display: note, modelText: note))
+                    failedResult = note
+                }
+                if regenerate {
+                    SessionHistoryStore.shared.replaceActiveLastTurnResult(failedResult)
+                } else {
+                    // A failed follow-up remains visible as a real transcript turn; persist the
+                    // same result so exposing/reopening cannot silently omit it.
+                    SessionHistoryStore.shared.recordTurn(
+                        primary: fileURL, additional: additionalURLs,
+                        action: action, prompt: typedPrompt, result: failedResult)
+                }
                 applyStage(
-                    .result(url: fileURL, action: action, text: note),
+                    .result(url: fileURL, action: action, text: failedResult),
                     ifSession: sessionRevision,
                     turnID: turnID,
                     completesTurn: true
                 )
             } else {
                 // Nothing on screen yet — show the error stage (drops the lone bubble).
+                _ = vm.finalizeFailedStream(with: "⚠️ \(msg)")
                 vm.conversation.removeAll()
                 applyStage(
                     .error(url: fileURL, message: msg),
