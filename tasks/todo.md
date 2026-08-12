@@ -2764,15 +2764,15 @@ hotkey and the normal session pipeline takes over.
       “Customize” submenu that links to both existing scoped settings windows.
 - [x] Verify menu wiring, diff hygiene, and a Debug build without changing either settings screen.
 
-## Release v1.1.6 (2026-08-12)
+## Release v1.1.6 (DONE 2026-08-12)
 
 - [x] Confirm `main`, inventory the complete `v1.1.5..main` plus working-tree delta, and verify no
       credentials or test secrets are included.
 - [x] Finalize `RELEASE_NOTES_v1.1.6.md` from `RELEASE_NOTES_NEXT.md`, add the last-saved-file and
       batch-compression work, omit menu-only reordering, and update README What's New.
 - [x] Bump app and extension to marketing version 1.1.6 / build 9; run diff hygiene and a Debug build.
-- [ ] Stage exact release-source paths, review the staged diff, and commit the complete Main release
+- [x] Stage exact release-source paths, review the staged diff, and commit the complete Main release
       source without pushing or tagging.
-- [ ] Run `scripts/release.sh`; verify Developer-ID signing, Apple notarization, stapling, DMG version,
+- [x] Run `scripts/release.sh`; verify Developer-ID signing, Apple notarization, stapling, DMG version,
       and the Sparkle EdDSA signature. Leave publishing and the generated appcast commit for an explicit
       follow-up request.
