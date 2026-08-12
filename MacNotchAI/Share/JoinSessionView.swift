@@ -1,31 +1,38 @@
-import SwiftUI
 import AppKit
+import SwiftUI
 
-/// The recipient's side: enter a 6-digit code, get the session locally.
-///
-/// After import this is an ordinary Dragaway session — the recipient works with THEIR OWN
-/// provider and API key. Nothing is sent back to the sender (fork, not sync).
+/// Recipient flow: one reusable six-digit Session ID, followed by a password only when the sender
+/// chose E2EE. The resulting session is a local fork and continues with the recipient's provider.
 struct JoinSessionView: View {
 
-    var onImported: (URL) -> Void
+    var onImported: (UUID) -> Void
     var onClose: () -> Void
 
-    @State private var code = ""
+    @State private var sessionIDText = ""
     @State private var password = ""
-    @State private var needsPassword = false
+    @State private var pendingImport: ShareController.PendingImport?
     @State private var busy = false
     @State private var error: String?
+    @State private var joinTask: Task<Void, Never>?
 
-    private var normalizedCode: String {
-        code.filter(\.isNumber)
+    private var parsedSessionID: ShareSessionID? {
+        ShareSessionID.parse(sessionIDText)
     }
+
+    private var passwordIsValid: Bool {
+        let bytes = password.utf8.count
+        return bytes >= ShareCrypto.minimumPasswordBytes
+            && bytes <= ShareCrypto.maximumPasswordBytes
+    }
+
+    private var needsPassword: Bool { pendingImport != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Join Session").font(.system(size: 16, weight: .semibold))
-                    Text("Enter the code your colleague shared")
+                    Text("Enter the Session ID your colleague shared")
                         .font(.caption).foregroundColor(.secondary)
                 }
                 Spacer()
@@ -34,31 +41,39 @@ struct JoinSessionView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
             }
 
             Divider().padding(.vertical, 14)
 
-            TextField("000000", text: $code)
+            TextField("000000", text: $sessionIDText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 30, weight: .bold, design: .monospaced))
                 .multilineTextAlignment(.center)
                 .padding(.vertical, 10)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
-                .onChange(of: code) { _, new in
-                    // Keep it forgiving: accept pasted spaces/dashes, cap at six digits.
-                    let digits = String(new.filter(\.isNumber).prefix(6))
-                    if digits != new { code = digits }
+                .onSubmit(join)
+                .onChange(of: sessionIDText) { _, newValue in
+                    // Pasted spaces and dashes are presentation only; keep one six-digit value.
+                    let digits = String(newValue.filter(\.isNumber).prefix(6))
+                    if digits != newValue { sessionIDText = digits }
+                    pendingImport = nil
+                    password = ""
                     error = nil
                 }
-                .disabled(busy)
+                .disabled(busy || needsPassword)
 
             if needsPassword {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("This session is password-protected.")
+                    Text("This snapshot is end-to-end encrypted.")
                         .font(.system(size: 11.5)).foregroundColor(.secondary)
                     SecureField("Password", text: $password)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 12.5))
+                        .onSubmit(join)
+                        .onChange(of: password) { _, _ in error = nil }
+                    Text("Password checks happen locally; retrying does not contact the service again.")
+                        .font(.caption2).foregroundColor(.secondary)
                 }
                 .padding(.top, 12)
             }
@@ -74,33 +89,57 @@ struct JoinSessionView: View {
             Button(action: join) {
                 HStack(spacing: 8) {
                     if busy { ProgressView().controlSize(.small) }
-                    Text(busy ? "Fetching…" : "Open Session").frame(maxWidth: .infinity)
+                    Text(buttonTitle).frame(maxWidth: .infinity)
                 }
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(busy || normalizedCode.count != 6 || (needsPassword && password.isEmpty))
+            .keyboardShortcut(.defaultAction)
+            .disabled(busy || parsedSessionID == nil || (needsPassword && !passwordIsValid))
             .padding(.top, 16)
         }
         .padding(22)
         .frame(width: 380)
+        .onDisappear {
+            joinTask?.cancel()
+            joinTask = nil
+        }
+    }
+
+    private var buttonTitle: String {
+        if busy { return needsPassword ? "Decrypting…" : "Fetching…" }
+        return needsPassword ? "Decrypt & Open" : "Open Session"
     }
 
     private func join() {
+        guard !busy,
+              let sessionID = parsedSessionID,
+              !needsPassword || passwordIsValid else { return }
         busy = true
         error = nil
-        Task {
-            let result = await ShareController.shared.importShare(
-                code: normalizedCode, password: needsPassword ? password : nil)
+
+        joinTask?.cancel()
+        joinTask = Task {
+            let result: ShareController.ImportResult
+            if let pendingImport {
+                result = await ShareController.shared.finishImport(pendingImport, password: password)
+            } else {
+                result = await ShareController.shared.beginImport(sessionID: sessionID)
+            }
+
+            guard !Task.isCancelled else { return }
             busy = false
+            joinTask = nil
+
             switch result {
-            case .success(let url):
-                onImported(url)
+            case .success(let localSessionID):
+                onImported(localSessionID)
                 onClose()
-            case .needsPassword:
-                // Also the "wrong password" path — same remedy, so the same prompt.
-                if needsPassword { error = "Wrong password." }
-                needsPassword = true
+
+            case .needsPassword(let pending):
+                if pendingImport != nil { error = "Wrong password." }
+                pendingImport = pending
+
             case .failure(let message):
                 error = message
             }

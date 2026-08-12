@@ -78,6 +78,7 @@ struct FeedbackView: View {
             HStack(spacing: 10) {
                 Button("Cancel") { onClose() }
                     .controlSize(.large)
+                    .keyboardShortcut(.cancelAction)
 
                 Button(sending ? "Sending…" : "Send") { submit() }
                     .buttonStyle(.borderedProminent)

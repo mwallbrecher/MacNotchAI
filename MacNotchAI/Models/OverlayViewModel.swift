@@ -180,9 +180,20 @@ class OverlayViewModel: ObservableObject {
         return true
     }
 
-    /// Stream failed mid-flight: stop tracking the bubble (any partial text stays
-    /// visible; the error note is appended separately by the caller).
-    func abortStreamedReply() { streamingMessageID = nil }
+    /// Stream failed mid-flight: turn any partial stream plus the error note into ONE definitive
+    /// assistant reply. Returning nil means no delta arrived, so the caller should append the note
+    /// as a new bubble. The same returned text is persisted and shared verbatim.
+    func finalizeFailedStream(with note: String) -> String? {
+        defer { streamingMessageID = nil }
+        guard let id = streamingMessageID,
+              let i = conversation.firstIndex(where: { $0.id == id }) else { return nil }
+        let old = conversation[i]
+        let partial = old.display.trimmingCharacters(in: .whitespacesAndNewlines)
+        let final = partial.isEmpty ? note : "\(partial)\n\n\(note)"
+        conversation[i] = ChatMessage(id: old.id, role: .assistant,
+                                      display: final, modelText: final)
+        return final
+    }
 
     /// Claim the single shared streaming slot before any optimistic conversation
     /// mutation. A second click/submit while a turn is live is deliberately ignored.
@@ -473,6 +484,79 @@ class OverlayViewModel: ObservableObject {
         applySmartActions(base: base, primary: primary)
     }
 
+    /// Remove one staged file without touching it on disk. If the primary is removed,
+    /// the next URL is promoted while the current transcript/result stays visible.
+    /// The last file is deliberately not removable here because the session has no
+    /// valid empty-file stage; callers expose removal only while a batch remains.
+    func removeSessionFile(_ target: URL) {
+        guard !isAITurnActive else { return }
+        let targetPath = target.standardizedFileURL.path
+        let current = sessionFileURLs
+        guard current.count > 1,
+              current.contains(where: { $0.standardizedFileURL.path == targetPath }) else { return }
+
+        let previousPrimary = current[0]
+        let remaining = current.filter { $0.standardizedFileURL.path != targetPath }
+        guard let newPrimary = remaining.first else { return }
+        let newAdditional = Array(remaining.dropFirst())
+        let primaryChanged = previousPrimary.standardizedFileURL.path != newPrimary.standardizedFileURL.path
+
+        // Cancel any prepared context and invalidate old async smart-action writes before
+        // publishing the new file set. Remaining folder snapshots stay cached; only a removed
+        // folder is released, so this interaction never eagerly re-parses the survivors.
+        beginNewSessionRevision()
+        if FileInspector.isDirectory(target) {
+            FolderAnalysisStore.shared.cancel(target)
+        }
+        additionalFileURLs = newAdditional
+        SessionHistoryStore.shared.replaceActivePaths(
+            primary: newPrimary,
+            additional: newAdditional
+        )
+
+        let baseActions = FileInspector.baseActions(forAll: remaining)
+        switch stage {
+        case .waitingForDrop:
+            return
+        case .chips:
+            stage = .chips(url: newPrimary, actions: baseActions)
+        case .loading(_, let action):
+            stage = .loading(url: newPrimary, action: action)
+        case .result(_, let action, let text):
+            stage = .result(url: newPrimary, action: action, text: text)
+        case .error(_, let message):
+            stage = .error(url: newPrimary, message: message)
+        case .fileResult(let original, let output, let tool):
+            stage = .fileResult(
+                original: primaryChanged ? newPrimary : original,
+                output: output,
+                tool: tool
+            )
+        }
+
+        if let cachedResult {
+            switch cachedResult {
+            case .chips:
+                self.cachedResult = .chips(url: newPrimary, actions: baseActions)
+            case .loading(_, let action):
+                self.cachedResult = .loading(url: newPrimary, action: action)
+            case .result(_, let action, let text):
+                self.cachedResult = .result(url: newPrimary, action: action, text: text)
+            case .error(_, let message):
+                self.cachedResult = .error(url: newPrimary, message: message)
+            case .fileResult(let original, let output, let tool):
+                self.cachedResult = .fileResult(
+                    original: primaryChanged ? newPrimary : original,
+                    output: output,
+                    tool: tool
+                )
+            case .waitingForDrop:
+                self.cachedResult = nil
+            }
+        }
+
+    }
+
     /// Start extracting a known, fully materialised session without delaying its UI.
     /// The result remains inside the Task until the first AI action consumes it.
     func prepareBaseContext(for urls: [URL], charLimit: Int) {
@@ -590,6 +674,9 @@ class OverlayViewModel: ObservableObject {
         contentTruncated = false
         customPrompt = ""
         chipsTab = .suggested
+        // A restart is a new lazy History identity on the same file. Keep the old record in Recent
+        // Sessions, but never let Expose read its now-invisible turns for this fresh conversation.
+        SessionHistoryStore.shared.beginSession(primary: url)
         stage = .chips(url: url,
                        actions: FileInspector.suggestedActions(forAll: [url] + additionalFileURLs))
     }
@@ -629,7 +716,8 @@ class OverlayViewModel: ObservableObject {
             stage: stage, chipsTab: chipsTab,
             isChipsExpanded: isChipsExpanded, isFollowupsExpanded: isFollowupsExpanded,
             userDragOffset: userDragOffset, cachedResult: cachedResult,
-            additionalFileURLs: additionalFileURLs, contentTruncated: contentTruncated,
+            additionalFileURLs: additionalFileURLs,
+            contentTruncated: contentTruncated,
             customPrompt: customPrompt, conversation: conversation, baseContext: baseContext)
         hasMinimizedSession = true
         return true
@@ -794,7 +882,7 @@ class OverlayViewModel: ObservableObject {
 enum ChipsLayout {
     /// Context label/control row + gap + file pill, including the same vertical
     /// slack previously budgeted for the one-row header.
-    static let fileHeaderHeight: CGFloat = 80
+    static let fileHeaderHeight: CGFloat = 100
 
     static let rowStride:    CGFloat = 36   // per-row height budget (chip + slack)
     static let rowSpacing:   CGFloat = 6

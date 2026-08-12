@@ -1,6 +1,6 @@
 # Dragaway Privacy & Data Handling
 
-*Plain-language technical overview — last reviewed July 2026*
+*Plain-language technical overview — last reviewed August 2026*
 
 Dragaway is designed to keep data movement understandable and minimal. Most preparation happens
 locally on the Mac, and an AI request is sent only when the user chooses an AI action. This document
@@ -17,6 +17,9 @@ explains what stays local, what leaves the device, and where the limits of those
 - Files are prepared locally before an AI request. Images sent to a vision model are included in that
   provider request.
 - API keys are stored in the macOS Keychain.
+- Session Sharing is a separate, explicit action. Nothing is exposed merely by opening or working in
+  a session. Password-protected shares are end-to-end encrypted; the convenient Session-ID-only
+  tier is intentionally not suitable for confidential material.
 - Network requests use HTTPS. This protects their contents in transit from ordinary network
   observers, but no application can truthfully promise that data is unreadable to the chosen
   provider, a managed company proxy, or a compromised device.
@@ -78,6 +81,43 @@ request to process it. A company-managed TLS inspection proxy, trusted system ad
 compromised Mac may also be able to inspect traffic. Dragaway therefore promises encrypted transport,
 not that interception is technically impossible under every threat model.
 
+## Session Sharing
+
+Session Sharing does nothing until the user deliberately chooses **Expose Session**. Dragaway then
+creates one immutable snapshot containing the selected file and that session's existing AI results.
+Recipients import independent local copies and continue with their own provider and API key; later
+work is not synchronised back to the sender, another recipient, or the sharing service.
+
+There are two deliberately different protection levels:
+
+- **Session ID only** is the convenient baseline for ordinary, non-confidential files. Anyone who
+  obtains or correctly guesses the live six-digit ID can open the snapshot. The payload is encrypted,
+  but the service holds the decryption key and can technically read it.
+- **Session ID plus password** is the confidential tier. The key is derived locally with
+  PBKDF2-HMAC-SHA256 and the payload is authenticated with AES-256-GCM. Neither password nor derived
+  key is uploaded, so the service cannot decrypt a strong-password share. Someone who obtains both
+  ciphertext and Session ID can still attempt password guesses offline, which is why password
+  strength remains important.
+
+The hosted relay stores raw ciphertext in private object storage and bounded coordination metadata:
+HMAC verifiers rather than plaintext Session IDs or bearer tokens, crypto parameters, expiry/state,
+and HMAC-based abuse counters. It receives no file name, app device ID, AI-provider key, or plaintext
+IP in its application database. Each colleague receives a separate short-lived download capability;
+the sender creates its distinct revoke capability locally and stores it in the macOS Keychain before
+upload begins. If an upload succeeds but its response is lost, Dragaway retains an unconfirmed
+cleanup entry instead of losing the ability to revoke. A Session ID can be reused by multiple
+colleagues until the sender revokes it or its 24-hour lifetime ends.
+
+At expiry, the share immediately becomes unavailable for new claims or downloads. Revoking blocks
+new access in the same way, although a transfer already authorised and in flight may finish.
+Automated cleanup removes the object and metadata afterward; infrastructure lifecycle cleanup is a
+backstop and can occur later than the exact expiry second. Revoking cannot remove copies that
+colleagues already imported.
+
+Organisations can configure a compatible self-hosted v2 endpoint. This changes only Session Sharing;
+BYOK AI requests continue to go directly to the selected AI provider. For confidential enterprise
+material, use the password tier or an organisation-controlled relay—never rely on six digits alone.
+
 ## Local storage
 
 To support reopening sessions and convenient drag workflows, Dragaway may store the following inside
@@ -86,6 +126,16 @@ the current macOS user's Application Support directory:
 - recent file paths, prompts, and AI answers;
 - materialised text, link, mail, or image drops;
 - Clipboard History entries when that feature is enabled.
+- display and routing metadata for still-active exposed sessions (including the shared Session ID,
+  endpoint, and expiry); their owner/revoke credentials remain in Keychain.
+
+Dragaway manages its private Drops folder toward 50 entries and 512 MB. Cleanup removes only older
+materialisations that are not referenced by a saved or currently open session; a new shared-file
+import is strictly refused rather than silently deleting a session the user can still reopen.
+Ordinary local text/link/image drops favor preserving user data and can temporarily exceed that target
+if every older item is still referenced. Imported and promised Safari/Photos/Mail files remain
+protected while their local file and Recent Sessions entry are being completed, including across
+background file writes.
 
 These records remain local and are not uploaded as telemetry, but they are not separately encrypted
 by Dragaway. They are protected by the Mac's user account, filesystem permissions, FileVault when
@@ -142,6 +192,8 @@ request travels directly to the organisation's selected provider. A conservative
 should additionally:
 
 - use an approved enterprise provider account and retention policy;
+- require password-protected Session Sharing for confidential material, or point it at an approved
+  self-hosted relay;
 - disable Clipboard History when it is not needed;
 - restrict outbound traffic to approved provider and update domains;
 - use FileVault and the organisation's normal endpoint protection;

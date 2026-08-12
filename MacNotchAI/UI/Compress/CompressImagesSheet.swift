@@ -163,6 +163,7 @@ struct CompressImagesSheet: View {
                 Task { await runner.runImages(urls, options: options) }
             }
             .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.defaultAction)
             .disabled(chosen.isEmpty)
         }
     }

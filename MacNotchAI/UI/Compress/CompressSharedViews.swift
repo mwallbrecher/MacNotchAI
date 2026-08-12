@@ -21,6 +21,7 @@ struct CompressSheetHeader: View {
                     .foregroundColor(.secondary)
             }
             .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
         }
     }
 }
@@ -136,7 +137,9 @@ struct CompressProgressView: View {
                         .buttonStyle(.bordered)
                     }
                     Spacer()
-                    Button("Done", action: onClose).buttonStyle(.borderedProminent)
+                    Button("Done", action: onClose)
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
                 }
             }
         }

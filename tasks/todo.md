@@ -88,7 +88,8 @@ Approved scope, build order:
    so the project builds before the package is added in Xcode.
 2. **Drag anything** — pill wakes for TEXT / WEB-URL / IMAGE drags, not just files.
    `DropMaterializer` (new, Core) captures the payload at draggingEntered and writes it to
-   Application Support/Drops on drop (.txt / .png, pruned to newest 50) → the whole
+   Application Support/Drops on drop (.txt / .png, one shared 50-entry / 512 MiB quota that
+   preserves files referenced by saved or live sessions) → the whole
    existing file pipeline (chips, AI, utilities, history) just works. Radial stays
    file-only (apps open files, not selections). Known trade-off: in-app text drags also
    show the pill — the drag hotkey gate is the opt-out.
@@ -2421,3 +2422,307 @@ Readability plus its licence. The final 4,550,142-byte DMG is Developer-ID signe
 under notary submission `875a1232-8a29-4946-bcd1-9d7d62ec0414`, stapled, and accepted by Gatekeeper.
 GitHub serves the exact local SHA-256 `b976bd6563c3a7f4e77443dc28c40730f5df39163c255b05607d4a802adf1fc6`;
 the public `main` appcast exposes build 8 with the matching length and EdDSA signature.
+
+## Session sharing v2 — security hardening (IMPLEMENTED 2026-08-06; live/deployment smoke pending)
+
+**Scope:** replace the unreleased `/v1` sharing prototype on `main` with a bounded, authenticated v2
+snapshot protocol. Preserve the explicit opt-in and fork semantics: any number of colleagues may
+independently open the same exposed snapshot, including one after another, until the sender revokes
+it or its 24-hour lifetime ends. Use only Apple system crypto in
+the Mac app: the deliberate no-third-party-dependency decision remains, so the password tier uses
+CommonCrypto PBKDF2-HMAC-SHA256 rather than Argon2id. Do not deploy, push, release, or merge into
+`thesis` as part of implementation; those are separate owner-authorised operations.
+
+- [x] **Write the threat model and migration contract first** — add a focused hardening record that
+      maps every reviewed weakness to its fix, explains the security boundary of both tiers, records
+      residual risks (a guessed six-digit unprotected session ID, server-readable code-only shares,
+      offline guessing of weak passwords, normal TLS trust), and states why v1 is deliberately
+      incompatible/disabled. Update the architecture,
+      privacy report, self-host guide, retention wording (including D1 Time Travel/backups), endpoint
+      reference, and `tasks/lessons.md` security rules to match code exactly.
+- [x] **Preserve the deliberate six-digit baseline honestly** — the sender still receives one
+      CSPRNG-generated six-digit Session ID and the recipient still enters only those six digits.
+      Treat it explicitly as a short-lived bearer credential for uncritical material: a valid ID
+      necessarily identifies and claims an unprotected share, so no documentation may pretend that
+      a per-share “wrong PIN” counter makes the one-million-value space cryptographically strong.
+      Use a sender-generated opaque 128-bit storage ID after the rate-limited lookup, with separate
+      capabilities: one sender-generated persistent 256-bit owner token authenticates revoke, while every successful
+      recipient lookup receives its own short-lived claim token for bounded download retries. There
+      is no product-level recipient/fetch cap and one recipient never consumes the Session ID for the
+      next. Store only token verifiers and compare fixed-size values safely. The password remains the
+      opt-in second layer for confidential material.
+- [x] **Define a versioned, bounded cryptographic envelope** — replace JSON-embedded file `Data` and
+      JSON/base64 transport with a small length-prefixed binary bundle (metadata JSON + raw file
+      bytes) encrypted as raw AES-256-GCM bytes. Enforce v2, one regular primary file, 25 MiB artifact,
+      bounded metadata/turn counts/string lengths, and a bounded total ciphertext size on both sides.
+      Reject folders and multi-file sessions before upload with an explicit explanation rather than
+      silently sharing an incomplete session.
+- [x] **Use the native password KDF correctly** — replace the custom repeated-HMAC construction with
+      CommonCrypto PBKDF2-HMAC-SHA256 at a documented 600,000-iteration work factor and a random
+      32-byte salt. Put `cryptoVersion`, KDF name, salt, iteration count, and limits in authenticated,
+      validated metadata so future formats can migrate safely. Require a 12–256-byte passphrase and
+      explain that password entropy still matters. Perform file I/O, packing, PBKDF2, and AES work
+      off the main actor; retain the dependency-free design and leave Argon2id as a future format,
+      not a misleading TODO in the active guarantee.
+- [x] **Move payloads to bounded binary R2 storage** — stream the raw request body from the Worker to
+      a private R2 binding after an exact `Content-Length`/header/schema check; stream R2 back to an
+      authenticated recipient. Keep filenames and transcript details only inside ciphertext. In the
+      code-only tier, wrap the server-held AES key under a Worker secret before D1 storage; document
+      honestly that the service can still decrypt that tier. Never send `X-Device-Id` on sharing.
+- [x] **Make protocol state transitions authoritative and atomic** — use a new D1 v2 schema and
+      single-statement/transactional conditional writes for pending→ready creation, unique live-code
+      reservation, independent recipient claims, per-claim download retries, revoke, and expiry.
+      Eliminate
+      select-then-update code
+      allocation/counter races. Apply both a Cloudflare burst limiter and an exact D1 abuse budget
+      keyed by a secret-HMAC of the connecting IP; never trust a caller-provided identity header.
+      Ensure unknown IDs, invalid tokens, and internal failures return stable generic errors.
+- [x] **Authenticate every destructive or data-bearing route** — create accepts the sender-generated
+      share ID and already-persisted owner credential, then echoes only the share ID; each claim consumes the rate-limited six-digit Session ID and returns an independent
+      short-lived claim token; payload reads require that claim token and revoke requires the owner
+      token. Remove delete-on-ACK entirely: a successful recipient import only discards/expires that
+      recipient's capability and never deletes the shared snapshot. Cache one fetched ciphertext
+      locally in the Join flow so password retries are offline and do not consume more claims or
+      downloads. Add `Cache-Control: no-store`, no cookies,
+      no permissive CORS, no secrets/IDs in logs, and an ephemeral no-cache macOS URLSession that
+      refuses cross-origin redirects and accepts HTTPS only (localhost HTTP solely for development).
+- [x] **Harden expiry, cleanup, and operations** — keep a share retrievable by independently
+      rate-limited recipients until explicit owner revoke or 24-hour expiry; neither the first nor any
+      later successful import changes that lifetime. Make expired shares logically inaccessible on
+      every route, then delete R2 payload + D1 share/claim metadata via cron. Add and document a
+      two-day R2 lifecycle backstop without claiming exact physical deletion timing. Move the Worker
+      to strict TypeScript, generated binding types, current compatibility date, JSONC config,
+      structured privacy-safe observability, placeholder self-host config, migrations, package lock,
+      deployment checklist, and a real MIT licence. Keep production resource identifiers separate
+      from the copyable self-host template.
+- [x] **Make imported files and history untrusted-data safe** — validate bundle/version/crypto fields,
+      regular-file status, supported type, safe basename, Unicode/control/path components, and all
+      declared lengths before writing. Prove the standardized destination remains inside the private
+      Drops directory, write through a same-directory temporary file, and atomically rename without
+      overwriting. Create one imported history record preserving original turn order/dates, return its
+      ID, and restore it through `openHistorySession(id:)` so the visible transcript and later turns
+      remain attached to that exact record rather than being cleared or duplicated.
+- [x] **Fix app lifecycle and revocation UX** — derive the exposed turns from the active history ID,
+      not the first matching filesystem path. Rebuild/reset Expose and Join state on every presentation
+      and clear retained windows through `NSWindowDelegate` when the native close button/⌘W is used.
+      Persist active-share metadata locally and its owner token in Keychain, show active shares in the
+      menu, and allow authenticated revoke until expiry even after the Expose window was closed.
+      Remove local records only after a confirmed `204` revoke response or their locally tracked expiry;
+      generic `404` responses retain the recovery capability for retry.
+- [x] **Make self-hosting real and safe** — add a Session Sharing settings field backed by a validated
+      URL override (HTTPS, or loopback HTTP for development), preserve the hosted default, notify the
+      app to re-arm sharing hotkeys, and store each active share's originating endpoint so changing
+      servers cannot send its revoke token to the wrong host. Explain exactly what a custom operator
+      can observe and which tier remains E2EE.
+- [x] **Verify security properties, not just compilation** — add Workers-runtime Vitest coverage for
+      malformed/oversized bodies, raw R2 storage, concurrent claim/fetch limits, IP budgets, expiry,
+      generic errors, token-gated payload/revoke, cleanup, and no-store headers. Prove that multiple
+      recipients can claim and download sequentially/concurrently, while each claim has only a small
+      retry window and no recipient can revoke or consume the share for others. Add a Swift smoke
+      harness over the production bundle/crypto/invite/import-policy code covering PBKDF2 vectors,
+      round trips, wrong passwords, corruption, every traversal form, limit bombs, and forgiving
+      six-digit Session-ID parsing. Run `wrangler types`, strict typecheck/lint, Worker tests, dry-run bundle,
+      `git diff --check`, and clean Debug + Release Xcode builds.
+- [x] **Close final local consistency audit findings** — restarting on the same file now arms a fresh
+      lazy History identity; failed streams commit exactly the result still visible; imported files
+      hold concrete count/byte/temp/final-path reservations through a throwing History write; and
+      bounded File-Promise leases protect Safari/Photos/Mail output until MainActor handoff. Every
+      prune also protects pending Add/Replace files.
+- [ ] **Complete the deployment/live owner smoke** — after the v2 Worker schema, secrets, R2 lifecycle,
+      and code are deployed, exercise expose/revoke/reopen, two or more sequential recipients in both
+      code-only and password tiers, wrong-password retry without refetch, expired share, malicious
+      filename fixture, and transcript continuation on the real service/two Macs.
+
+**Deployment gate:** backend schema/R2/secrets/lifecycle and v2 Worker must be deployed and smoke-tested
+before an app build containing the v2 client is distributed. The old public `/v1` endpoints are disabled
+rather than kept as an unauthenticated compatibility path; any prototype v1 shares are allowed to expire.
+
+**Non-blocking retention follow-up:** ordinary locally materialised text/web/image drops still write
+first and run best-effort retention afterward. If all 50 / 512 MiB are protected, that path can exceed
+the quota without deleting referenced data. Move those existing producers onto the same preflight
+reservation API in a dedicated drag-pipeline change; do not mix it into the release-blocking sharing
+fix because web placeholders can grow during background enrichment and need their own size contract.
+
+## Responsive selectable multi-file shelf (PLANNED 2026-08-08)
+
+**Scope:** replace the chips/result header's fixed two-icon pager with one responsive full-width file
+shelf. Every staged file starts selected; this presentation selection controls only the native macOS
+Share button and drag-out payload. It must not silently change AI context, Favorite Tools, folder
+analysis, session history, or the v2 online Expose contract, which currently accepts one regular file.
+
+- [x] Add session-scoped transfer selection to `OverlayViewModel` using deselected standardized paths,
+      so new files are selected by default and selection survives stage transitions, minimize/restore,
+      removal/promotion, and path remaps without becoming a second source of truth for session files.
+- [x] Redesign `FilePillsRow` responsively: one file retains the full-width detailed pill; two files
+      divide all available file-track width equally with one standalone trailing Share button; three or
+      more become icon-first overlapping cards whose spacing/padding derives from available geometry and
+      file count. Hover expands/reveals one filename, raises it above neighbours, and moves through the
+      shelf with one smooth Reduce-Motion-aware animation instead of paging arrows.
+- [x] Make selection unmistakable but quiet: selected by default, click to deselect/reselect, dim and
+      outline deselected cards, preserve folder/file preview through a secondary gesture, and disable the
+      Share button when no file is selected. The native Share sheet receives only selected URLs in their
+      original session order.
+- [x] Replace the single-provider SwiftUI drag source with a small AppKit multi-item drag source. Dragging
+      a selected card writes one native dragging item per selected URL; dragging a deselected card first
+      makes that file the sole transfer selection. Preserve the existing drag-out collapse lifecycle and
+      Finder-compatible file URL payloads.
+- [ ] Verify selection lifecycle and ordered payload helpers, `git diff --check`, Debug + Release builds,
+      and manual UI smoke at 1, 2, 3, 5, and dense file counts: selection, zero-selection Share disabled,
+      multi-file Share, multi-file drag to Finder, hover traversal, Quick Look/folder preview, removal,
+      minimize/restore, result/back navigation, Reduce Motion, and every `uiScale` setting.
+
+## Unified non-selectable multi-file field (PLANNED 2026-08-08)
+
+**Correction:** remove the transfer-selection and hover-reveal interaction again. A multi-file session
+is one fixed, full-width file field: Share and drag-out always include every staged file. The field is
+never a window-move surface; moving the overlay remains available only through its visible top grabber.
+
+- [x] Remove transfer-selection state and its minimize/restore/remap lifecycle from the view model.
+- [x] Replace the individual multi-file cards with one non-hovering full-width field whose entire
+      content area starts one native multi-item drag for all session URLs; keep Share inside at right.
+- [x] Remove whole-card window dragging so file drags cannot race it; retain the explicit top grabber.
+- [x] Verify `git diff --check` plus Debug and Release builds; leave real Finder drag/UI smoke explicit.
+
+## Session files browser popover (PLANNED 2026-08-08)
+
+**Scope:** clicking the non-Share part of the full-width session file field opens a compact native-style
+grid/list browser. Its single blue focus selection exists only for navigation; Share and drag-out still
+operate on every staged file and there is no transfer-selection mode.
+
+- [x] Add a responsive grid/list popover with local single-file selection, thumbnails, names, sizes,
+      total file count/size, and clear blue focus treatment.
+- [x] Route `Space` to Quick Look for the focused file and `Return`/`Delete` to a centralized session
+      removal operation; disable removal while an AI turn is active.
+- [x] Make primary-file promotion and additional-file removal update live/cached stage URLs, local
+      folder analysis, cached context, and active History paths without re-parsing eagerly.
+- [x] Remove the “Click to preview” copy while preserving whole-field multi-file drag-out and the
+      separate Share target; verify `git diff --check` plus Debug and Release builds.
+
+## Unified file fan card (PLANNED 2026-08-09)
+
+**Scope:** give single- and multi-file sessions the same full-width information card. The card remains
+one native drag source; overlapping icons are presentation only, with hover choosing which filename and
+size are shown. The session browser keeps one local focus selection and removes it only with Backspace.
+
+- [x] Replace the special two-file layout and dense strip with one overlapping large-icon fan for every
+      multi-file count; keep a single stable filename/size column beside it.
+- [x] Track fan hover inside the existing native drag source so text changes do not split or obstruct
+      the full-field multi-file drag hitbox.
+- [x] Enlarge the single-file icon and replace instructional subtitle copy with the actual file size;
+      keep folder detail access and Share behavior intact.
+- [x] Bind removal only to macOS Backspace (`keyCode 51` / SwiftUI `.delete`), update shared header
+      height math, and verify `git diff --check` plus Debug and Release builds.
+
+## Dense file fan metadata row (PLANNED 2026-08-09)
+
+**Scope:** keep the unified full-field drag source while giving sessions with six or more files a
+two-row presentation. Tooltips expose complete filenames without reintroducing per-file hit targets.
+
+- [x] Make the model-menu trigger explicitly smaller without changing the native menu contents.
+- [x] Keep 2–5 files in the compact row; from 6 files place the fan in row one and the hovered
+      filename/size in row two, within the existing shared header-height budget.
+- [x] Feed full filenames into the native hover tracker so each fan position updates the AppKit
+      tooltip and no “Click to browse” copy remains; verify diff hygiene and both build modes.
+
+## Stable file-fan hover geometry (PLANNED 2026-08-10)
+
+**Scope:** correct the over-aggressive model-label reduction and make the overlapping file fan's
+visual order and native hover map describe the same immutable geometry.
+
+- [x] Restore the model label to a readable size that remains visibly subordinate to the file type.
+- [x] Replace offset-positioned fan tiles with equal-step negative-spacing layout and keep their base
+      stacking order stable while hover supplies only a small vertical lift/emphasis.
+- [x] Bound native hover to the fan's actual X and Y rectangle in both compact and stacked layouts,
+      including the raised edge, so space above/below the tiles cannot select a file.
+- [x] Record the overlap/z-order lesson, then verify diff hygiene plus Debug and Release builds.
+
+## File-fan direct preview click (PLANNED 2026-08-10)
+
+**Scope:** keep one native full-card drag source while routing a completed click according to the
+already-validated fan hover index.
+
+- [x] Increase the model trigger from 7 pt to a still-secondary but more comfortable readable size.
+- [x] Re-evaluate the exact fan hover on mouse-down, then Quick Look only that file when the click
+      finishes without becoming a drag; retain the session Gallery click everywhere else.
+- [x] Preserve Space, Share, and multi-file drag behavior; verify diff hygiene plus both build modes.
+
+## File presentation performance pass (PLANNED 2026-08-10)
+
+**Scope:** remove filesystem I/O from the file-card hover and session-browser render paths, while
+keeping thumbnail memory strictly bounded and preserving the fan's deterministic hit geometry.
+
+- [x] Load directory/file-size metadata off-main once per standardized session path, cache a small
+      bounded snapshot, and render the single-file card, multi-file hover text, gallery rows, and
+      gallery total exclusively from that snapshot.
+- [x] Quantize Quick Look requests to small Retina-aware pixel buckets, coalesce identical in-flight
+      requests, and hold completed images in a cost-limited cache so no view retains oversized source
+      artwork or repeatedly regenerates the same thumbnail.
+- [x] Reconcile the hovered file's visual elevation with the fan's stable overlap/hit-test order so
+      foreground emphasis does not reintroduce the previously fixed uneven spacing or hover mismatch.
+- [x] Verify `git diff --check` plus Debug and Release builds; leave the real local/iCloud file-count
+      interaction matrix to the owner in the final release candidate.
+
+## Keyboard interaction polish (PLANNED 2026-08-10)
+
+**Scope:** restore reliable Finder-style Backspace removal in the session-files popover and make
+single-line dialog forms consistently executable with Return, without stealing Return from multiline
+editors or broadening any global-keyboard/accessibility surface.
+
+- [x] Replace the popover's timing-sensitive SwiftUI focus binding with a popover-local native first
+      responder that handles only Space and physical Backspace (`keyCode 51`), reclaims focus after
+      file/layout clicks, and preserves the existing removal guards and deferred stage write.
+- [x] Add one guarded primary action per custom form window: Expose/Join (including password fields),
+      onboarding, hotkey save, compression, tutorial progression, and first-result session search.
+      Add field-local Return submission for Settings values, while leaving multiline feedback input
+      and non-form destructive actions untouched.
+- [x] Record the keyboard-focus/default-action lesson, run `git diff --check`, and build Debug and
+      Release serially; leave the final Backspace/Space and enabled/disabled Return interaction matrix
+      to the owner in the release candidate.
+
+## Session Sharing — up to five files (IMPLEMENTED 2026-08-10 — automated verification green; owner live/UI smoke pending)
+
+**Scope:** Expose may snapshot one through five regular staged files, in session order. Folders,
+symbolic links, empty sessions, and six or more files remain blocked by the existing native warning.
+The existing 25 MiB source-payload ceiling becomes an aggregate limit across the files, so the Worker
+transport/storage bound and the local 512 MiB Drops policy do not silently expand.
+
+- [x] **Make the sender boundary explicit** — validate the complete staged URL set before opening the
+      Expose panel; accept only 1–5 existing regular non-symlink files. Keep the warning path for a
+      folder or 6+ files and update its copy to state the exact limit instead of claiming that every
+      multi-file session is unsupported.
+- [x] **Add an honest multi-file disclosure** — pass the immutable URL snapshot into the Expose panel,
+      show total count/size plus every filename, and add a conspicuous warning for 2–5 files that all
+      listed files will be encrypted and shared. Tell the user to verify the list/remove unintended
+      files before continuing; do not add a second selection model inside the sharing dialog.
+- [x] **Version the encrypted bundle without breaking existing shares** — continue emitting/accepting
+      bundle v2 for one-file snapshots; add a bounded v3 envelope for 2–5 files with canonical ordered
+      filename/length metadata and concatenated raw bytes. Decode both versions, authenticate the exact
+      bundle version in AES-GCM AAD, reject duplicate/unsafe names, folders, length bombs, more than five
+      files, or more than 25 MiB aggregate before variable-size allocation.
+- [x] **Keep the relay rollout compatible** — allow bundle versions 2 and 3 on create/claim while keeping
+      crypto protocol v2, request limits, R2 format, Session IDs, password semantics, and existing D1
+      rows unchanged. Add Worker tests proving legacy v2 rows still claim and new v3 descriptors round
+      trip; document that the updated Worker must deploy before the app can expose multi-file sessions.
+- [x] **Import the recipient snapshot transactionally** — validate all file types/names first, reserve
+      count, aggregate bytes, collision-safe final names, and distinct temp names for the whole batch;
+      persist every file with mode 0600 and create one History session (`primary` + ordered `additional`)
+      before releasing leases. On any failure, remove only this batch's uncommitted files and leave no
+      partial session or orphan.
+- [x] **Verify the real contract** — expand the Swift security smoke for v2 compatibility, 2-file and
+      5-file round trips, duplicate basenames, malformed offsets/lengths, 6-file/folder rejection,
+      aggregate size bounds, and batch rollback. Run Worker typecheck/tests/dry-run, Swift smoke,
+      `git diff --check`, and serial Debug + Release builds; leave two-Mac code-only/password transfer
+      and the visible 1/2/5/6-file disclosure matrix to the release candidate.
+
+## Capture current product work for the next release (DONE 2026-08-10)
+
+**Scope:** commit the complete reviewed `main` worktree without publishing or releasing it. Preserve a
+user-facing, version-neutral summary of the working-tree diff against `HEAD` so a later release pass can
+merge it with any additional changes and assign the final version number.
+
+- [x] Inventory the complete tracked and untracked diff against `HEAD` and separate user-facing changes
+      from implementation/security details.
+- [x] Add `RELEASE_NOTES_NEXT.md` covering the hardened sharing protocol, five-file sharing, session-file
+      presentation/performance, keyboard polish, and the relevant privacy boundaries.
+- [x] Re-run diff hygiene, review the exact staged paths and staged diff, then create one local `main`
+      commit without pushing, tagging, version-bumping, or releasing.

@@ -335,6 +335,13 @@
 - **Fix**: Drop the default; make `offset` required and pass `OverlayViewModel.shared.userDragOffset` from each (MainActor) caller.
 - **Rule**: Under SWIFT_DEFAULT_ACTOR_ISOLATION=MainActor, never put a MainActor-isolated read in a default argument. Pass it in explicitly.
 
+### [BUILD-06] Do not run Debug and Release against the same DerivedData concurrently
+- **Mistake**: Parallel `xcodebuild` invocations for the same project shared one XCBuildData database;
+  the second build failed with `build.db: database is locked` despite valid source code.
+- **Fix**: Let the first configuration finish, then run the second configuration serially.
+- **Rule**: Parallelize read-only verification, but serialize Xcode builds unless each invocation has
+  its own explicit `-derivedDataPath`.
+
 ---
 
 ## UI / Animation
@@ -1095,3 +1102,276 @@
   ladder through hover help, and reserve nested provider/family/model menus for configurable routes.
 - **Rule:** menu depth must represent an actual decision. Fixed or automatically routed choices stay
   flat, with explanatory metadata available on demand.
+
+---
+
+## Session sharing
+
+### [SHARE-01] An accepted low-assurance tier is a product boundary, not an accidental bug
+
+- **What was wrong:** the first hardening plan replaced the intentionally simple six-digit Session ID
+  with an opaque invitation plus a second PIN, changing the baseline user promise while treating that
+  change as an implementation detail.
+- **Why:** the owner deliberately defines two assurance levels: a short-lived bearer ID for uncritical
+  material, whose service can read the payload, and an optional password tier for confidential files.
+  A security review must expose the residual risk in the first tier, but cannot silently erase a
+  conscious usability/security trade-off.
+- **Fix:** preserve the exact six-digit sender/recipient flow and document that guessing a valid ID
+  grants an unprotected share. Harden underneath it with CSPRNG allocation, atomic uniqueness, short
+  expiry, authoritative rate budgets, an opaque internal storage ID, and separate claim/revoke
+  capabilities. Keep native PBKDF2 + AES-GCM as the explicit confidential second layer.
+- **Rule:** distinguish a vulnerability from an explicitly accepted threat-model boundary. Improve
+  authentication, authorization, storage, and disclosure inside that boundary; require an explicit
+  product decision before adding another user-visible credential.
+
+### [SHARE-02] A reusable snapshot cannot be governed by first-recipient deletion
+
+- **What was wrong:** the initial prototype deleted a share after one recipient ACK and capped total
+  fetches, while the intended product lets any number of colleagues open the same Session ID—even
+  sequentially—during its lifetime.
+- **Why:** recipient delivery and share lifetime are different authorities. Letting one recipient's
+  success destroy sender-owned state turns a multi-recipient invitation into an accidental one-time
+  transfer and lets the first claimant deny access to everyone else.
+- **Fix:** the sender's owner token alone may revoke before the 24-hour expiry. Every successful,
+  rate-limited Session-ID lookup issues a separate short-lived claim token with a small retry budget;
+  completing an import only discards/expires that recipient capability. There is no product-level
+  recipient cap, and every recipient receives the same immutable exposed snapshot as a local fork.
+- **Rule:** model lifecycle authority separately from access capability. Sender revoke/TTL governs the
+  shared object; recipient tokens govern only that recipient's bounded read and must never consume the
+  object for other recipients.
+
+### [SHARE-03] Persist the recovery capability before an ambiguous mutation
+
+- **What was wrong:** waiting for Create to return the server-generated `share_id` and owner token
+  meant a server commit followed by a lost HTTP response could leave a live share that the Mac could
+  neither identify nor revoke. A local record-cap could also fail only after upload.
+- **Why:** network errors report what the client observed, not whether a remote mutation committed;
+  credentials learned only from the response disappear in exactly the ambiguous case that needs them.
+- **Fix:** the Mac now generates a 128-bit share ID and 256-bit owner token, commits their compound
+  endpoint-bound owner state to Keychain/Application Support before POST, and promotes it only after
+  a valid response. Unconfirmed creates stay visible and revocable; the 100-record bound is checked
+  before upload and never evicts a live capability.
+- **Rule:** for a non-idempotent remote mutation, durably retain enough authority to reconcile or undo
+  it before sending the request. A timeout must not be able to turn uncertainty into an orphan.
+
+### [SHARE-04] A generic authorization error is not proof that state is gone
+
+- **What was wrong:** the client removed its only owner token on revoke `404`, while the Worker
+  deliberately returns the same `404` for an unknown share and a wrong owner token.
+- **Why:** anti-enumeration collapses distinguishable server states; treating the collapsed response
+  as one specific state destroys the only credential that can resolve the ambiguity later.
+- **Fix:** local revoke state is removed only after confirmed `204` or its locally confirmed expiry.
+  A `404`, offline error, malformed response, or failed cleanup retains the endpoint-bound Keychain
+  capability and offers retry.
+- **Rule:** client-side destructive cleanup requires an authoritative acknowledgement. Never infer
+  deletion from an intentionally generic authentication/not-found response.
+
+### [SHARE-05] Bearer routing coordinates belong inside the capability identity
+
+- **What was wrong:** active records and Keychain services were keyed only by server-supplied
+  `share_id`, so a malicious custom endpoint could return the same ID as a hosted share and replace
+  or redirect its local owner state.
+- **Why:** opaque IDs are unique only inside their issuing authority; they are not globally unique
+  across mutually untrusted self-hosts.
+- **Fix:** local identity and Keychain service names derive from `endpoint + share_id`, while the
+  Keychain credential itself repeats and validates both coordinates before yielding the token.
+- **Rule:** scope bearer capabilities to their issuer/origin. Never use an issuer-local identifier as
+  the sole key across configurable trust domains.
+
+### [SHARE-06] A response limit must stop transfer, not inspect it afterward
+
+- **What was wrong:** the client downloaded an arbitrary response fully to a temporary file and only
+  then checked its size. RAM was bounded, but a broken or malicious self-host could still consume
+  disk and bandwidth.
+- **Why:** post-hoc validation constrains parsing, not resource acquisition.
+- **Fix:** a one-shot URLSession data delegate rejects oversized declared lengths before body transfer,
+  accumulates only up to the exact route limit, cancels on the first overflowing chunk, and still
+  refuses redirects/cookies/cache.
+- **Rule:** enforce byte/time/count ceilings at the streaming boundary where resources are consumed;
+  checking the finished artifact is not a transport bound.
+
+### [SHARE-07] Imported snapshots share local retention with every other drop
+
+- **What was wrong:** ordinary materialised drops kept the newest 50 entries, but shared imports used
+  a separate atomic writer and never invoked retention, allowing repeated 25 MiB imports to grow the
+  private Drops directory indefinitely. The old cleanup could also delete still-referenced history.
+- **Why:** safe persistence and lifecycle retention are separate responsibilities, and path age alone
+  does not reveal whether a user-visible session still owns a file.
+- **Fix:** one 50-entry / 512 MiB retention policy observes both paths. Shared imports enforce it by
+  reserving count+bytes before writing; saved/current session paths are protected, and the import
+  fails instead of deleting a reopenable session. Existing ordinary materialisation is honestly
+  documented as best-effort until its producers adopt the same preflight API.
+- **Rule:** every producer writing into a managed store must enter the same quota/retention policy,
+  and retention must understand durable references—not merely timestamps.
+
+### [SHARE-08] The shared transcript must be the transcript the sender sees
+
+- **What was wrong:** Go deeper/Regenerate could replace the on-screen assistant bubble while leaving
+  Session History stale; a failed stream could show partial text plus a warning but persist only the
+  warning. Restarting a conversation also cleared only the UI while retaining the old active History
+  identity, allowing Expose to share an invisible transcript.
+- **Why:** exact session identity fixes path ambiguity but not divergence between two representations
+  of the same turn.
+- **Fix:** regeneration replaces the active record's final result in place (preserving prompt/action,
+  updating its date); a failed partial stream is finalized into one partial+warning result used by
+  bubble, stage, History, and Share. Restart arms a fresh lazy identity while retaining the old record
+  in Recent Sessions.
+- **Rule:** if a UI mutation semantically replaces persisted content, update the source of truth in
+  the same completion path. Snapshot/export features must never reconstruct truth from stale mirrors.
+
+### [SHARE-09] Cleanup must claim its rows before touching external storage
+
+- **What was wrong:** selecting expired shares and then deleting R2/D1 state one row at a time both
+  exceeded a realistic D1 invocation budget and allowed a concurrent create/ready transition to race
+  with cleanup.
+- **Why:** cleanup spans two stores without a cross-service transaction; an unclaimed candidate set
+  can change while the external deletion is in flight, and per-row statements scale with backlog.
+- **Fix:** one conditional `UPDATE ... RETURNING` atomically marks only eligible rows as `revoking`,
+  R2 objects are deleted in a bounded batch, and D1/claim removal uses set-based statements. The
+  205-row regression test keeps one invocation below 30 D1 queries.
+- **Rule:** claim lifecycle ownership atomically before external side effects, then batch database
+  work to a measured platform budget.
+
+### [SHARE-10] Best-effort telemetry must not decide request success
+
+- **What was wrong:** payload metrics were awaited on the authenticated download path, so an
+  observability write could turn an otherwise valid fetch into a user-visible failure.
+- **Why:** telemetry has a weaker reliability requirement than the product operation it describes.
+- **Fix:** the Worker schedules privacy-safe metrics with `waitUntil`; delivery completes from the
+  authoritative authorization/storage result even if telemetry later fails.
+- **Rule:** keep non-authoritative observability off critical success paths unless the metric is part
+  of the operation's explicit correctness contract.
+
+### [SHARE-11] A local import transaction spans file I/O, retention, and durable history
+
+- **What was wrong:** quota preflight and the later atomic rename were separated by a detached await.
+  Another retention pass could delete the new import (or a pending Add/Replace file) before History
+  protected it; the History writer also swallowed disk errors and could not prove a commit.
+- **Why:** main-actor serialization ends at an `await`, while external File-Promise sources write into
+  Drops outside that actor. A byte/count check is not a reservation unless every competing cleanup
+  understands the in-flight paths and the durable ownership handoff.
+- **Fix:** imports reserve projected count/bytes, one exact final collision name, and a unique temp
+  path before I/O; every prune protects those plus live, saved, and pending paths. The History import
+  write now throws and publishes memory state only after atomic persistence; failures remove only the
+  uncommitted file. Safari/Photos/Mail hold bounded delivery leases and per-path handoff protection,
+  with a 30-second abandonment watchdog for a generic receiver that never calls back; results arriving
+  after that boundary are never opened as a session.
+- **Rule:** model retention-sensitive persistence as a lease that begins before the first external
+  side effect and ends only after the next durable owner accepts the exact path. Never treat a
+  successful rename or an error-swallowing save as the whole transaction.
+
+### [SHARE-12] A bundle-version rollout crosses the client, relay, and database constraint
+
+- **What was wrong:** the first multi-file pass taught the Worker to accept bundle v3 but left D1's
+  original `CHECK(bundle_version = 2)` intact, so a valid v3 create reached the database and failed
+  as an internal error.
+- **Why:** the authenticated bundle version is enforced in several independent layers: inner envelope
+  magic/metadata, AES-GCM AAD, native response validation, Worker request/stored-row validation, and
+  the D1 schema. Updating only code does not widen an already-deployed storage invariant. A batch
+  import also extends the local lease across every file, not just the primary path.
+- **Fix:** keep new single-file shares byte-compatible with `DRAGSHR2`; use `DRAGSHR3` only for ordered
+  2–5-file snapshots; accept both descriptors end-to-end; add a data-preserving D1 migration whose
+  sole semantic change is `bundle_version IN (2, 3)`; and reserve/write/commit recipient files as one
+  History-owned batch with rollback of only uncommitted outputs.
+- **Rule:** before emitting a new authenticated format version, enumerate and migrate every enforcing
+  layer, deploy storage then relay before the client, and test both the legacy and new descriptor.
+  When one logical snapshot contains several files, quota, persistence, rollback, and ownership
+  handoff are batch-wide invariants.
+
+### [FILE-SHELF-01] An expanded hover surface needs an expanded hitbox
+
+- **What was wrong:** the dense shelf initially widened and shifted only the rendered file card while
+  its AppKit tracking/drag view stayed at the collapsed icon width. Moving from the icon onto the
+  revealed filename could therefore fire `mouseExited`, immediately collapse the card, and make the
+  apparently interactive area impossible to drag.
+- **Why:** SwiftUI visual overflow does not automatically enlarge a representable's AppKit tracking
+  area or its parent's reliable event region.
+- **Fix:** the dense shelf now animates each hovered card's real outer frame and position. The visual
+  card, AppKit tracking surface, click target, Space responder, drag source, and remove control all
+  share that same expanded geometry.
+- **Rule:** when hover changes an AppKit-backed SwiftUI control's visible bounds, animate the actual
+  hit-tested frame too; never expand only decoration around a smaller native event source.
+
+### [FILE-SHELF-02] File-export drags and window drags need disjoint hit regions
+
+- **What was wrong:** the whole overlay card had a SwiftUI window-drag gesture with a two-point
+  threshold while the native file-export source began at three points. A drag starting in the file
+  field could therefore move the window before Finder's file drag took ownership.
+- **Why:** two drag recognizers with overlapping hit regions and different thresholds form a race;
+  making one low-priority does not guarantee that AppKit's native drag wins first.
+- **Fix:** multi-file sessions now expose one fixed native drag source over the complete full-width
+  file field and always transfer every staged file. The card-level window gesture was removed,
+  window movement remains on the explicit top grabber, and the AppKit source returns `false` from
+  `mouseDownCanMoveWindow` as a second boundary.
+- **Rule:** never place a window-move gesture beneath a native file-export source. Give each action
+  a visibly distinct, non-overlapping hit region and deny window movement at the AppKit source.
+
+### [FILE-SHELF-03] Name and bind Mac removal keys precisely
+
+- **What was wrong:** the first session-browser binding treated Return and deletion keys as
+  interchangeable removal shortcuts, while the intended control was specifically the physical
+  Backspace key above Return.
+- **Why:** SwiftUI names the Mac Backspace key `.delete`, which makes loose descriptions such as
+  “Return / Delete” easy to translate into a broader and destructive shortcut than requested.
+- **Fix:** removal is bound only to `.onKeyPress(.delete)`; Return is left untouched and Space remains
+  reserved for Quick Look.
+- **Rule:** for destructive Mac shortcuts, document both the visible key (`⌫`) and the framework
+  spelling (`.delete`, key code 51), and never add Return as an alias without an explicit request.
+
+### [FILE-SHELF-04] An overlapping fan needs one immutable visual and hit-test order
+
+- **What was wrong:** promoting the hovered tile to the highest `zIndex` made it cover the next
+  tile's normally visible slice. The X-based native hover map still used the original equal steps, so
+  the fan looked uneven and the visible tile under the pointer could disagree with the selected one.
+- **Why:** in an overlapping stack, z-order is part of the apparent geometry even when every frame and
+  X offset is mathematically unchanged. X-only hit testing also treats empty space above and below the
+  tiles as if it belonged to the fan.
+- **Fix:** tiles now use an equal negative-spacing `HStack` with stable index order. Hover adds only a
+  small vertical lift and shadow, while the AppKit tracker checks the union of the resting/lifted tile
+  rectangle in both axes before mapping X to a file.
+- **Rule:** never mutate occlusion order independently of an overlap-based hit map. Keep the visual
+  slices stable, and test the full visible rectangle—not just one coordinate.
+
+### [UI-06] Do not iterate typography below legibility against a stale running build
+
+- **What was wrong:** repeated model-label reductions accumulated to 2.5 pt because earlier changes
+  were not yet visible in the running app; once refreshed, the final value was unreadable.
+- **Why:** a stale runtime gives no trustworthy visual feedback, while compilation still accepts
+  technically valid but unusably small type.
+- **Fix:** the model trigger is restored to an explicit 7 pt—still subordinate to the 11 pt file type
+  but readable—and both build configurations are verified from the edited worktree.
+- **Rule:** keep secondary interface labels at a deliberate readable floor and verify the current
+  binary before applying another typography decrement.
+
+### [FILE-SHELF-05] SwiftUI presentation paths must render snapshots, not query the filesystem
+
+- **What was wrong:** every file-fan hover change formatted a fresh `URL.resourceValues` result, while
+  gallery selection/layout updates traversed every file again for row sizes and the aggregate total.
+- **Why:** SwiftUI body recomputation is synchronous on the main actor, and metadata that is cheap for a
+  warm local file can block on iCloud, external, or network-backed URLs. Release optimization cannot
+  remove that I/O. Independent Quick Look views also requested the same thumbnail sizes repeatedly and
+  could retain source representations far larger than the UI needed.
+- **Fix:** load one bounded metadata snapshot per standardized path on detached utility tasks, coalesce
+  concurrent readers, and make cards/gallery totals consume only cached values. Quantize thumbnail
+  requests to 96/192/256 physical pixels, coalesce in-flight generation, rasterize before retention,
+  and use an 8 MiB / 96-entry `NSCache` so memory pressure remains authoritative.
+- **Rule:** never call filesystem metadata APIs from a SwiftUI body or hover callback. Cache immutable
+  presentation facts off-main, and bound image caches by physical pixels and decoded-byte cost—not
+  source-file resolution or item count alone.
+
+### [KEYBOARD-01] SwiftUI focus state is not an AppKit first-responder guarantee
+
+- **What was wrong:** the session-files popover used a SwiftUI focus binding for Space and Backspace.
+  During popover presentation—and again after clicking its layout or file controls—the binding could
+  say “focused” while AppKit had installed a different first responder, so physical Backspace never
+  reached the removal handler.
+- **Why:** SwiftUI focus describes declarative intent, while keyboard delivery in an AppKit-hosted
+  popover follows the window's actual first-responder chain. Presentation timing can temporarily make
+  those two states disagree.
+- **Fix:** a popover-local `NSView` now explicitly claims first responder after attachment and after
+  relevant clicks, handles only unmodified Space and physical Backspace (`keyCode 51`), and forwards
+  every other key. Custom single-action windows declare one guarded `.defaultAction`; Settings uses
+  field-local `.onSubmit`, while multiline feedback deliberately retains Return for new lines.
+- **Rule:** for keyboard behavior in AppKit-hosted SwiftUI popovers, verify or own the native first
+  responder. Keep the responder local, consume only named keys, and never add an app-wide monitor or
+  Accessibility dependency for a window-local shortcut.

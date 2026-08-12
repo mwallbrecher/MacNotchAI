@@ -1,0 +1,4 @@
+# Generate each value independently; never reuse production secrets in development.
+# openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+VERIFIER_HMAC_SECRET="PASTE_32_RANDOM_BYTES_AS_BASE64URL"
+KEY_WRAP_SECRET="PASTE_ANOTHER_32_RANDOM_BYTES_AS_BASE64URL"

@@ -1,0 +1,12 @@
+{
+  "rules": [
+    {
+      "id": "delete-dragaway-share-payloads-after-two-days",
+      "enabled": true,
+      "conditions": { "prefix": "v2/payloads/" },
+      "deleteObjectsTransition": {
+        "condition": { "type": "Age", "maxAge": 172800 }
+      }
+    }
+  ]
+}

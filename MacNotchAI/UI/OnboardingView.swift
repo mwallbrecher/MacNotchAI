@@ -11,6 +11,7 @@ struct OnboardingView: View {
     @State private var apiKey = ""
     @State private var saved  = false
     @State private var version: Version = .byok
+    @State private var completing = false
 
     private var selectedType: AIProviderType {
         AIProviderType(rawValue: selectedProvider) ?? .groq
@@ -99,6 +100,7 @@ struct OnboardingView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .keyboardShortcut(.defaultAction)
             .padding(.horizontal, 28)
             .padding(.bottom, 28)
             .disabled(ctaDisabled)
@@ -139,6 +141,7 @@ struct OnboardingView: View {
 
                 SecureField(placeholder(for: selectedType), text: $apiKey)
                     .textFieldStyle(.roundedBorder)
+                    .onSubmit(saveAndDismiss)
 
                 HStack {
                     Image(systemName: "lock.fill")
@@ -200,6 +203,7 @@ struct OnboardingView: View {
 
     // ── CTA enablement ──────────────────────────────────────────────
     private var ctaDisabled: Bool {
+        if completing { return true }
         switch version {
         case .free:
             return !hostedAvailable
@@ -209,6 +213,8 @@ struct OnboardingView: View {
     }
 
     private func saveAndDismiss() {
+        guard !ctaDisabled else { return }
+        completing = true
         switch version {
         case .byok:
             let type = selectedType

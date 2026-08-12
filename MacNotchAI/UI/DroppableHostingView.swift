@@ -169,6 +169,9 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
         // writes the real file(s) asynchronously — the session opens on delivery.
         if urls.isEmpty, cachedHasPromise {
             let isMailPromise = cachedIsMailPromise
+            // Begin before invoking either legacy or modern promise APIs: the source may create a
+            // destination file synchronously, before it gives us a URL callback.
+            let promiseLease = DropMaterializer.beginPromisedFileDelivery()
             cachedHasPromise = false
             cachedIsMailPromise = false
             cachedPayload = nil
@@ -204,7 +207,8 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
                     receiveLegacyMailPromises(
                         named: legacyNames,
                         at: dest,
-                        baseline: baseline
+                        baseline: baseline,
+                        promiseLease: promiseLease
                     )
                     return true
                 }
@@ -216,10 +220,12 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
                 receivePromises(
                     receivers,
                     isMailPromise: isMailPromise,
-                    mailBaseline: mailBaseline
+                    mailBaseline: mailBaseline,
+                    promiseLease: promiseLease
                 )
                 return true
             }
+            DropMaterializer.finishPromisedFileDelivery(promiseLease)
             return false
         }
         cachedHasPromise = false
@@ -272,20 +278,23 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
     private func receivePromises(
         _ receivers: [NSFilePromiseReceiver],
         isMailPromise: Bool,
-        mailBaseline: [String: MailFileFingerprint]? = nil
+        mailBaseline: [String: MailFileFingerprint]? = nil,
+        promiseLease: DropMaterializer.PromisedFileDeliveryLease
     ) {
         let dest = DropMaterializer.dropsDirectory()
         if isMailPromise {
             receiveMailPromises(
                 receivers,
                 at: dest,
-                baseline: mailBaseline ?? Self.mailFingerprints(in: dest)
+                baseline: mailBaseline ?? Self.mailFingerprints(in: dest),
+                promiseLease: promiseLease
             )
             return
         }
 
         // Keep the proven Safari / Photos promise route unchanged. Mail is split
         // above because one legacy receiver may invoke its reader more than once.
+        let delivery = GenericPromiseDeliveryState(promiseLease: promiseLease)
         var received: [URL] = []                      // mutated only on the serial queue
         let group = DispatchGroup()
         for receiver in receivers {
@@ -296,11 +305,28 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
                 group.leave()
             }
         }
+        // A broken source must not disable destructive retention until relaunch by never invoking
+        // its completion callback. Thirty seconds is deliberately much longer than the normal
+        // Safari/Photos path. Timeout is an abandonment boundary: late callbacks are never handed
+        // off after their paths may have become eligible for cleanup.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [delivery] in
+            MainActor.assumeIsolated { delivery.timeoutIfStillPending() }
+        }
         group.notify(queue: .main) {
             MainActor.assumeIsolated {
+                guard delivery.claimCompletionBeforeTimeout() else {
+                    // The timed-out source has finally stopped. Never open its potentially deleted
+                    // URLs; simply let normal protected-path-aware retention collect any orphan.
+                    DropMaterializer.sweepRetention()
+                    return
+                }
                 let final = received.map { DropMaterializer.normalizeReceived($0) }
                     .filter { !FileInspector.isUnsupportedFileType($0) }
-                guard !final.isEmpty else { return }
+                guard !final.isEmpty else {
+                    delivery.finishLeaseIfNeeded()
+                    return
+                }
+                DropMaterializer.protectPromisedFilesForHandoff(final)
                 let vm = OverlayViewModel.shared
                 if case .waitingForDrop = vm.stage {
                     NotificationCenter.default.post(name: .radialOpenSession, object: final)
@@ -308,7 +334,9 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
                     withAnimation(.spring(response: 0.36, dampingFraction: 1.0)) {
                         vm.pendingDroppedURLs = final
                     }
+                    DropMaterializer.promisedFilesDidEnterSession(final)
                 }
+                delivery.finishLeaseIfNeeded()
             }
         }
     }
@@ -320,9 +348,10 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
     private func receiveMailPromises(
         _ receivers: [NSFilePromiseReceiver],
         at dest: URL,
-        baseline: [String: MailFileFingerprint]
+        baseline: [String: MailFileFingerprint],
+        promiseLease: DropMaterializer.PromisedFileDeliveryLease
     ) {
-        let state = MailPromiseDeliveryState()
+        let state = MailPromiseDeliveryState(promiseLease: promiseLease)
         let nameSource = MailPromiseNameSource.receivers(receivers)
 
         for receiver in receivers {
@@ -368,9 +397,10 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
     private func receiveLegacyMailPromises(
         named names: [String],
         at dest: URL,
-        baseline: [String: MailFileFingerprint]
+        baseline: [String: MailFileFingerprint],
+        promiseLease: DropMaterializer.PromisedFileDeliveryLease
     ) {
-        let state = MailPromiseDeliveryState()
+        let state = MailPromiseDeliveryState(promiseLease: promiseLease)
         // Mail's legacy method can return display labels with no extension even
         // though it writes subject-named `.eml` files. The label count is useful;
         // the literal labels are not reliable destination paths.
@@ -579,8 +609,12 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
         let batch = state.callbackURLs
         state.callbackURLs.removeAll()
         state.callbackPaths.removeAll()
-        guard !batch.isEmpty else { return }
+        guard !batch.isEmpty else {
+            if state.promiseSourceFinished { finishMailPromiseLease(state) }
+            return
+        }
         deliverMailPromiseURLs(batch, state: state)
+        if state.promiseSourceFinished { finishMailPromiseLease(state) }
     }
 
     private func scheduleMailSafeFlush(
@@ -671,10 +705,26 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
                 } else {
                     // Final bounded recovery pass: deliver any verified remainder,
                     // even if one advertised message never appeared on disk.
-                    self.flushMailCallbackBatch(state: state)
+                    self.completeMailPromiseSource(state)
                 }
+            } else {
+                self.completeMailPromiseSource(state)
             }
         }
+    }
+
+    /// No more promise output is expected after the bounded recovery horizon (or every advertised
+    /// path is already delivered). Flush any coalesced batch first; the lease is released only by
+    /// the actual handoff path, so delayed collapse-safe delivery remains protected.
+    private func completeMailPromiseSource(_ state: MailPromiseDeliveryState) {
+        state.promiseSourceFinished = true
+        flushMailCallbackBatch(state: state)
+    }
+
+    private func finishMailPromiseLease(_ state: MailPromiseDeliveryState) {
+        guard !state.promiseLeaseFinished else { return }
+        state.promiseLeaseFinished = true
+        DropMaterializer.finishPromisedFileDelivery(state.promiseLease)
     }
 
     /// Main-thread, exact-once handoff used only by Apple Mail promise recovery.
@@ -695,12 +745,15 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
         }
         guard !fresh.isEmpty else { return }
 
+        DropMaterializer.protectPromisedFilesForHandoff(fresh)
+
         if case .waitingForDrop = vm.stage {
             NotificationCenter.default.post(name: .radialOpenSession, object: fresh)
         } else {
             withAnimation(.spring(response: 0.36, dampingFraction: 1.0)) {
                 vm.pendingDroppedURLs = vm.pendingDroppedURLs + fresh
             }
+            DropMaterializer.promisedFilesDidEnterSession(fresh)
         }
     }
 
@@ -773,6 +826,47 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
         var batchGeneration = 0
         let startedAt = ProcessInfo.processInfo.systemUptime
         var recoveryObservations: [String: MailFileFingerprint] = [:]
+        let promiseLease: DropMaterializer.PromisedFileDeliveryLease
+        var promiseSourceFinished = false
+        var promiseLeaseFinished = false
+
+        init(promiseLease: DropMaterializer.PromisedFileDeliveryLease) {
+            self.promiseLease = promiseLease
+        }
+    }
+
+    private final class GenericPromiseDeliveryState {
+        private enum Phase {
+            case pending
+            case completing
+            case timedOut
+        }
+
+        let promiseLease: DropMaterializer.PromisedFileDeliveryLease
+        private var leaseFinished = false
+        private var phase: Phase = .pending
+
+        init(promiseLease: DropMaterializer.PromisedFileDeliveryLease) {
+            self.promiseLease = promiseLease
+        }
+
+        func claimCompletionBeforeTimeout() -> Bool {
+            guard case .pending = phase else { return false }
+            phase = .completing
+            return true
+        }
+
+        func timeoutIfStillPending() {
+            guard case .pending = phase else { return }
+            phase = .timedOut
+            finishLeaseIfNeeded()
+        }
+
+        func finishLeaseIfNeeded() {
+            guard !leaseFinished else { return }
+            leaseFinished = true
+            DropMaterializer.finishPromisedFileDelivery(promiseLease)
+        }
     }
 
     private enum MailPromiseNameSource {

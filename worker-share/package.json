@@ -1,0 +1,25 @@
+{
+  "name": "dragaway-share-worker",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "types": "wrangler types worker-configuration.d.ts --env-interface Env",
+    "types:check": "wrangler types worker-configuration.d.ts --env-interface Env --check",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dry-run": "wrangler deploy --dry-run --outdir .wrangler/dist",
+    "check": "npm run types:check && npm run typecheck && npm test && npm run dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.20.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.10",
+    "wrangler": "^4.36.0"
+  },
+  "overrides": {
+    "undici": "^7.29.0"
+  }
+}

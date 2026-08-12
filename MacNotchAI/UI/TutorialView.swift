@@ -308,11 +308,13 @@ struct TutorialView: View {
 
             HStack {
                 Button("Exit Tutorial") { controller.finish() }
+                    .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(step.trigger == nil || controller.stepDone
                        ? (controller.stepIndex == controller.steps.count - 1 ? "Done" : "Next")
                        : "Skip Step") { controller.advance() }
                     .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 24)
             .padding(.top, 10)

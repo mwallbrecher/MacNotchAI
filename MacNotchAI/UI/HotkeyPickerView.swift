@@ -141,6 +141,7 @@ struct HotkeyPickerView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .keyboardShortcut(.defaultAction)
                 .frame(maxWidth: .infinity)
             }
             .padding(.horizontal, 28)
