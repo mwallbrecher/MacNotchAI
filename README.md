@@ -10,6 +10,24 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 
 ---
 
+## What's New in v1.1.6
+
+- **Share sessions with colleagues** — expose the current session and let multiple colleagues open its
+  immutable file snapshot with a six-digit code. Add a password for end-to-end encryption, or revoke an
+  active share at any time.
+- **A much stronger multi-file workspace** — stage, preview, and drag multiple files in one session, and
+  share up to five regular files together. The compact file fan and Finder-style gallery use cached
+  metadata and small thumbnails for smooth interaction.
+- **Launch the latest saved file with `⌃⌘L`** — watch configurable folders for a recent download, export,
+  or save and open the newest supported file directly in Dragaway. The local watcher is independently
+  disableable and needs no Accessibility permission.
+- **Batch image and video compression** — configure and run one compression job across multiple staged
+  images or videos.
+- **Keyboard and dialog polish** — Space and Backspace behave consistently in the file gallery, while
+  Return confirms primary actions throughout Dragaway's native dialogs.
+
+---
+
 ## What's New in v1.1.5
 
 - **Drop complete folders** — Dragaway scans folders locally within strict depth, size, file-count,

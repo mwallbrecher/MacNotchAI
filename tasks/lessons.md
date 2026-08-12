@@ -1375,3 +1375,41 @@
 - **Rule:** for keyboard behavior in AppKit-hosted SwiftUI popovers, verify or own the native first
   responder. Keep the responder local, consume only named keys, and never add an app-wide monitor or
   Accessibility dependency for a window-local shortcut.
+
+### [CAPTURE-01] `NSMetadataQuery` accepts only Spotlight's restricted predicate dialect
+
+- **What was wrong:** the recent-file bootstrap used a general Foundation predicate that compared the
+  content-change-date metadata attribute with `nil`. It compiled, but starting the real Spotlight query
+  raised an `NSInvalidArgumentException` at runtime.
+- **Why:** `NSMetadataQuery` does not support every expression accepted by `NSPredicate`; in particular,
+  a `nil` right-hand side is invalid in Spotlight's query parser.
+- **Fix:** constrain the query with supported filename-extension and visibility predicates, then skip
+  results without a usable change date while reading the returned metadata. A live smoke test now starts
+  the actual query and FSEvents stream instead of treating compilation as sufficient verification.
+- **Rule:** never assume a valid `NSPredicate` is valid for `NSMetadataQuery`. Exercise every Spotlight
+  predicate against a real query, avoid `nil` comparisons, and apply unsupported checks to the results.
+
+### [CAPTURE-02] Unfinished filesystem candidates need ordering, cleanup, and a hard bound
+
+- **What was wrong:** the first recent-file resolver treated every unresolved live path as a blocker,
+  even when that event was older than an already stable file, and kept invalid rename-out paths without
+  an independent size limit.
+- **Why:** “not stable yet” is not sufficient ordering information. A menu-bar process also lives long
+  enough that even small per-event leaks become an unbounded lookup and latency problem.
+- **Fix:** unresolved candidates are capped at 128 and ordered by FSEvent ID. Invalid paths are removed,
+  changing paths receive one bounded retry, and only an unresolved event newer than the best stable
+  candidate may delay opening it. The resolver checks its deadline inside that decision loop.
+- **Rule:** every long-lived event queue needs an explicit bound and terminal cleanup. Pending work may
+  block a fallback only when its logical source order proves that it is actually newer.
+
+### [CAPTURE-03] Bootstrap discovery must not sit in front of an authoritative live source
+
+- **What was wrong:** Spotlight bootstrap filtering could resolve thousands of paths on MainActor, and
+  the resolver waited for the query even after FSEvents had already supplied a valid live candidate.
+- **Why:** metadata APIs can touch iCloud, external, or network-backed storage; compilation and local
+  SSD testing hide that latency. A historical seed is also lower-authority than a post-launch event.
+- **Fix:** query-result snapshots are read in yielded batches, filesystem policy checks run on a
+  cancellable utility task, and valid live work bypasses an in-progress bootstrap. Fully excluded roots
+  are not subscribed at all.
+- **Rule:** keep discovery backfills subordinate to live data, and move all path resolution or metadata
+  validation off the UI actor even when the query API itself must be driven from that actor.

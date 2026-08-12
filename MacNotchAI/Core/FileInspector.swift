@@ -2,6 +2,28 @@ import Foundation
 import NaturalLanguage
 
 struct FileInspector {
+    /// Automatic recent-file capture is intentionally stricter than manual drops. Manual drops keep
+    /// the generic fallback for uncommon formats because the user explicitly chose the file; a
+    /// filesystem watcher must not turn unknown cache/database formats into sessions by accident.
+    nonisolated static let recentFileExtensions: Set<String> = [
+        "pdf", "doc", "docx", "pages", "rtf", "eml", "emlx",
+        "png", "jpg", "jpeg", "heic", "webp", "gif", "tiff",
+        "mp4", "mov", "avi", "mkv", "m4v", "wmv", "flv", "webm",
+        "mp3", "aac", "wav", "flac", "ogg", "m4a", "aiff", "aif",
+        "txt", "text", "md", "markdown", "csv", "tsv", "json", "ndjson", "jsonl",
+        "xml", "yaml", "yml", "toml", "ini", "conf", "cfg", "properties",
+        "log", "html", "htm", "css", "scss", "sass", "less",
+        "js", "mjs", "cjs", "jsx", "ts", "tsx", "swift", "py", "rb", "go", "rs",
+        "java", "kt", "kts", "gradle", "c", "h", "cpp", "cc", "hpp", "hh", "cs",
+        "m", "mm", "php", "sh", "bash", "zsh", "fish", "sql", "r", "lua", "pl",
+        "pm", "dart", "scala", "clj", "ex", "exs", "vue", "svelte", "tex",
+        "srt", "vtt", "gitignore", "b64", "base64",
+    ]
+
+    nonisolated static func isKnownRecentFileType(_ url: URL) -> Bool {
+        recentFileExtensions.contains(url.pathExtension.lowercased())
+    }
+
     /// True for a filesystem directory. Kept separate from extension-based type
     /// classification because dropped folders have no meaningful path extension.
     nonisolated static func isDirectory(_ url: URL) -> Bool {

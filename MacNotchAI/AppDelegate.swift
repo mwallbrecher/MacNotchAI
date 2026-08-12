@@ -32,6 +32,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     private let joinHotkey   = GlobalHotkey()
     /// ⌃⌘N — open a new session from the current clipboard (text / image / files).
     private let sessionHotkey = GlobalHotkey()
+    /// ⌃⌘L — open the newest stable supported file from the user's watched folders.
+    /// Registered only while the feature is enabled so disabling it releases the chord globally.
+    private let recentFileHotkey = GlobalHotkey()
+    /// At most one latest-file resolution may run at a time. The generation prevents a cancelled
+    /// task's deferred cleanup from clearing a newer task installed after a settings change.
+    private var recentFileOpenTask: Task<Void, Never>?
+    private var recentFileOpenGeneration: UInt64 = 0
 
     // ── Dismiss-race protection ───────────────────────────────────────────────
     // When hideOverlay() fires, dismissAnimated() starts a 0.14 s alpha fade.
@@ -105,12 +112,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
 
         // Capture features: ⌃⌘N clipboard→session hotkey + screenshot→session watcher.
         armCaptureFeatures()
+        armRecentFileFeature()
 
         // Session sharing: ⌃⌘E expose / ⌃⌘J join.
         armSharingHotkeys()
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleCaptureSettingsChanged),
             name: .captureSettingsChanged, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleRecentFileSettingsChanged),
+            name: .recentFileSettingsChanged, object: nil
         )
         NotificationCenter.default.addObserver(
             self, selector: #selector(handleShareServiceConfigurationChanged),
@@ -388,8 +400,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // (The Upgrade/Pro line stays hidden until payments are wired.)
         addItem(to: menu, title: "AI Provider",   action: #selector(menuChangeModel))
         addItem(to: menu, title: "Window Size",   action: #selector(menuWindowSize))
-        addItem(to: menu, title: "Custom Prompts", action: #selector(menuCustomPrompts))
-        addItem(to: menu, title: "Favorite Tools", action: #selector(menuFavoriteTools))
+        let customizeItem = NSMenuItem(title: "Customize", action: nil, keyEquivalent: "")
+        let customizeMenu = NSMenu()
+        addItem(to: customizeMenu, title: "Custom Prompts", action: #selector(menuCustomPrompts))
+        addItem(to: customizeMenu, title: "Favorite Tools", action: #selector(menuFavoriteTools))
+        customizeItem.submenu = customizeMenu
+        menu.addItem(customizeItem)
+        addItem(to: menu, title: "Capture Settings", action: #selector(menuCaptureSettings))
         addItem(to: menu, title: "Enhanced Access", action: #selector(menuEnhancedAccess))
         addItem(to: menu, title: "Session Sharing", action: #selector(menuSessionSharing))
 
@@ -598,10 +615,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         track.target = self
         track.state = ClipboardHistoryStore.isEnabled ? .on : .off
         menu.addItem(track)
-
-        // Screenshot→session / ⌃⌘N settings live in their own Settings section.
-        addItem(to: menu, title: "Capture Settings…", action: #selector(menuCaptureSettings))
-        menu.addItem(.separator())
 
         let items = ClipboardHistoryStore.shared.items
         guard !items.isEmpty else {
@@ -1359,6 +1372,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
 
     @objc private func handleCaptureSettingsChanged() { armCaptureFeatures() }
 
+    @objc private func handleRecentFileSettingsChanged() { armRecentFileFeature() }
+
     @objc private func handleShareServiceConfigurationChanged() { armSharingHotkeys() }
 
     /// (Re)arm both capture features from their persisted toggles. Idempotent.
@@ -1379,6 +1394,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         }
     }
 
+    /// Keep the low-idle FSEvents stream and its Carbon hotkey in exact lockstep. When disabled,
+    /// Dragaway neither observes paths nor consumes ⌃⌘L in other applications.
+    private func armRecentFileFeature() {
+        cancelRecentFileOpen()
+
+        guard RecentFileSettings.shared.isEnabled else {
+            recentFileHotkey.unregister()
+            RecentFileWatcher.shared.setShortcutAvailable(false)
+            RecentFileWatcher.shared.stop()
+            return
+        }
+
+        let registered = recentFileHotkey.register(
+            keyCode: UInt32(kVK_ANSI_L),
+            modifiers: UInt32(cmdKey | controlKey)
+        ) { [weak self] in
+            self?.openMostRecentFile()
+        }
+        RecentFileWatcher.shared.setShortcutAvailable(registered)
+
+        guard registered else {
+            RecentFileWatcher.shared.stop()
+            return
+        }
+        RecentFileWatcher.shared.reconfigure()
+    }
+
+    /// ⌃⌘L: resolve the newest stable candidate and reuse the canonical external-file launch path.
+    /// No copy or eager content extraction happens in the watcher itself.
+    private func openMostRecentFile() {
+        guard recentFileOpenTask == nil else { return }
+        recentFileOpenGeneration &+= 1
+        let generation = recentFileOpenGeneration
+
+        recentFileOpenTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.recentFileOpenGeneration == generation {
+                    self.recentFileOpenTask = nil
+                }
+            }
+            guard let url = await RecentFileWatcher.shared.resolveLatestFile() else {
+                if !Task.isCancelled { NSSound.beep() }
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.recentFileOpenGeneration == generation,
+                  RecentFileSettings.shared.isEnabled else { return }
+            self.openSessionWithFiles([url])
+        }
+    }
+
+    private func cancelRecentFileOpen() {
+        recentFileOpenGeneration &+= 1
+        recentFileOpenTask?.cancel()
+        recentFileOpenTask = nil
+    }
+
     /// ⌃⌘N: open a session from whatever the clipboard holds — copied files directly,
     /// anything else (text / link / image) through the same materializer the
     /// drag-anything pipeline uses. Beeps when the clipboard has nothing usable.
@@ -1396,7 +1469,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         openSessionWithFiles(urls)
     }
 
-    @objc private func menuCaptureSettings() { showSettings(section: .clipboard) }
+    @objc private func menuCaptureSettings() { showSettings(section: .capture) }
     @objc private func menuHelp()            { showSettings(section: .help) }
     @objc private func handleShowTutorial()  { showTutorial() }
 
@@ -1937,7 +2010,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         case .outputDirectory: h = 360
         case .scripts:         h = 560
         case .aiProvider:      h = 640
-        case .clipboard:       h = 320
+        case .capture:         h = 640
         case .enhancedAccess:  h = 360
         case .sessionSharing:  h = 360
         case .help:            h = 520
@@ -2043,6 +2116,9 @@ extension Notification.Name {
     static let addFilesFromShare = Notification.Name("com.aidrop.addFilesFromShare")
     static let radialOpenSession = Notification.Name("com.aidrop.radialOpenSession")
     static let captureSettingsChanged = Notification.Name("com.aidrop.captureSettingsChanged")
+    static let recentFileSettingsChanged = Notification.Name(
+        "com.aidrop.recentFileSettingsChanged"
+    )
     static let shareServiceConfigurationChanged = Notification.Name(
         "com.aidrop.shareServiceConfigurationChanged"
     )

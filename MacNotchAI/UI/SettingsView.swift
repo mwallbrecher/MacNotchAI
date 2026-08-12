@@ -5,10 +5,10 @@ import UniformTypeIdentifiers
 
 /// Which slice of the settings to show. The menu-bar dropdown opens the window
 /// scoped to a single setting (`.windowSize` / `.customPrompt` / `.favoriteTools` /
-/// `.aiProvider` / `.enhancedAccess`); the system ⌘, Settings scene still shows
+/// `.aiProvider` / `.capture` / `.enhancedAccess`); the system ⌘, Settings scene still shows
 /// everything (`.all`).
 enum SettingsSection: String {
-    case all, windowSize, customPrompt, favoriteTools, outputDirectory, scripts, aiProvider, clipboard, enhancedAccess, sessionSharing, help
+    case all, windowSize, customPrompt, favoriteTools, outputDirectory, scripts, aiProvider, capture, enhancedAccess, sessionSharing, help
 
     /// Title for the settings window when opened scoped to this section.
     var windowTitle: String {
@@ -20,7 +20,7 @@ enum SettingsSection: String {
         case .outputDirectory: return "Output Directory"
         case .scripts:         return "Scripts"
         case .aiProvider:      return "AI Provider"
-        case .clipboard:       return "Clipboard & Capture"
+        case .capture:         return "Capture Settings"
         case .enhancedAccess:  return "Enhanced Access"
         case .sessionSharing:  return "Session Sharing"
         case .help:            return "Help"
@@ -67,6 +67,8 @@ struct SettingsView: View {
     @ObservedObject private var scriptsStore = ScriptsStore.shared
     @ObservedObject private var modelCatalog = AIModelCatalogStore.shared
     @ObservedObject private var entitlementStore = EntitlementStore.shared
+    @ObservedObject private var recentFileSettings = RecentFileSettings.shared
+    @ObservedObject private var recentFileWatcher = RecentFileWatcher.shared
     @State private var apiKey = ""
     @State private var ollamaAvailable = false
     @State private var saved = false
@@ -151,8 +153,8 @@ struct SettingsView: View {
             }
             }
 
-            if shows(.clipboard) {
-            Section("Clipboard & Capture") {
+            if shows(.capture) {
+            Section("Capture Settings") {
                 VStack(alignment: .leading, spacing: 14) {
                     VStack(alignment: .leading, spacing: 4) {
                         Toggle("Open new screenshots in a session", isOn: $screenshotsToSession)
@@ -183,6 +185,10 @@ struct SettingsView: View {
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+
+                    Divider()
+
+                    recentFileCaptureSettings
                 }
                 .padding(.vertical, 4)
                 .onChange(of: screenshotsToSession) { _, _ in
@@ -334,6 +340,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     helpRow("⌃⌘V",       "Clipboard history picker (last 10)")
                     helpRow("⌃⌘N",       "New session from the current clipboard")
+                    helpRow("⌃⌘L",       "New session from the last saved supported file")
                     if BackendConfig.isSharingAvailable {
                         helpRow("⌃⌘E",   "Expose the current session — share it with a colleague")
                         helpRow("⌃⌘J",   "Join a reusable session with its 6-digit Session ID")
@@ -347,7 +354,7 @@ struct SettingsView: View {
             }
             Section("Where things live") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("• Drag files, text, links, or images onto the notch to start a session.\n• Right-click files in Finder → Quick Actions → “Add to Dragaway”.\n• Utilities tab: local conversions (PDF ⇄ Word/Markdown, images, video) — no upload.\n• Scripts tab: run your own commands on the dropped file.\n• Screenshots → session: Settings → Clipboard & Capture.\n• Recent + Search Sessions: menu bar icon.")
+                    Text("• Drag files, text, links, or images onto the notch to start a session.\n• Right-click files in Finder → Quick Actions → “Add to Dragaway”.\n• Utilities tab: local conversions (PDF ⇄ Word/Markdown, images, video) — no upload.\n• Scripts tab: run your own commands on the dropped file.\n• Screenshots → session: Settings → Capture Settings.\n• Recent + Search Sessions: menu bar icon.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -864,6 +871,218 @@ struct SettingsView: View {
         guard !t.isEmpty else { return }
         promptStore.addCustom(t)
         newCustomPrompt = ""
+    }
+
+    // MARK: - Last saved file
+
+    @ViewBuilder private var recentFileCaptureSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle(
+                    "⌃⌘L — New session from last saved file",
+                    isOn: Binding(
+                        get: { recentFileSettings.isEnabled },
+                        set: { recentFileSettings.setEnabled($0) }
+                    )
+                )
+                Text("Watches only paths and file metadata in the folders below. Content stays unread until you press the shortcut and the normal local session preparation begins. No Accessibility permission is required.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(recentFileStatusColor)
+                    .frame(width: 7, height: 7)
+                Text(recentFileStatusText)
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(recentFileStatusColor)
+                Spacer(minLength: 0)
+            }
+
+            if let latest = recentFileWatcher.latestFileURL {
+                HStack(spacing: 8) {
+                    Image(systemName: recentFileSymbol(for: latest))
+                        .font(.system(size: 20))
+                        .foregroundColor(.accentColor)
+                        .frame(width: 24, height: 24)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(latest.lastPathComponent)
+                            .font(.caption.weight(.medium))
+                            .lineLimit(1)
+                        Text(abbreviatedPath(latest.deletingLastPathComponent().path))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .help(latest.path)
+            }
+
+            recentFolderGroup(
+                title: "Watched folders",
+                folders: recentFileSettings.watchedFolders,
+                emptyText: "No folders — the shortcut will beep until one is added.",
+                addTitle: "Add Folder…",
+                excluded: false
+            )
+
+            recentFolderGroup(
+                title: "Excluded from selection",
+                folders: recentFileSettings.excludedFolders,
+                emptyText: "No exclusions. Exclusions always win over watched folders.",
+                addTitle: "Add Exclusion…",
+                excluded: true
+            )
+
+            HStack {
+                Button("Reset Default Folders") {
+                    recentFileSettings.resetFoldersToDefaults()
+                }
+                .controlSize(.small)
+                Spacer()
+                Text("Known credential names such as credentials.json are ignored; exclude sensitive folders explicitly.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.trailing)
+            }
+        }
+    }
+
+    private var recentFileStatusText: String {
+        if !recentFileSettings.isEnabled { return "Off — no watcher and no global shortcut" }
+        if !recentFileWatcher.isShortcutAvailable { return "Shortcut unavailable — ⌃⌘L is in use" }
+        if recentFileSettings.watchedFolders.isEmpty { return "No watched folders — add one below" }
+        if !hasEffectiveRecentFileRoot { return "All watched folders are excluded" }
+        if recentFileWatcher.isWatching {
+            return recentFileWatcher.latestFileURL == nil
+                ? "Watching — no supported file found yet"
+                : "Watching — latest supported file"
+        }
+        return "No available watched folder"
+    }
+
+    private var recentFileStatusColor: Color {
+        if recentFileSettings.isEnabled, !recentFileWatcher.isShortcutAvailable { return .orange }
+        if recentFileSettings.watchedFolders.isEmpty || !hasEffectiveRecentFileRoot {
+            return .secondary
+        }
+        return recentFileWatcher.isWatching ? .green : .secondary
+    }
+
+    private var hasEffectiveRecentFileRoot: Bool {
+        recentFileSettings.watchedFolders.contains {
+            recentFileSettings.contains($0.path)
+        }
+    }
+
+    @ViewBuilder
+    private func recentFolderGroup(
+        title: String,
+        folders: [URL],
+        emptyText: String,
+        addTitle: String,
+        excluded: Bool
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(.secondary)
+
+            if folders.isEmpty {
+                Text(emptyText)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(folders, id: \.path) { folder in
+                    HStack(spacing: 7) {
+                        Image(systemName: excluded ? "folder.badge.minus" : "folder")
+                            .foregroundColor(excluded ? .orange : .accentColor)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(folder.lastPathComponent)
+                                .font(.caption.weight(.medium))
+                                .lineLimit(1)
+                            Text(abbreviatedPath(folder.path))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        Spacer(minLength: 4)
+                        Button {
+                            if excluded {
+                                recentFileSettings.removeExcludedFolder(folder)
+                            } else {
+                                recentFileSettings.removeWatchedFolder(folder)
+                            }
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove \(folder.lastPathComponent)")
+                    }
+                    .help(folder.path)
+                }
+            }
+
+            Button {
+                chooseRecentFolders(excluded: excluded)
+            } label: {
+                Label(addTitle, systemImage: "plus")
+            }
+            .controlSize(.small)
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.secondary.opacity(0.07))
+        )
+    }
+
+    private func chooseRecentFolders(excluded: Bool) {
+        let panel = NSOpenPanel()
+        panel.title = excluded ? "Choose folders to exclude" : "Choose folders to watch"
+        panel.prompt = excluded ? "Exclude" : "Watch"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = true
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        if panel.runModal() == .OK {
+            if excluded {
+                recentFileSettings.addExcludedFolders(panel.urls)
+            } else {
+                recentFileSettings.addWatchedFolders(panel.urls)
+            }
+        }
+    }
+
+    private func abbreviatedPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path == home { return "~" }
+        if RecentFileSettings.contains(root: home, path: path) {
+            return "~" + String(path.dropFirst(home.count))
+        }
+        return path
+    }
+
+    private func recentFileSymbol(for url: URL) -> String {
+        let ext = url.pathExtension.lowercased()
+        if ["png", "jpg", "jpeg", "heic", "webp", "gif", "tiff"].contains(ext) {
+            return "photo"
+        }
+        if ["mp4", "mov", "avi", "mkv", "m4v", "wmv", "flv", "webm"].contains(ext) {
+            return "film"
+        }
+        if ["mp3", "aac", "wav", "flac", "ogg", "m4a", "aiff", "aif"].contains(ext) {
+            return "waveform"
+        }
+        if ["eml", "emlx"].contains(ext) { return "envelope" }
+        if ext == "pdf" { return "doc.richtext" }
+        return "doc.text"
     }
 
     // MARK: - Scripts section
