@@ -21,7 +21,21 @@ import Combine
 // MARK: - Event model
 
 enum SignalKind: String, Codable {
-    case clipboard, appFocus, scrollBurst, dwell, selection
+    case clipboard, appFocus, scrollBurst, dwell, selection, activity
+}
+
+/// The participant went idle or came back (ActivityMonitor). Carries NO evidence —
+/// it is segmentation metadata, so that analysis can separate work time from
+/// awake-but-untouched time, and so `dense_dwell` can be told apart from "away from
+/// the desk" after the fact.
+struct ActivityPayload: Codable {
+    /// Lifecycle/segmentation state. Current writers use `inactive`,
+    /// `extended_inactivity`, `active`, `paused`, `resumed`, `sleep`, and `wake`.
+    /// Kept as a String so future markers remain backwards-compatible.
+    let state: String
+    /// For "idle": how long input had already been absent when we noticed.
+    /// For "active": how long the idle span that just ended lasted.
+    let seconds: Double
 }
 
 /// A copy/cut landed on the general pasteboard. Content is classified and discarded.
@@ -79,6 +93,9 @@ struct AppFocusPayload: Codable {
     let previousBundleID: String?
     /// How long the previous app held focus.
     let secondsInPrevious: Double?
+    /// `activated` is a real switch, `baseline` opens a capture segment, and
+    /// `segment_end` closes one at a lifecycle boundary. Nil means a legacy switch.
+    var transition: String? = nil
 }
 
 /// A contiguous scroll gesture (events closer than 0.8 s), aggregated at burst end.
@@ -92,7 +109,8 @@ struct ScrollBurstPayload: Codable {
 }
 
 /// The mouse was stationary for at least 10 s (emitted when movement resumes).
-/// Mouse-quiet conflates reading and typing; disambiguation comes with AX (M2).
+/// Mouse-quiet is emitted only when the OS reports no key-down during the interval;
+/// it remains coarse context rather than proof that the participant was reading.
 struct DwellPayload: Codable {
     let app: String?
     let seconds: Double
@@ -102,14 +120,105 @@ struct DwellPayload: Codable {
 /// Flat optional payloads (rather than an enum with associated values) keep the
 /// JSONL schema forgiving: unknown/extra fields never break a decode.
 struct SignalEvent: Codable {
-    /// Event time (epoch seconds). THE timestamp — never use Date() downstream.
+    /// Ordering/decay timestamp. Live initialisers use process uptime; legacy/replayed
+    /// events retain their recorded `t` unchanged.
     let t: TimeInterval
     let kind: SignalKind
+    /// Explicit dual-clock capture. Nil only when decoding legacy v1/v2 traces.
+    let wallTime: TimeInterval?
+    let uptime: TimeInterval?
+    let sessionID: String?
+    let processID: Int32?
+    let clockDiscontinuity: MonotonicClock.Discontinuity?
     var clipboard: ClipboardPayload? = nil
     var appFocus: AppFocusPayload? = nil
     var scroll: ScrollBurstPayload? = nil
     var dwell: DwellPayload? = nil
     var selection: SelectionPayload? = nil
+    var activity: ActivityPayload? = nil
+
+    /// Explicit timestamp construction for golden checks, synthetic traces, and
+    /// compatibility code. It preserves `t` exactly and intentionally has no live
+    /// process-clock metadata. Runtime producers must use `live(...)` below.
+    init(t: TimeInterval, kind: SignalKind,
+         clipboard: ClipboardPayload? = nil,
+         appFocus: AppFocusPayload? = nil,
+         scroll: ScrollBurstPayload? = nil,
+         dwell: DwellPayload? = nil,
+         selection: SelectionPayload? = nil,
+         activity: ActivityPayload? = nil) {
+        self.t = t
+        self.kind = kind
+        self.wallTime = nil
+        self.uptime = nil
+        self.sessionID = nil
+        self.processID = nil
+        self.clockDiscontinuity = nil
+        self.clipboard = clipboard
+        self.appFocus = appFocus
+        self.scroll = scroll
+        self.dwell = dwell
+        self.selection = selection
+        self.activity = activity
+    }
+
+    /// Runtime construction from one and only one dual-clock observation. `t` and
+    /// `uptime` are therefore identical, while wall time and any discontinuity belong
+    /// to that exact same signal snapshot.
+    static func live(kind: SignalKind,
+                     clipboard: ClipboardPayload? = nil,
+                     appFocus: AppFocusPayload? = nil,
+                     scroll: ScrollBurstPayload? = nil,
+                     dwell: DwellPayload? = nil,
+                     selection: SelectionPayload? = nil,
+                     activity: ActivityPayload? = nil) -> SignalEvent {
+        let stamp = MonotonicClock.stamp()
+        return SignalEvent(stamp: stamp, kind: kind, clipboard: clipboard,
+                           appFocus: appFocus, scroll: scroll, dwell: dwell,
+                           selection: selection, activity: activity)
+    }
+
+    private init(stamp: MonotonicClock.Stamp, kind: SignalKind,
+                 clipboard: ClipboardPayload?, appFocus: AppFocusPayload?,
+                 scroll: ScrollBurstPayload?, dwell: DwellPayload?,
+                 selection: SelectionPayload?, activity: ActivityPayload?) {
+        t = stamp.uptime
+        self.kind = kind
+        wallTime = stamp.wallTime
+        uptime = stamp.uptime
+        sessionID = stamp.sessionID
+        processID = stamp.processID
+        clockDiscontinuity = stamp.discontinuity
+        self.clipboard = clipboard
+        self.appFocus = appFocus
+        self.scroll = scroll
+        self.dwell = dwell
+        self.selection = selection
+        self.activity = activity
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case t, kind, wallTime, uptime, sessionID, processID, clockDiscontinuity
+        case clipboard, appFocus, scroll, dwell, selection, activity
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        t = try c.decode(TimeInterval.self, forKey: .t)
+        kind = try c.decode(SignalKind.self, forKey: .kind)
+        wallTime = try c.decodeIfPresent(TimeInterval.self, forKey: .wallTime)
+        uptime = try c.decodeIfPresent(TimeInterval.self, forKey: .uptime)
+        sessionID = try c.decodeIfPresent(String.self, forKey: .sessionID)
+        processID = try c.decodeIfPresent(Int32.self, forKey: .processID)
+        clockDiscontinuity = try c.decodeIfPresent(MonotonicClock.Discontinuity.self,
+                                                    forKey: .clockDiscontinuity)
+        clipboard = try c.decodeIfPresent(ClipboardPayload.self, forKey: .clipboard)
+        appFocus = try c.decodeIfPresent(AppFocusPayload.self, forKey: .appFocus)
+        scroll = try c.decodeIfPresent(ScrollBurstPayload.self, forKey: .scroll)
+        dwell = try c.decodeIfPresent(DwellPayload.self, forKey: .dwell)
+        selection = try c.decodeIfPresent(SelectionPayload.self, forKey: .selection)
+        activity = try c.decodeIfPresent(ActivityPayload.self, forKey: .activity)
+    }
 }
 
 // MARK: - SignalBus
@@ -128,8 +237,32 @@ final class SignalBus {
     private let windowSeconds: TimeInterval = 120
     private let capacity = 600
     private var lastPublishedT: TimeInterval = -.infinity
+    /// `PassthroughSubject.send` is synchronous and permits re-entrant sends. Without
+    /// this queue, subscriber A can publish a newer event while subscriber B has not
+    /// received the outer event yet, so B observes t2 before t1. That is fatal for the
+    /// append-only trace. One outer publisher therefore drains every nested publish in
+    /// strict FIFO order only after all subscribers saw the preceding event.
+    private var pendingEvents: [SignalEvent] = []
+    private var isDrainingEvents = false
 
     func publish(_ event: SignalEvent) {
+        pendingEvents.append(event)
+        guard !isDrainingEvents else { return }
+
+        isDrainingEvents = true
+        defer {
+            pendingEvents.removeAll(keepingCapacity: true)
+            isDrainingEvents = false
+        }
+
+        var index = 0
+        while index < pendingEvents.count {
+            deliver(pendingEvents[index])
+            index += 1
+        }
+    }
+
+    private func deliver(_ event: SignalEvent) {
 #if DEBUG
         // Monotonicity tripwire: sensors stamp at publish time, so time can never
         // run backwards on the bus. If this prints, a sensor regressed to stamping
@@ -151,6 +284,33 @@ final class SignalBus {
         events.send(event)
     }
 
+#if THESIS_STUDY_BUILD
+    /// Isolated deterministic seam used by the Study golden checks. The second sink
+    /// represents the recorder: it must see the outer event before a nested publish.
+    static func reentrantDeliveryCheckForTesting() -> Bool {
+        let bus = SignalBus()
+        var firstSink: [TimeInterval] = []
+        var recorderSink: [TimeInterval] = []
+        var subscriptions: [AnyCancellable] = []
+
+        subscriptions.append(bus.events.sink { event in
+            firstSink.append(event.t)
+            if event.t == 1 {
+                bus.publish(SignalEvent(t: 2, kind: .activity,
+                                        activity: ActivityPayload(state: "active", seconds: 0)))
+            }
+        })
+        subscriptions.append(bus.events.sink { recorderSink.append($0.t) })
+        bus.publish(SignalEvent(t: 1, kind: .activity,
+                                activity: ActivityPayload(state: "active", seconds: 0)))
+
+        return firstSink == [1, 2]
+            && recorderSink == [1, 2]
+            && bus.buffer.map(\.t) == [1, 2]
+            && subscriptions.count == 2
+    }
+#endif
+
     /// Full wipe — required before replaying a trace: stale live events carry
     /// timestamps FAR ahead of the recorded timeline and would corrupt windowing.
     func reset() {
@@ -170,5 +330,27 @@ final class SignalBus {
 protocol IntentSensor: AnyObject {
     var name: String { get }
     func start(bus: SignalBus)
+    /// Attach to the bus without emitting or arming an event source. Used when a
+    /// persisted participant pause survives relaunch.
+    func startSuspended(bus: SignalBus)
     func stop()
+
+    /// Pause periodic work while the participant is away (ActivityMonitor). Distinct
+    /// from `stop()`: the sensor keeps its state and its subscription, it just stops
+    /// spending wake-ups on a machine nobody is using. Event-driven sensors need no
+    /// implementation — hence the default no-ops.
+    func suspend()
+    func resume()
+}
+
+extension IntentSensor {
+    func startSuspended(bus: SignalBus) {
+        start(bus: bus)
+        suspend()
+    }
+}
+
+extension IntentSensor {
+    func suspend() {}
+    func resume() {}
 }

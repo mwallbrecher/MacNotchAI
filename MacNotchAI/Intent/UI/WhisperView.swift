@@ -36,7 +36,7 @@ final class WhisperWindow: NSPanel {
     func place(size: CGSize) {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let x = screen.frame.midX - size.width / 2
-        let y = screen.frame.height - 37 - size.height
+        let y = screen.frame.maxY - 37 - size.height
         setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: false)
     }
 }
@@ -46,6 +46,10 @@ final class WhisperWindow: NSPanel {
 enum WhisperContent {
     case suggestion(IntentSuggestion)
     case ticker([TickerRow])
+    /// Experience sampling immediately after an interaction (M5, study builds).
+    case prompt(InSituPrompt)
+    /// One-time card teaching the summon hotkey (E2).
+    case hint
 }
 
 struct TickerRow: Identifiable {
@@ -54,8 +58,43 @@ struct TickerRow: Identifiable {
     let probability: Double
     /// One-line "why": the strongest evidence contributions, humanised.
     let evidenceLine: String
-    /// Only translation rows are actionable in M3.
+    /// Every class resolves since the summon channel became the MVP; nil only when
+    /// there is genuinely nothing actionable in front of the user.
     let suggestion: IntentSuggestion?
+}
+
+/// The three questions asked right after an affordance interaction.
+///
+/// Two measure EXPERIENCE — the wanted-versus-intrusive distinction that replaced
+/// "would you have used it?", and the thing the reframed research question actually
+/// turns on. The third measures CONTEXT, and it is what makes every affordance event
+/// self-interpreting: without it, an event in a fortnight of continuous capture cannot
+/// be told apart from an hour of video watching, and summon rates lose their
+/// denominator.
+struct InSituPrompt {
+    enum Stage { case assessment, intrusive, context }
+    enum FirstQuestion: String {
+        case suggestionRelevant = "suggestion_relevant"
+        case resultUseful = "result_useful"
+    }
+
+    let interactionID: UUID
+    let channel: AffordanceChannel
+    let rank: Int
+    let intentClass: IntentClass
+    let action: String
+    /// What the participant did with the suggestion ("accepted" / "dismissed").
+    let outcome: String
+    /// A completed provider turn asks about the result. A dismissal or technical
+    /// failure asks only whether the suggestion itself was relevant/wanted.
+    let firstQuestion: FirstQuestion
+
+    var stage: Stage = .assessment
+    var firstAnswer: Bool?
+    var intrusive: Bool?
+
+    static let contextOptions = ["Reading / research", "Writing", "Email / messages",
+                                 "Admin / organising", "Something else"]
 }
 
 // MARK: - Views
@@ -65,48 +104,50 @@ struct WhisperSuggestionView: View {
     let onAccept: () -> Void
     let onDismiss: () -> Void
     let onHover: (Bool) -> Void
+    @Environment(\.uiScale) private var scale
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 10 * scale) {
             Image(systemName: "globe")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: 14 * scale, weight: .semibold))
                 .foregroundColor(.white.opacity(0.85))
 
             Text(suggestion.phrase)
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: 13 * scale, weight: .medium))
                 .foregroundColor(.white)
                 .lineLimit(1)
 
-            Spacer(minLength: 4)
+            Spacer(minLength: 4 * scale)
 
             Button(action: onAccept) {
-                HStack(spacing: 5) {
-                    Text("Translate")
-                        .font(.system(size: 12, weight: .semibold))
+                HStack(spacing: 5 * scale) {
+                    Text(suggestion.action.rawValue)
+                        .font(.system(size: 12 * scale, weight: .semibold))
                     Text("⌥⏎")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .padding(.horizontal, 4).padding(.vertical, 1.5)
-                        .background(RoundedRectangle(cornerRadius: 4).fill(.white.opacity(0.18)))
+                        .font(.system(size: 10 * scale, weight: .semibold, design: .monospaced))
+                        .padding(.horizontal, 4 * scale).padding(.vertical, 1.5 * scale)
+                        .background(RoundedRectangle(cornerRadius: 4 * scale)
+                            .fill(.white.opacity(0.18)))
                 }
                 .foregroundColor(.white)
-                .padding(.horizontal, 10).padding(.vertical, 5)
+                .padding(.horizontal, 10 * scale).padding(.vertical, 5 * scale)
                 .background(Capsule().fill(Color.accentColor.opacity(0.85)))
             }
             .buttonStyle(.plain)
 
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
+                    .font(.system(size: 10 * scale, weight: .bold))
                     .foregroundColor(.white.opacity(0.55))
-                    .frame(width: 22, height: 22)
+                    .frame(width: 22 * scale, height: 22 * scale)
                     .contentShape(Circle())
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 14).padding(.vertical, 9)
+        .padding(.horizontal, 14 * scale).padding(.vertical, 9 * scale)
         .background(
             Capsule().fill(Color.black.opacity(0.92))
-                .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+                .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1 * scale))
         )
         .onHover(perform: onHover)
     }
@@ -116,72 +157,85 @@ struct WhisperTickerView: View {
     let rows: [TickerRow]
     let onAccept: (IntentSuggestion) -> Void
     let onClose: () -> Void
+    @Environment(\.uiScale) private var scale
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8 * scale) {
             HStack {
                 Text("Current intent estimates")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 11 * scale, weight: .semibold))
                     .foregroundColor(.white.opacity(0.55))
                 Spacer()
                 Button(action: onClose) {
                     Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
+                        .font(.system(size: 9 * scale, weight: .bold))
                         .foregroundColor(.white.opacity(0.5))
                 }
                 .buttonStyle(.plain)
             }
 
             ForEach(rows) { row in
-                HStack(spacing: 10) {
-                    Text(label(for: row.intentClass))
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white)
-                        .frame(width: 108, alignment: .leading)
-
-                    // Honest calibrated confidence — a bar, not a verdict.
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(.white.opacity(0.12))
-                            Capsule().fill(Color.accentColor.opacity(0.85))
-                                .frame(width: max(3, geo.size.width * row.probability))
-                        }
-                    }
-                    .frame(height: 6)
-
-                    Text(String(format: "%.0f%%", row.probability * 100))
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.85))
-                        .frame(width: 34, alignment: .trailing)
-
-                    if let s = row.suggestion {
-                        Button("Go") { onAccept(s) }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 11, weight: .semibold))
+                VStack(alignment: .leading, spacing: 4 * scale) {
+                    HStack(spacing: 10 * scale) {
+                        Text(label(for: row.intentClass))
+                            .font(.system(size: 12 * scale, weight: .medium))
                             .foregroundColor(.white)
-                            .padding(.horizontal, 8).padding(.vertical, 3)
-                            .background(Capsule().fill(Color.accentColor.opacity(0.85)))
-                    } else {
-                        Text("—")
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.3))
-                            .frame(width: 26)
+                            .frame(width: 108 * scale, alignment: .leading)
+
+                        // Model estimate — a bar, not a verdict. Empirical calibration
+                        // is an analysis target, not a property claimed by this build.
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(.white.opacity(0.12))
+                                Capsule().fill(Color.accentColor.opacity(0.85))
+                                    .frame(width: max(3 * scale,
+                                                      geo.size.width * row.probability))
+                            }
+                        }
+                        .frame(height: 6 * scale)
+
+                        Text(String(format: "%.0f%%", row.probability * 100))
+                            .font(.system(size: 11 * scale, weight: .semibold,
+                                          design: .monospaced))
+                            .foregroundColor(.white.opacity(0.85))
+                            .frame(width: 34 * scale, alignment: .trailing)
                     }
+
+                    if let suggestion = row.suggestion {
+                        Button(action: { onAccept(suggestion) }) {
+                            HStack(spacing: 5 * scale) {
+                                Image(systemName: suggestion.action.icon)
+                                Text(suggestion.action.rawValue)
+                                Text("· \(suggestion.phrase)")
+                                    .foregroundColor(.white.opacity(0.6))
+                                    .lineLimit(1)
+                            }
+                        }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11 * scale, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 9 * scale).padding(.vertical, 4 * scale)
+                            .background(RoundedRectangle(cornerRadius: 6 * scale)
+                                .fill(Color.accentColor.opacity(0.72)))
+                    } else {
+                        Text("No current, verifiable source")
+                            .font(.system(size: 10 * scale))
+                            .foregroundColor(.white.opacity(0.38))
+                    }
+                    Text(row.evidenceLine)
+                        .font(.system(size: 10 * scale))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(1)
                 }
-                Text(row.evidenceLine)
-                    .font(.system(size: 10))
-                    .foregroundColor(.white.opacity(0.45))
-                    .lineLimit(1)
-                    .padding(.leading, 2)
             }
         }
-        .padding(14)
-        .frame(width: 420, alignment: .leading)
+        .padding(14 * scale)
+        .frame(width: 480 * scale, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
                 .fill(Color.black.opacity(0.92))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(.white.opacity(0.12), lineWidth: 1))
+                .overlay(RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                    .strokeBorder(.white.opacity(0.12), lineWidth: 1 * scale))
         )
     }
 
@@ -191,5 +245,140 @@ struct WhisperTickerView: View {
         case .comprehension: return "Comprehension"
         case .discovery:     return "Discovery"
         }
+    }
+}
+
+// MARK: - In-situ prompt (experience sampling, M5)
+
+/// Three one-tap questions on the same non-activating surface as the whisper.
+///
+/// One question at a time, deliberately. A three-part form is a task; a single
+/// yes/no that replaces itself is a reflex — and the whole point of sampling in
+/// situ rather than at the exit interview is to catch the reaction before it turns
+/// into a considered account.
+///
+/// Skipping is always one click away and is RECORDED as a skip rather than silently
+/// dropped: which moments people decline to rate is itself data, and treating a
+/// non-answer as missing-at-random would quietly bias the intrusiveness measure.
+struct WhisperPromptView: View {
+    let prompt: InSituPrompt
+    let onAnswerYesNo: (Bool) -> Void
+    let onAnswerContext: (String) -> Void
+    let onSkip: () -> Void
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10 * scale) {
+            HStack {
+                Text(question)
+                    .font(.system(size: 12 * scale, weight: .medium))
+                    .foregroundColor(.white)
+                Spacer()
+                Button(action: onSkip) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9 * scale, weight: .bold))
+                        .foregroundColor(.white.opacity(0.5))
+                }
+                .buttonStyle(.plain)
+                .help("Skip")
+            }
+
+            switch prompt.stage {
+            case .assessment, .intrusive:
+                HStack(spacing: 8 * scale) {
+                    pill("Yes")  { onAnswerYesNo(true) }
+                    pill("No")   { onAnswerYesNo(false) }
+                    Spacer()
+                }
+            case .context:
+                // Wraps: five options do not fit one row at this width.
+                VStack(alignment: .leading, spacing: 6 * scale) {
+                    ForEach(Array(InSituPrompt.contextOptions.enumerated()), id: \.offset) { _, option in
+                        pill(option) { onAnswerContext(option) }
+                    }
+                }
+            }
+        }
+        .padding(14 * scale)
+        .frame(width: 380 * scale, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                .fill(Color.black.opacity(0.92))
+                .overlay(RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                    .strokeBorder(.white.opacity(0.12), lineWidth: 1 * scale))
+        )
+    }
+
+    private var question: String {
+        switch prompt.stage {
+        case .assessment:
+            return prompt.firstQuestion == .resultUseful
+                ? "Was the AI result useful?"
+                : "Was that suggestion relevant or wanted?"
+        case .intrusive: return "Did it feel intrusive?"
+        case .context:   return "What were you doing just now?"
+        }
+    }
+
+    private func pill(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11 * scale, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 10 * scale).padding(.vertical, 4 * scale)
+                .background(Capsule().fill(.white.opacity(0.14)))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Summon hint (E2, discoverability)
+
+/// Shown once, right after consent, on the surface where suggestions will actually
+/// appear — so the hotkey is learned in the place it pays off rather than in a
+/// settings pane the participant will never revisit.
+///
+/// Discoverability is risk 1 of the pivot: a summon hotkey nobody knows about is a
+/// feature nobody uses, and then the guarantee the thesis rests on evaporates.
+struct WhisperHintView: View {
+    let onClose: () -> Void
+    @Environment(\.uiScale) private var scale
+
+    var body: some View {
+        HStack(spacing: 12 * scale) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 15 * scale))
+                .foregroundColor(.white.opacity(0.8))
+
+            VStack(alignment: .leading, spacing: 3 * scale) {
+                Text("Press ⌃⌥⌘I whenever you want help")
+                    .font(.system(size: 12 * scale, weight: .semibold))
+                    .foregroundColor(.white)
+                Text("Dragaway shows what it would suggest for whatever you're looking at. "
+                   + "Nothing happens unless you pick something.")
+                    .font(.system(size: 11 * scale))
+                    .foregroundColor(.white.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 4 * scale)
+
+            Button(action: onClose) {
+                Text("Got it")
+                    .font(.system(size: 11 * scale, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10 * scale).padding(.vertical, 4 * scale)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.85)))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14 * scale)
+        .frame(width: 460 * scale, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                .fill(Color.black.opacity(0.92))
+                .overlay(RoundedRectangle(cornerRadius: 14 * scale, style: .continuous)
+                    .strokeBorder(.white.opacity(0.12), lineWidth: 1 * scale))
+        )
     }
 }

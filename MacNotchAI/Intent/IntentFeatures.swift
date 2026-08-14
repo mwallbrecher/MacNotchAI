@@ -82,11 +82,41 @@ final class FeatureExtractor {
         let langConfidence: Double?
         let source: String?
         let shape: String
+        let charCount: Int
     }
     private(set) var translationCandidate: ClipCandidate?
+
+    /// Newest text copy of ANY language — the object the comprehension and discovery
+    /// suggestions act on. `translationCandidate` is deliberately kept separate: it
+    /// only tracks FOREIGN copies, because translation is the one class whose evidence
+    /// is the foreignness itself.
+    private(set) var latestTextCandidate: ClipCandidate?
+
+    /// Fresh resolver accessors deliberately take event time. The extractor may sit
+    /// idle for minutes after its last bus event; relying on `handle` to trim would let
+    /// stale clipboard metadata live forever merely because nothing else happened.
+    func translationCandidate(at t: TimeInterval) -> ClipCandidate? {
+        trim(before: t)
+        guard let candidate = translationCandidate, candidate.t <= t else { return nil }
+        return candidate
+    }
+
+    func latestTextCandidate(at t: TimeInterval) -> ClipCandidate? {
+        trim(before: t)
+        guard let candidate = latestTextCandidate, candidate.t <= t else { return nil }
+        return candidate
+    }
+
+    /// Distinct things copied inside the collect window. Discovery only makes sense
+    /// once the participant has gathered more than one fresh source.
+    func distinctRecentCopies(at t: TimeInterval) -> Int {
+        trim(before: t)
+        return copies.filter { $0.t <= t }.count
+    }
+
     private var copies: [Copy] = []                                  // 90 s window
     private var bursts: [(t: TimeInterval, app: String?, net: Double, flips: Int)] = []  // 60 s
-    private var selections: [(t: TimeInterval, docID: String)] = []  // 60 s
+    private var selections: [(t: TimeInterval, docID: String, hash: String)] = []  // 60 s
 
     func handle(_ event: SignalEvent) {
         trim(before: event.t)
@@ -96,18 +126,43 @@ final class FeatureExtractor {
         case .scrollBurst: if let p = event.scroll { onScrollBurst(p, t: event.t) }
         case .dwell:       if let p = event.dwell { onDwell(p, t: event.t) }
         case .selection:   if let p = event.selection { onSelection(p, t: event.t) }
+        // Segmentation metadata only — an idle span is not evidence of any intent.
+        // It exists so the ANALYSIS can separate work from absence (and reading from
+        // away-from-desk); feeding it to detectors would invent signal from silence.
+        case .activity:    break
         }
     }
 
     func reset() {
         copies = []; bursts = []; selections = []
         translationCandidate = nil
+        latestTextCandidate = nil
+    }
+
+    /// A pause/stop must not leave an actionable raw-object alias behind. Detector
+    /// history may remain for longitudinal scoring; only resolver-facing candidates
+    /// are invalidated so the next action requires a newly observed copy.
+    func clearResolverCandidates() {
+        translationCandidate = nil
+        latestTextCandidate = nil
     }
 
     private func trim(before t: TimeInterval) {
         copies.removeAll { $0.t < t - 90 }
         bursts.removeAll { $0.t < t - 60 }
         selections.removeAll { $0.t < t - 60 }
+
+        // Resolver caches are aliases into the 90-second copy window, not a second
+        // unbounded history. Clear them as soon as their exact observation expires or
+        // has been replaced by a newer copy of the same hash.
+        if let candidate = translationCandidate,
+           !copies.contains(where: { $0.hash == candidate.hash && $0.t == candidate.t }) {
+            translationCandidate = nil
+        }
+        if let candidate = latestTextCandidate,
+           !copies.contains(where: { $0.hash == candidate.hash && $0.t == candidate.t && $0.isText }) {
+            latestTextCandidate = nil
+        }
     }
 
     // MARK: Clipboard → foreign_language_clip · format_mismatch(arm) · collect_mode · topic_coherence
@@ -128,6 +183,13 @@ final class FeatureExtractor {
         }
         copies.append(entry)
 
+        if p.contentClass == "text" {
+            latestTextCandidate = ClipCandidate(
+                t: t, hash: p.hashPrefix, language: p.language,
+                langConfidence: p.langConfidence, source: p.sourceApp, shape: p.shape,
+                charCount: p.charCount)
+        }
+
         if p.isForeignLanguage {
             // Strength: language confidence × snippet-length band (40–2000 chars is
             // the "worth translating" sweet spot — ARCHITECTURE §5 worked example).
@@ -136,7 +198,8 @@ final class FeatureExtractor {
                            strength: (p.langConfidence ?? 0.8) * band, t: t))
             translationCandidate = ClipCandidate(
                 t: t, hash: p.hashPrefix, language: p.language,
-                langConfidence: p.langConfidence, source: p.sourceApp, shape: p.shape)
+                langConfidence: p.langConfidence, source: p.sourceApp, shape: p.shape,
+                charCount: p.charCount)
         }
 
         detectCollectMode(t: t)
@@ -144,10 +207,11 @@ final class FeatureExtractor {
 
     private func detectCollectMode(t: TimeInterval) {
         let recent = copies.filter { $0.t > t - 90 }
-        let sources = Set(recent.compactMap(\.source))
-        guard recent.count >= 3, sources.count >= 2 else { return }
+        guard recent.count >= 3 else { return }
 
-        // ≥3 distinct copies from ≥2 sources in 90 s ⇒ the user is collecting.
+        // ≥3 distinct copies in 90 s ⇒ the user is collecting. Bundle IDs are not
+        // source identities: three browser tabs are three sources but share one bundle.
+        // The source app remains in the raw event for an offline sensitivity analysis.
         emit?(Evidence(feature: .collectMode,
                        strength: min(1.0, 0.5 + 0.25 * Double(recent.count - 3)), t: t))
 
@@ -156,12 +220,21 @@ final class FeatureExtractor {
         // Only COMPARABLE pairs count: cross-language pairs (different NLEmbedding
         // dimensions) return nil and are skipped — never averaged in as a spurious
         // 0, which would falsely read a bilingual research session as incoherent.
-        let vectors = recent.compactMap(\.embedding).suffix(4)
+        let vectors = recent.compactMap { copy -> (language: String, vector: [Double])? in
+            guard let vector = copy.embedding, let language = copy.language else { return nil }
+            return (String(language.prefix(2)).lowercased(), vector)
+        }.suffix(4)
         guard vectors.count >= 2 else { return }
         var sims: [Double] = []
         for i in vectors.indices {
             for j in vectors.indices where j > i {
-                if let c = IntentText.cosine(vectors[i], vectors[j]) { sims.append(c) }
+                // Apple's sentence embeddings are language-specific coordinate spaces,
+                // even when their dimensions happen to match. Compare only like with
+                // like until a multilingual aligned backbone is actually shipped.
+                guard vectors[i].language == vectors[j].language else { continue }
+                if let c = IntentText.cosine(vectors[i].vector, vectors[j].vector) {
+                    sims.append(c)
+                }
             }
         }
         guard !sims.isEmpty else { return }   // no comparable pairs (e.g. all cross-language)
@@ -175,6 +248,9 @@ final class FeatureExtractor {
     // MARK: App focus → copy_then_translator_switch · format_mismatch(fire)
 
     private func onAppFocus(_ p: AppFocusPayload, t: TimeInterval) {
+        // Segment bookkeeping completes app-time denominators but is not a user
+        // switch and therefore cannot contribute intent evidence.
+        guard p.transition == nil || p.transition == "activated" else { return }
         guard let lastTextCopy = copies.last(where: { $0.isText }) else { return }
         let sinceCopy = t - lastTextCopy.t
 
@@ -204,12 +280,14 @@ final class FeatureExtractor {
             emit?(Evidence(feature: .copyThenTranslatorSwitch, strength: 0.9, t: t))
         }
 
-        guard let docID = p.docID, p.charCount > 0 else { return }
-        selections.append((t, docID))
-        let sameDoc = selections.filter { $0.docID == docID && $0.t > t - 60 }.count
-        if sameDoc >= 2 {
+        guard let docID = p.docID, p.charCount > 0, !p.hashPrefix.isEmpty else { return }
+        selections.append((t, docID, p.hashPrefix))
+        let sameSelection = selections.filter {
+            $0.docID == docID && $0.hash == p.hashPrefix && $0.t > t - 60
+        }.count
+        if sameSelection >= 2 {
             emit?(Evidence(feature: .repeatSelection,
-                           strength: min(1.0, Double(sameDoc - 1) / 3.0), t: t))
+                           strength: min(1.0, Double(sameSelection - 1) / 3.0), t: t))
         }
     }
 

@@ -25,18 +25,29 @@ final class GlobalHotkey {
 
     /// Register `keyCode` (virtual key, e.g. `kVK_ANSI_V`) with Carbon modifier mask
     /// (`cmdKey` / `controlKey` / `optionKey` / `shiftKey`). Replaces any prior key.
-    func register(keyCode: UInt32, modifiers: UInt32, onFire: @escaping () -> Void) {
+    @discardableResult
+    func register(keyCode: UInt32, modifiers: UInt32,
+                  onFire: @escaping () -> Void) -> Bool {
         unregister()
         self.onFire = onFire
 
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind: UInt32(kEventHotKeyPressed))
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), hotkeyCallback,
-                            1, &spec, selfPtr, &eventHandler)
+        let handlerStatus = InstallEventHandler(GetApplicationEventTarget(), hotkeyCallback,
+                                                1, &spec, selfPtr, &eventHandler)
+        guard handlerStatus == noErr else {
+            unregister()
+            return false
+        }
 
-        RegisterEventHotKey(keyCode, modifiers, hotKeyID,
-                            GetApplicationEventTarget(), 0, &hotKeyRef)
+        let hotkeyStatus = RegisterEventHotKey(keyCode, modifiers, hotKeyID,
+                                               GetApplicationEventTarget(), 0, &hotKeyRef)
+        guard hotkeyStatus == noErr, hotKeyRef != nil else {
+            unregister()
+            return false
+        }
+        return true
     }
 
     func unregister() {

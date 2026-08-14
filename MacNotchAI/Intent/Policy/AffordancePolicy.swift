@@ -9,7 +9,8 @@ import Foundation
 //
 // Show iff expected utility beats interruption cost: P·V > (1−P)·C. The user's
 // sensitivity tier sets C, expressed as the exposure threshold θ — the tier
-// gates EXPOSURE only; scores stay calibrated and comparable (§7).
+// gates EXPOSURE only; recorded scores stay mechanically comparable (§7). Whether
+// they are empirically calibrated is a study question, not a runtime guarantee.
 struct AffordancePolicy {
 
     enum Verdict: Equatable {
@@ -23,7 +24,7 @@ struct AffordancePolicy {
     }
 
     /// M3: the passive channel speaks for translation only — the noisier classes
-    /// stay ticker-only until they are calibrated on real traces (ARCHITECTURE §11).
+    /// stay ticker-only until they are evaluated on real labelled traces (ARCHITECTURE §11).
     static let passiveClasses: Set<IntentClass> = [.translation]
 
     private(set) var cooldownUntil: [String: TimeInterval] = [:]

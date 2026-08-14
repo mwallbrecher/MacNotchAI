@@ -1,5 +1,13 @@
 # AI Drop — App Store Roadmap & Review
 
+## Website — feature screen recordings (DONE 2026-07-15)
+
+- [x] Replace the Radial Launcher and Clipboard History showcase placeholders with their delivered recordings.
+- [x] Remove the AI insights showcase tab and its unavailable recording slot.
+- [x] Cache-bust the showcase data and verify the website scripts.
+
+---
+
 ## Website — Pricing page (DONE 2026-07-08)
 
 - [x] Inspect existing static subpage structure and shared styles.
@@ -2726,3 +2734,41 @@ merge it with any additional changes and assign the final version number.
       presentation/performance, keyboard polish, and the relevant privacy boundaries.
 - [x] Re-run diff hygiene, review the exact staged paths and staged diff, then create one local `main`
       commit without pushing, tagging, version-bumping, or releasing.
+
+## Thesis 24-hour recording hardening (IMPLEMENTED 2026-08-12; physical pilot pending)
+
+**Scope confirmed by the owner:** harden the existing uncommitted A1–A3, B1–B4, C1–C6,
+D1–D4 and E1–E3 implementation for a meaningful 24-hour pilot. Consent remains an
+organisational pre-recording step; provider traffic and the local, discarded AX probe are outside
+the recorded-data review. Each participant uses one identity on their own installation, so
+cross-participant export filtering is not required.
+
+- [x] **Study artefact and restart safety** — make the manually distributed thesis build incapable
+      of starting Sparkle, restart trace recording whenever an armed study relaunches, expose real
+      recorder health, and document the separate macOS-login launch prerequisite without claiming it
+      is code-verified.
+- [x] **Trace integrity and time model** — write wall time plus monotonic uptime and explicit process /
+      sleep boundaries; make file opening, rotation and writes fail closed; retain a cumulative health
+      counter; validate non-empty parseable JSONL and required config during export instead of hiding
+      copy failures.
+- [x] **Pause, idle, sleep and AX lifecycle** — guarantee no sensor/evaluation events inside a pause,
+      preserve pause across relaunch, invalidate in-flight AX polls, attribute selection to the app
+      actually read, mark sleep/wake gaps, and avoid classifying quiet reading as definite absence.
+- [x] **Action semantics and UI** — use a current selection before clipboard/document fallbacks, expire
+      stale clipboard candidates, support an honest multi-source discovery target, resolve AX work
+      off-main with accept-time document freshness, show the concrete ticker action, and time out/log
+      every ticker lifecycle.
+- [x] **Outcome and prompt integrity** — log accepted only after a session is successfully opened,
+      add stable interaction/rank/channel linkage, cancel or explicitly skip displaced prompts, persist
+      prompt caps, and keep delayed prompts from resurfacing after pause/stop/withdrawal.
+- [ ] **Auto-run session binding** — bind each accepted-action latch to the exact verified overlay
+      revision and affordance-log session, clear it at controller stop/log failure, consume it only from
+      the matching current chips session, and cover revision mismatch plus clear semantics deterministically.
+- [x] **Verification and handoff** — add deterministic golden/lifecycle checks where possible, run diff
+      hygiene, clean Debug and Release builds, 29/29 checks in both artefacts, and a built-bundle
+      Sparkle-isolation audit; write `docs/thesis/24H_RECORDING_HARDENING.md` with the exact
+      guarantees, schema/export contract, accepted exclusions and remaining physical 24-hour checks.
+- [ ] **Physical artefact pilot** — execute the signed/notarised Release-DMG 24-hour matrix, including
+      sleep/wake, force-kill/manual recovery, reboot/login item, midnight, independent ZIP extraction,
+      AX app coverage, CPU/Energy/RSS, and sufficient per-class/label counts. Do not call the build the
+      final participant artefact until this passes.

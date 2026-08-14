@@ -11,7 +11,7 @@ import AppKit
 //
 // Dwell: 2 Hz polling of `NSEvent.mouseLocation` (the DragMonitor fallback trick —
 // no permission, no event tap). Stationary ≥ 10 s emits a dwell event when movement
-// resumes. Mouse-quiet conflates reading and typing; AX disambiguates in M2.
+// resumes; an OS key-idle counter suppresses intervals that contained typing.
 final class DwellSensor: IntentSensor {
 
     let name = "dwell"
@@ -19,6 +19,7 @@ final class DwellSensor: IntentSensor {
     private weak var bus: SignalBus?
     private var scrollMonitor: Any?
     private var housekeeping: Timer?
+    private var isSuspended = true
 
     // Scroll-burst accumulation
     private var burstOpen = false
@@ -33,6 +34,7 @@ final class DwellSensor: IntentSensor {
     // Mouse dwell
     private var lastMouse = NSEvent.mouseLocation
     private var stationarySince: TimeInterval?
+    private var stationaryApp: String?
 
     private let burstGap: TimeInterval = 0.8
     private let dwellMinimum: TimeInterval = 10
@@ -41,7 +43,45 @@ final class DwellSensor: IntentSensor {
 
     func start(bus: SignalBus) {
         self.bus = bus
+        resume()
+    }
+
+    func stop() {
+        suspend()
+        bus = nil
+    }
+
+    /// Close the observable portion immediately before a pause/sleep/inactivity
+    /// boundary. IntentEngine calls this while capture is still active, then suspends
+    /// us, then writes the boundary marker. This preserves a long quiet-reading dwell
+    /// instead of silently deleting it when energy gating begins.
+    func flushBeforeGap() {
+        guard !isSuspended else { return }
+        closeBurstIfDue(force: true)
+
+        let now = MonotonicClock.now
+        closeDwell(at: now)
+        resetTransientState()
+    }
+
+    /// A capture boundary must remove BOTH the timer and the global scroll monitor.
+    /// Keeping the event-driven monitor armed was cheap, but incorrect for a manual
+    /// pause: scroll events could still open a burst and later leak it across the gap.
+    func suspend() {
+        guard !isSuspended else { return }
+        isSuspended = true
+        housekeeping?.invalidate()
+        housekeeping = nil
+        if let monitor = scrollMonitor { NSEvent.removeMonitor(monitor) }
+        scrollMonitor = nil
+        resetTransientState()
+    }
+
+    func resume() {
+        guard isSuspended, bus != nil else { return }
+        isSuspended = false
         lastMouse = NSEvent.mouseLocation
+        resetTransientState()
         scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             self?.handleScroll(event)
         }
@@ -51,23 +91,30 @@ final class DwellSensor: IntentSensor {
         let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.tick()
         }
+        // Keep D1's tolerance on every initial/re-arm path.
+        t.tolerance = 0.1
         RunLoop.main.add(t, forMode: .common)
         housekeeping = t
     }
 
-    func stop() {
-        if let m = scrollMonitor { NSEvent.removeMonitor(m) }
-        scrollMonitor = nil
-        housekeeping?.invalidate()
-        housekeeping = nil
-        closeBurstIfDue(force: true)
+    private func resetTransientState() {
+        burstOpen = false
+        burstStart = 0
+        burstLast = 0
+        burstNet = 0
+        burstAbs = 0
+        burstFlips = 0
+        burstLastSign = 0
+        burstApp = nil
         stationarySince = nil
+        stationaryApp = nil
     }
 
     // MARK: Scroll bursts
 
     private func handleScroll(_ event: NSEvent) {
-        let now = Date().timeIntervalSince1970
+        guard !isSuspended else { return }
+        let now = MonotonicClock.now
         let dy = Double(event.scrollingDeltaY)
 
         if burstOpen, now - burstLast > burstGap {
@@ -92,7 +139,7 @@ final class DwellSensor: IntentSensor {
 
     private func closeBurstIfDue(force: Bool = false) {
         guard burstOpen else { return }
-        let now = Date().timeIntervalSince1970
+        let now = MonotonicClock.now
         guard force || now - burstLast > burstGap else { return }
         burstOpen = false
 
@@ -103,7 +150,7 @@ final class DwellSensor: IntentSensor {
         // tick) would otherwise time-travel behind already-published events. The
         // shift is noise at τ ≥ 60 s (<2% decay error); `duration` still describes
         // the gesture itself.
-        bus?.publish(SignalEvent(t: now, kind: .scrollBurst, scroll: ScrollBurstPayload(
+        bus?.publish(.live(kind: .scrollBurst, scroll: ScrollBurstPayload(
             app: burstApp,
             duration: ((burstLast - burstStart) * 100).rounded() / 100,
             netDeltaY: (burstNet * 10).rounded() / 10,
@@ -114,22 +161,51 @@ final class DwellSensor: IntentSensor {
     // MARK: Housekeeping tick (burst timeout + dwell detection)
 
     private func tick() {
+        guard !isSuspended else { return }
         closeBurstIfDue()
 
-        let now = Date().timeIntervalSince1970
+        let now = MonotonicClock.now
         let loc = NSEvent.mouseLocation
         let moved = hypot(loc.x - lastMouse.x, loc.y - lastMouse.y) > jitterDeadband
 
         if moved {
-            if let since = stationarySince, now - since >= dwellMinimum {
-                bus?.publish(SignalEvent(t: now, kind: .dwell, dwell: DwellPayload(
-                    app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-                    seconds: ((now - since) * 10).rounded() / 10)))
-            }
-            stationarySince = nil
+            closeDwell(at: now)
             lastMouse = loc
         } else if stationarySince == nil {
             stationarySince = now
+            stationaryApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         }
+    }
+
+    /// An app activation is a hard semantic boundary for mouse-stationary dwell.
+    /// Close any qualifying interval against the app captured at dwell start, then
+    /// let the next housekeeping tick begin a fresh interval in the newly active app.
+    /// Called by AppFocusSensor before it publishes the focus transition. This keeps
+    /// the closing dwell attached to the application observed at dwell start.
+    func prepareForAppActivation() {
+        guard !isSuspended else { return }
+        closeDwell(at: MonotonicClock.now)
+        lastMouse = NSEvent.mouseLocation
+    }
+
+    private func closeDwell(at now: TimeInterval) {
+        if let since = stationarySince, now - since >= dwellMinimum {
+            let duration = now - since
+            // Mouse-stationary typing is not reading dwell. This permission-free
+            // system counter lets us suppress any interval containing a key-down;
+            // it stores no key identity and installs no keyboard monitor.
+            let keyQuiet = CGEventSource.secondsSinceLastEventType(
+                .combinedSessionState, eventType: .keyDown)
+            guard !keyQuiet.isFinite || keyQuiet + 0.25 >= duration else {
+                stationarySince = nil
+                stationaryApp = nil
+                return
+            }
+            bus?.publish(.live(kind: .dwell, dwell: DwellPayload(
+                app: stationaryApp,
+                seconds: (duration * 10).rounded() / 10)))
+        }
+        stationarySince = nil
+        stationaryApp = nil
     }
 }

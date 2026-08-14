@@ -18,7 +18,7 @@ implementation contract for all `Thesis-Component:` work.
 |---|---|---|
 | 1 | **Sensing** — which OS signals are observable, at what permission/CPU cost | L1 |
 | 2 | **Representation** — turning a raw event stream into computable evidence | L2 |
-| 3 | **Inference** — calibrated `P(intent class | evidence)` | L3 (+L3b) |
+| 3 | **Inference** — log-linear intent estimate `P̂(intent class | evidence)`; empirical calibration is evaluated later | L3 (+L3b) |
 | 4 | **Decision & resolution** — *when* to surface *which* concrete action, *how phrased* | L4 |
 | 5 | **Learning** — per-user improvement without initial training data | L5 |
 
@@ -75,8 +75,8 @@ Target intent classes (proposal Objective 2): **Translation/Transformation** (pr
 | Clipboard | `NSPasteboard.general.changeCount` polling (0.5 s) | none | content-derived scalars (§4) |
 | App focus | `NSWorkspace.didActivateApplicationNotification` | none | bundle id, category, dwell-in-previous |
 | Scroll | global `NSEvent` monitor `.scrollWheel` | none (pointer events are ungated) | scroll bursts: net Δ, direction changes |
-| Mouse dwell | 1 Hz poll of `NSEvent.mouseLocation` | none | stationary periods ≥ 10 s |
-| Selection / doc context | Accessibility API (`AXUIElementCopyAttributeValue`: `kAXSelectedText`, `kAXDocument`, `kAXTitle`) | **Accessibility (opt-in)** | selected text scalars, doc path — **M2** |
+| Mouse dwell | 2 Hz poll of `NSEvent.mouseLocation`; stationary spans containing key-down activity are suppressed | none | stationary periods ≥ 10 s |
+| Selection / doc context | Accessibility API (`AXUIElementCopyAttributeValue`: selected text/window attributes) | **Accessibility (research setup)** | selected-text scalars and hashed document identity; no path/raw text crosses the bus |
 | File activity | FSEvents / `NSMetadataQuery` | folder TCC | new/changed files — **M2** |
 
 **Permission stance.** The *released* app (main branch) requests zero permissions as of
@@ -101,13 +101,10 @@ sensor* and the content is discarded:
   (concealed · `com.apple.is-sensitive` · transient · auto-generated — the same list the
   clipboard-history feature uses, so the two clipboard paths cannot drift; auto-generated
   is also semantic hygiene: a programmatic write is not a user copy, hence not a signal)
-- every event carries its **own timestamp `t`**; all downstream logic MUST use event time,
-  never wall clock — this single rule is what makes traces deterministically replayable (§10).
-  Sensors stamp at **publish time**, so bus time is monotonic (a DEBUG tripwire guards this;
-  scroll bursts accept ≤ ~1.3 s detection latency — <2% decay error at τ ≥ 60 s). The replayer
-  **rejects** traces with >1 s time regressions instead of sorting them — order is part of the
-  recorded interaction; sub-second regressions are tolerated as clock jitter (`Date()` is not
-  monotonic across NTP adjustments).
+- every live event carries a process-uptime ordering/decay time `t` and a separate wall time. The two
+  values come from one clock stamp; explicit discontinuities and session/boot UUIDs make wall-clock
+  steps and process resets analysable. All within-session inference uses `t`; the replayer rejects an
+  unexplained regression and accepts a typed `uptime_reset` boundary.
 
 The `SignalBus` keeps a ring buffer (window 120 s / cap 600 events, trimmed against the
 *newest event's* time, not wall clock) for windowed feature extraction; older data exists only
@@ -134,8 +131,9 @@ S_c  =  log P(c)/(1−P(c))  +  Σ_i  w_i · f_i · e^−(t−t_i)/τ_i
 P(c|E) = σ(S_c) = 1/(1+e^−S_c)
 ```
 
-- **Weights are log-likelihood-ratios**, not arbitrary knobs: `w_i = log P(e_i|c)/P(e_i|¬c)`.
-  `w = +2.2` means "this signal is ~9× more likely under real intent" (`e^2.2 ≈ 9`).
+- **Weights are log-odds contribution parameters.** Their initial values are theory/formative-data
+  motivated and synthetically regression-tested; without empirical likelihood estimation they must
+  not be reported as measured likelihood ratios.
 - **The prior enforces silence.** With `P(c) ≈ 0.02`, every hypothesis starts at ≈ **−3.9**;
   evidence must contribute ~4–5 points before anything can surface.
 - **Decay is analytic and lazy**: `e^−(t−t_i)/τ` is a pure function of *read time* — scores are
@@ -147,9 +145,9 @@ P(c|E) = σ(S_c) = 1/(1+e^−S_c)
 (w 2.2 × confidence 0.9, decayed ≈ +1.9); switch toward a translator within 10 s (+3.0)
 → S ≈ +1.0 → P ≈ 0.73 → show (θ=0.70). Foreign copy alone: P ≈ 0.12; translator switch alone:
 P ≈ 0.29 → **silence** either way. Earliness (suggesting on the copy alone) is **earned through
-personal evidence** (§9), never assumed. Calibration stance: translation signals are
-near-deterministic and fire readily; the noisier comprehension/discovery families need
-near-max combined evidence to speak unprompted and otherwise surface via the summon ticker.
+personal evidence** (§9), never assumed. These percentages are model estimates, not yet calibrated
+probabilities. Translation is the only passive class; noisier comprehension/discovery families remain
+summon-only until evaluated on real labelled data.
 
 **Initial parameters** (from the formative-study taxonomy; provenance column required —
 every weight cites the observation that motivated it):
@@ -188,8 +186,8 @@ preference sentence, never behavioural data.
 
 Show iff expected utility exceeds interruption cost: `P·V > (1−P)·C`. Since C is high, the
 threshold is high. **Sensitivity tiers set C — they shift the exposure threshold θ only,
-never the score.** P stays calibrated and comparable across users and tiers (that makes tier
-a post-hoc analysable variable in the logs).
+never the score.** With frozen parameters, P̂ stays mechanically comparable across users and tiers;
+whether it is empirically calibrated is a study question, not an implementation claim.
 
 | Tier | θ_show | Rate limit | Semantics |
 |---|---|---|---|
@@ -207,13 +205,14 @@ aggressive users generate more feedback → learn faster.)
   **⌥⏎** (Carbon hotkey, registered only while the whisper is visible), dismiss = ×,
   no reaction = 8 s auto-fade (logged as `ignored`, weak negative).
 - *Active channel (summon ticker):* **⌃⌥⌘I** (or the debug menu) shows the current top-3
-  intents with honest calibrated confidence — **no threshold**; a solicited suggestion cannot
+  intents with their current model estimates — **no threshold**; a solicited suggestion cannot
   annoy by definition. Hotkeys become user-configurable with the M4 user-control surface.
 
-The ticker doubles as a measurement instrument: **every summon is a labelled ground-truth
-moment** ("user had intent NOW"). A summon while the passive channel stayed silent is a logged
-false negative — direct evidence for RQ1 threshold/signal analysis. The candidate buffer also
-gives faded suggestions a recovery path.
+The ticker doubles as a measurement instrument: every summon is an observable **help-seeking
+moment**, not ground truth for one of the three intent classes. A summon while the passive channel
+stayed silent is a useful candidate missed-need case for later labelling, not by itself a false
+negative. Ranking and the percentage display can influence the selected row and must be treated as
+part of the intervention. The candidate buffer also gives faded suggestions a recovery path.
 
 **Resolver:** intent class + evidence payload → hard mapping into the `AIAction` catalog
 (translation intent + text ⇒ Translate with target language from the user profile), then
@@ -296,10 +295,11 @@ events (usage of language control is itself a finding). Onboarding uses the same
   THE mode for **Phase 1 formative observation** — the signals must be captured without the
   system perturbing the behaviour under study — and for any later data collection. Toggling it
   live attaches/detaches the affordance layer without interrupting a recording.
-- **Study modes** (RQ2, within-subjects): condition switcher A: chat-mediated · B: drag
-  (today's Dragaway) · C: intent-mediated. Logged outcomes: accepted / dismissed / ignored +
-  task timings; **in-situ prompts** ("helpful? intrusive?") after each affordance interaction,
-  skippable, non-blocking.
+- **Current Study build:** one intent-mediated condition with accepted/dismissed/ignored plus linked
+  provider-turn started/completed/failed/cancelled records and bounded in-situ prompts (result useful
+  or suggestion relevant, intrusive, work context). It does **not** implement the planned
+  chat/drag/intent condition switcher or experimental task timing; those remain required for a
+  comparative RQ2 study.
 
 ---
 
@@ -309,9 +309,9 @@ events (usage of language control is itself a finding). Onboarding uses the same
 |---|---|---|
 | **M1** | SignalBus, Clipboard/AppFocus/Dwell sensors, trace recorder + replayer, engine flag + debug menu | a recorded real session replays with identical event stream; zero permissions used |
 | **M2** | AX sensor (opt-in), feature detectors, scorer + `IntentConfig`, weights tuned on own traces | golden smoke checks (debug menu → Run Golden Checks) all pass; "why" decomposition available |
-| **M3** | whisper affordance + policy + resolver (Translation e2e) + summon ticker. **Passive channel fires for translation only** — comprehension/discovery stay ticker-only until calibrated on real traces | translation scenario works end-to-end passively and via summon |
+| **M3** | whisper affordance + policy + resolver (Translation e2e) + summon ticker. **Passive channel fires for translation only** — comprehension/discovery stay ticker-only until evaluated on real traces | translation scenario works end-to-end passively and via summon |
 | **M4** | online learning, context priors, preference compiler, onboarding, LLM disambiguator/phrasing | preference statement changes behaviour with preview+undo |
-| **M5** | study mode switcher, in-situ prompts, consent gates, export | pilot session produces analysable RQ1/RQ2 dataset |
+| **M5** | study instrumentation, in-situ prompts, researcher-led consent provenance, export | pilot produces an analysable feasibility/RQ1-style dataset; comparative RQ2 condition tooling remains separate |
 
 **Component ↔ `Thesis-Component:` trailer map:** `infrastructure` (workflow/docs) ·
 `signal-capture` (L1, traces, replay) · `intent-scoring` (L2/L3/L3b) · `affordance-ui` (L4/L5

@@ -1375,3 +1375,112 @@
 - **Rule:** for keyboard behavior in AppKit-hosted SwiftUI popovers, verify or own the native first
   responder. Keep the responder local, consume only named keys, and never add an app-wide monitor or
   Accessibility dependency for a window-local shortcut.
+
+### [STUDY-01] A research build needs compile-time distribution isolation
+
+- **What was wrong:** disabling updater checks from mutable study state still left Sparkle linked and
+  the ordinary release script capable of packaging the thesis checkout.
+- **Why:** runtime state can be unset on first launch, while linkage and release automation operate
+  before participant setup.
+- **Fix:** the thesis configurations define `THESIS_STUDY_BUILD`, compile the updater to a stub, remove
+  Sparkle from the target, mark the bundle, and make the release script require `main` and reject that
+  marker before any build/sign/notarise step.
+- **Rule:** isolate experimental distribution at compile, bundle and release-script boundaries; never
+  rely on a preference or on the promise not to publish.
+
+### [STUDY-02] Codable validation does not reject undeclared private fields
+
+- **What was wrong:** strict typed decoding appeared to validate JSONL, but `JSONDecoder` silently
+  ignored an injected `rawText`, path or other unknown key while export copied the original bytes.
+- **Why:** type safety covers decoded fields, not the complete serialized object.
+- **Fix:** validate semantics, then canonical-decode/re-encode every exported row and stage only those
+  canonical bytes.
+- **Rule:** at a privacy export boundary, either reject exact key-set deviations recursively or export
+  a typed canonical encoding; never validate one byte stream and ship another.
+
+### [STUDY-03] Audit a recovery before mutating the damaged evidence
+
+- **What was wrong:** crash-tail repair could truncate/complete a JSONL file before a new header or log
+  row successfully preserved what changed.
+- **Why:** repair followed by another disk/open failure loses the only forensic record of the repair.
+- **Fix:** synchronize a dedicated recovery journal first, mutate only the final fragment, fold the
+  journal into the next healthy stream, synchronize that record, then clear the journal. Writer
+  failure uses the same durable-gap pattern.
+- **Rule:** recovery metadata is a write-ahead journal: durable audit first, mutation second, clear only
+  after the canonical record is durable.
+
+### [STUDY-04] Reentrant subjects do not guarantee one global observer order
+
+- **What was wrong:** a subscriber could publish a lifecycle/failure event while the bus was still
+  delivering the outer event, allowing later subscribers to see a different order.
+- **Why:** synchronous subject reentrancy is per call stack, not a shared FIFO transaction.
+- **Fix:** `SignalBus` enqueues nested publications and drains them non-reentrantly after every
+  subscriber has received the current event.
+- **Rule:** when event order is research data, own an explicit FIFO dispatch boundary and regression
+  test nested publication.
+
+### [STUDY-05] Product-local storage can violate a study recorder's privacy claim
+
+- **What was wrong:** the content-minimised Clipboard sensor coexisted with the product Clipboard
+  History feature, which could persist raw copied text locally even though it was not exported.
+- **Why:** participants judge the installed research artefact, not just the chosen export folder.
+- **Fix:** Study builds forcibly keep product Clipboard History monitoring and its hotkey off without
+  deleting the user's existing history or preference.
+- **Rule:** audit every parallel producer in the installed build, not only files named by the research
+  exporter; disable unrelated raw-content capture for the study cohort.
+
+### [STUDY-06] Interaction acceptance and task outcome are different events
+
+- **What was wrong:** `accepted` originally meant only that an overlay opened, while analysis/UI copy
+  could read it as a completed or helpful AI action; posting AutoRun synchronously could also log the
+  action start before acceptance.
+- **Why:** UI handoff, provider completion and perceived usefulness are separate causal stages.
+- **Fix:** log ordered `accepted → action_started → action_completed|action_failed|action_cancelled`;
+  ask result usefulness only after completion, and suggestion relevance after dismissal/failure.
+- **Rule:** give each causal transition its own linked record and write the prerequisite before
+  triggering synchronous downstream work.
+
+### [STUDY-07] A new cohort must reset hidden model and policy state
+
+- **What was wrong:** archived evidence/logs did not reset hand-edited weights, priors, tier, mutes,
+  rate-limit slots or cooldowns on a reused pilot installation.
+- **Why:** identical method claims require identical runtime parameters and fresh state, not merely an
+  exported config snapshot that reveals the divergence later.
+- **Fix:** researcher setup rebuilds a canonical compiled study config (participant languages only),
+  persists those languages separately, resets policy/prompt quota, and export fails if config drifted.
+- **Rule:** define a cohort boundary that resets data, inference parameters and behavioral policy state
+  together; then enforce the frozen configuration on relaunch and export.
+
+### [STUDY-08] Independent notification observers do not define research-event order
+
+- **What was wrong:** Clipboard, dwell and app-focus sensors independently observed the same
+  `NSWorkspace.didActivateApplicationNotification`; a rapid copy→translator switch could publish the
+  focus row before the pending clipboard row depending on callback order.
+- **Why:** registration order is not a semantic transaction contract, yet the feature extractor needs
+  copy before focus to recognise the strongest translation sequence.
+- **Fix:** AppFocus owns the single activation observer and synchronously asks Clipboard to reconcile
+  its pending change and Dwell to close its old-app interval before publishing the focus transition.
+- **Rule:** when two observations form one causal sequence, centralise their ordering in one callback;
+  never infer a research timeline from independent observer delivery order.
+
+### [STUDY-09] Deferred UI work must be bound to the exact session identity
+
+- **What was wrong:** the one-shot accepted-action latch originally expired by time only, so an action
+  left unconsumed during pause/sleep/session replacement could later run against another file session.
+- **Why:** a TTL bounds age but does not prove ownership; an immortal/reused SwiftUI view can consume a
+  notification much later than the controller that created it.
+- **Fix:** bind the latch to the opened `sessionRevision` and originating affordance-log session,
+  require an exact revision at take, and clear it at controller stop or log failure.
+- **Rule:** delayed work that touches session data needs an immutable session token, not just a timeout.
+
+### [STUDY-10] Persist the method configuration before capture, not only at export
+
+- **What was wrong:** after withdrawal, export could snapshot a mutable current scorer configuration
+  rather than the exact frozen configuration that generated the completed cohort's scores.
+- **Why:** stopping capture does not freeze later preferences or debug edits, so provenance rebuilt at
+  export time can silently relabel historical data.
+- **Fix:** researcher setup atomically persists a full deployment snapshot (identity, consent times,
+  start time and `IntentConfig`) before arming Study mode; active export verifies against it and
+  post-withdraw export uses it directly.
+- **Rule:** persist experimental configuration at the cohort boundary and treat it as immutable
+  provenance; never reconstruct it from current runtime state after data collection.

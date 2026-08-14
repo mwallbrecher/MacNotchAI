@@ -15,7 +15,7 @@ import Foundation
 
 // MARK: - Config (all tunables live here — values are data, not architecture)
 
-struct IntentConfig: Codable {
+struct IntentConfig: Codable, Equatable {
     var v = 1
     /// "lazy" | "balanced" | "aggressive" — exposure tier (M3 policy reads this).
     var tier = "balanced"
@@ -44,7 +44,7 @@ struct IntentConfig: Codable {
     /// M4 onboarding question).
     var userLanguages: [String] = []
 
-    // Initial values, calibrated against the synthetic design targets (validated by
+    // Initial values, tuned against the synthetic design targets (validated by
     // the standalone scorer test; refine against golden traces):
     //   · translation: foreign clip + translator switch ⇒ fires on balanced (~73%);
     //     either signal alone stays silent (12% / 29%). The switch is the strongest
@@ -86,6 +86,26 @@ struct IntentConfig: Codable {
     // path on every schema growth. decodeIfPresent per field keeps old files valid.
 
     init() {}
+
+    /// Frozen configuration for an in-situ study deployment. Participant languages
+    /// are the sole per-participant input; every inferential and exposure parameter is
+    /// reset to the compiled baseline so a reused pilot install cannot leak learned or
+    /// hand-edited state into a new cohort.
+    static func studyConfiguration(userLanguages: [String]) -> IntentConfig {
+        var config = IntentConfig()
+        config.userLanguages = Array(Set(userLanguages.compactMap { raw in
+            let code = String(raw.prefix(2)).lowercased()
+            return code.count == 2 && code.allSatisfy(\.isLetter) ? code : nil
+        })).sorted()
+        return config
+    }
+
+    /// Exact invariant checked before a live Study export. The selected language
+    /// repertoire is intentionally preserved while all other fields are compared with
+    /// the compiled, frozen configuration.
+    var isFrozenStudyConfiguration: Bool {
+        self == Self.studyConfiguration(userLanguages: userLanguages)
+    }
 
     private enum CodingKeys: String, CodingKey {
         case v, tier, basePriorLogOdds, priorOffsets, weights, taus, thresholds,

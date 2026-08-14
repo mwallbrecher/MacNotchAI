@@ -1,4 +1,4 @@
-#if DEBUG
+#if THESIS_STUDY_BUILD
 import Foundation
 
 // THESIS — golden smoke checks: an executable floor under the M2 pipeline.
@@ -52,7 +52,9 @@ enum IntentGoldenChecks {
             previousBundleID: "com.apple.Preview", secondsInPrevious: 30))
     }
 
-    private static func pct(_ v: Double) -> String { String(format: "%.0f%%", v * 100) }
+    nonisolated private static func pct(_ v: Double) -> String {
+        String(format: "%.0f%%", v * 100)
+    }
 
     // MARK: The suite
 
@@ -177,7 +179,7 @@ enum IntentGoldenChecks {
         }
 
         // 11 · Ticker-only class: even at 99%, comprehension must not pass the
-        //      passive gate in M3 (it stays summon-only until calibrated).
+        //      passive gate in M3 (it stays summon-only until evaluated on real data).
         do {
             let policy = AffordancePolicy()
             let v = policy.decide(intentClass: .comprehension, probability: 0.99,
@@ -244,6 +246,320 @@ enum IntentGoldenChecks {
             checks.append(Check(name: "14 foreign flag follows configured languages", pass: pass,
                                 detail: "German text — reader[en]: foreign=\(foreignForEnglishReader) (want true), "
                                       + "reader[de,en]: foreign=\(foreignForGermanReader) (want false)"))
+        }
+
+        // 15 · Idle spans are SEGMENTATION, never evidence. The in-situ study records
+        //      activity events so the analysis can separate work from absence, but an
+        //      untouched machine must never move any intent hypothesis: silence is not
+        //      a signal, and inventing one would corrupt the very base rate the prior
+        //      encodes. Guards the deliberate `case .activity: break` in the extractor.
+        do {
+            let pipe = Pipeline()
+            let t0: TimeInterval = 5_000
+            pipe.feed(SignalEvent(t: t0, kind: .activity,
+                                  activity: ActivityPayload(state: "idle", seconds: 900)))
+            pipe.feed(SignalEvent(t: t0 + 900, kind: .activity,
+                                  activity: ActivityPayload(state: "active", seconds: 900)))
+
+            let evidenceCount = pipe.scorer.evidence.count
+            let pTranslation = pipe.p(.translation, at: t0 + 901)
+            let pComprehension = pipe.p(.comprehension, at: t0 + 901)
+            let pDiscovery = pipe.p(.discovery, at: t0 + 901)
+            let atPrior = [pTranslation, pComprehension, pDiscovery].allSatisfy { abs($0 - 0.02) < 0.005 }
+
+            let pass = evidenceCount == 0 && atPrior
+            checks.append(Check(name: "15 activity events create no evidence", pass: pass,
+                                detail: "evidence=\(evidenceCount) (want 0), "
+                                      + "p=[\(String(format: "%.3f", pTranslation)), "
+                                      + "\(String(format: "%.3f", pComprehension)), "
+                                      + "\(String(format: "%.3f", pDiscovery))] (want all ≈0.020)"))
+        }
+
+        // 16 · A live event derives ordering time and persisted clock metadata from
+        //      one stamp. Equality is exact by construction — no timing tolerance.
+        do {
+            let event = SignalEvent.live(
+                kind: .activity,
+                activity: ActivityPayload(state: "active", seconds: 0))
+            let sameUptime = event.uptime.map { event.t == $0 } ?? false
+            let hasWall = event.wallTime.map { $0 > 0 } ?? false
+            let hasSession = event.sessionID.map { !$0.isEmpty } ?? false
+            let hasProcess = event.processID.map { $0 > 0 } ?? false
+            let matchesProcess = event.processID == MonotonicClock.processID
+            let matchesSession = event.sessionID == MonotonicClock.sessionID
+            let pass = sameUptime && hasWall && hasSession && hasProcess
+                    && matchesProcess && matchesSession
+            checks.append(Check(name: "16 live signal carries one complete clock stamp",
+                                pass: pass,
+                                detail: "t==uptime=\(sameUptime), wall=\(hasWall), "
+                                      + "session=\(hasSession && matchesSession), "
+                                      + "process=\(hasProcess && matchesProcess)"))
+        }
+
+        // 17 · The content vault is exercised only through its RAM API. Preserve any
+        //      live entries around the check so running diagnostics cannot destroy a
+        //      participant's current candidate set. No URL/UserDefaults/file API is
+        //      touched here.
+        do {
+            let vault = IntentContentVault.shared
+            let now = MonotonicClock.now
+            let savedSnapshot = vault.snapshot(at: now)
+            let savedTexts = vault.texts(matching: savedSnapshot.references, at: now) ?? []
+            let savedEntries = Array(zip(savedSnapshot.references, savedTexts))
+            defer {
+                vault.clear()
+                for (reference, text) in savedEntries {
+                    vault.store(text: text, hash: reference.hash, at: reference.capturedAt)
+                }
+            }
+
+            vault.clear()
+            vault.store(text: "source alpha", hash: "golden-alpha", at: now)
+            vault.store(text: "source beta", hash: "golden-beta", at: now + 1)
+            let snapshot = vault.snapshot(at: now + 1)
+            let exactTexts = vault.texts(matching: snapshot.references, at: now + 1)
+            let exact = snapshot.count == 2
+                     && exactTexts == ["source alpha", "source beta"]
+
+            vault.discard(Array(snapshot.references.prefix(1)))
+            let discardWorked = vault.snapshot(at: now + 1).count == 1
+                && vault.texts(matching: snapshot.references, at: now + 1) == nil
+
+            vault.clear()
+            let clearWorked = vault.snapshot(at: now + 1).count == 0
+            vault.store(text: "expires", hash: "golden-expiry", at: now + 10)
+            let expired = vault.snapshot(
+                at: now + 10 + IntentContentVault.lifetime + 0.001).count == 0
+
+            checks.append(Check(name: "17 RAM vault exact snapshot, discard, clear, TTL",
+                                pass: exact && discardWorked && clearWorked && expired,
+                                detail: "exact=\(exact), discard=\(discardWorked), "
+                                      + "clear=\(clearWorked), expired=\(expired)"))
+        }
+
+        // 18 · A current explicit selection is the narrowest object. Give the context
+        //      a non-nil clipboard candidate with an intentionally impossible hash as
+        //      well as a document: the selection branch must win before any pasteboard
+        //      validation is needed.
+        do {
+            let interactionID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+            let selection = DocumentReader.Snapshot(
+                scope: .selection, pid: 101, bundleID: "golden.reader",
+                appName: "Golden Reader", docID: "selection-doc",
+                contentHash: "selection-hash", charCount: 120)
+            let document = DocumentReader.Snapshot(
+                scope: .document, pid: 101, bundleID: "golden.reader",
+                appName: "Golden Reader", docID: "document-doc",
+                contentHash: "document-hash", charCount: 5_000)
+            let clipboard = FeatureExtractor.ClipCandidate(
+                t: t0, hash: "not-a-valid-hash-prefix", language: "en",
+                langConfidence: 1, source: "golden.clipboard", shape: "prose",
+                charCount: 2_000)
+            let context = TaskResolver.Context(
+                now: t0, translationCandidate: nil, latestTextCandidate: clipboard,
+                recentCopies: 1,
+                vault: IntentContentVault.Snapshot(references: []),
+                selection: selection, document: document)
+            let suggestion = TaskResolver.resolve(
+                intentClass: .comprehension, probability: 0.81,
+                context: context, interactionID: interactionID,
+                channel: .summon, rank: 2)
+
+            let choseSelection: Bool
+            if let suggestion, case .accessibility(let chosen) = suggestion.target {
+                choseSelection = chosen.scope.rawValue == DocumentReader.Scope.selection.rawValue
+                    && chosen.contentHash == selection.contentHash
+                    && suggestion.action.rawValue == AIAction.explainSimply.rawValue
+            } else {
+                choseSelection = false
+            }
+            checks.append(Check(name: "18 comprehension prioritises current selection",
+                                pass: choseSelection,
+                                detail: choseSelection
+                                    ? "selection won over clipboard and document"
+                                    : "resolver did not target the current selection"))
+        }
+
+        // 19 · Discovery with two exact vault references must remain a real synthesis
+        //      action and carry the surface's identity/rank unchanged into its target.
+        do {
+            let interactionID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+            let references = [
+                IntentContentVault.Reference(hash: "vault-one", capturedAt: t0),
+                IntentContentVault.Reference(hash: "vault-two", capturedAt: t0 + 1),
+            ]
+            let fallbackDocument = DocumentReader.Snapshot(
+                scope: .document, pid: 202, bundleID: "golden.discovery",
+                appName: "Golden Discovery", docID: "fallback-doc",
+                contentHash: "fallback-hash", charCount: 4_000)
+            let context = TaskResolver.Context(
+                now: t0 + 1, translationCandidate: nil, latestTextCandidate: nil,
+                recentCopies: 2,
+                vault: IntentContentVault.Snapshot(references: references),
+                selection: nil, document: fallbackDocument)
+            let suggestion = TaskResolver.resolve(
+                intentClass: .discovery, probability: 0.76,
+                context: context, interactionID: interactionID,
+                channel: .summon, rank: 3)
+
+            let linked: Bool
+            if let suggestion, case .clipboardVault(let chosen) = suggestion.target {
+                linked = suggestion.action.rawValue == AIAction.turnIntoBrief.rawValue
+                    && suggestion.interactionID == interactionID
+                    && suggestion.channel.rawValue == AffordanceChannel.summon.rawValue
+                    && suggestion.rank == 3
+                    && chosen == references
+            } else {
+                linked = false
+            }
+            checks.append(Check(name: "19 discovery links two-source synthesis to row",
+                                pass: linked,
+                                detail: linked
+                                    ? "turnIntoBrief · summon · rank 3 · exact references"
+                                    : "action, linkage, or vault references differed"))
+        }
+
+        // 20 · Repeating a different phrase in the same document is not evidence for
+        //      re-reading. Only the exact content-free selection fingerprint may fire.
+        do {
+            let pipe = Pipeline()
+            func selection(_ t: TimeInterval, _ hash: String) -> SignalEvent {
+                SignalEvent(t: t, kind: .selection, selection: SelectionPayload(
+                    app: "golden.reader", charCount: 40, wordCount: 7,
+                    language: "en", langConfidence: 1, isForeignLanguage: false,
+                    shape: "prose", hashPrefix: hash, docID: "dddddddddddddddd",
+                    isTranslatorContext: false))
+            }
+            pipe.feed(selection(t0, "aaaaaaaaaaaaaaaa"))
+            pipe.feed(selection(t0 + 5, "bbbbbbbbbbbbbbbb"))
+            let differentSilent = !pipe.has(.repeatSelection)
+            pipe.feed(selection(t0 + 10, "aaaaaaaaaaaaaaaa"))
+            let identicalFired = pipe.has(.repeatSelection)
+            checks.append(Check(name: "20 repeat selection requires same fingerprint",
+                                pass: differentSilent && identicalFired,
+                                detail: "different silent=\(differentSilent), exact repeat=\(identicalFired)"))
+        }
+
+        // 21 · A persisted pause attaches event-driven sensors without publishing a
+        //      baseline. This guards the relaunch path's promise of an empty gap.
+        do {
+            let bus = SignalBus()
+            let sensor = AppFocusSensor()
+            sensor.startSuspended(bus: bus)
+            let emitted = bus.buffer.count
+            sensor.stop()
+            checks.append(Check(name: "21 suspended start emits no app baseline",
+                                pass: emitted == 0,
+                                detail: "events before resume=\(emitted) (want 0)"))
+        }
+
+        // 22–25 · Crash-tail repair, FIFO delivery and exporter schema validation run only against
+        //         isolated in-memory/temporary fixtures, never participant data.
+        do {
+            let pass = TraceRecorder.tailRecoveryCheckForTesting()
+            checks.append(Check(name: "22 recorder repairs only final interrupted tail",
+                                pass: pass,
+                                detail: pass ? "valid tail completed; partial tail discarded"
+                                             : "isolated tail-recovery fixture failed"))
+        }
+        do {
+            let pass = StudyExporter.schemaValidationCheckForTesting()
+            checks.append(Check(name: "23 exporter enforces typed v4/v4 schemas",
+                                pass: pass,
+                                detail: pass ? "valid trace/lifecycle accepted; bad link rejected; unknown field stripped"
+                                             : "schema validator fixture failed"))
+        }
+        do {
+            let pass = SignalBus.reentrantDeliveryCheckForTesting()
+            checks.append(Check(name: "24 nested signal publication remains FIFO",
+                                pass: pass,
+                                detail: pass ? "both subscribers observed t1 before nested t2"
+                                             : "re-entrant delivery reordered the stream"))
+        }
+        do {
+            let pass = AffordanceController.tailRecoveryCheckForTesting()
+            checks.append(Check(name: "25 affordance tail recovery is durably journaled",
+                                pass: pass,
+                                detail: pass ? "valid tail completed; partial tail audited and discarded"
+                                             : "affordance recovery transaction fixture failed"))
+        }
+
+        // 26 · Browser tabs share a bundle ID but are still distinct collected sources.
+        //      Conversely, equal-dimensional vectors from different language-specific
+        //      Apple models must never be treated as one shared embedding space.
+        do {
+            let sameApp = Pipeline()
+            for (offset, hash) in ["one", "two", "three"].enumerated() {
+                sameApp.feed(textClip(t: t0 + Double(offset), foreign: false,
+                                      source: "com.apple.Safari", hash: hash))
+            }
+            let sameAppCollects = sameApp.has(.collectMode)
+
+            let mixed = Pipeline()
+            mixed.feed(textClip(t: t0, foreign: false, source: "browser", hash: "en",
+                                embedding: [1, 0, 0]))
+            mixed.feed(textClip(t: t0 + 1, foreign: true, source: "browser", hash: "fr",
+                                embedding: [1, 0, 0]))
+            mixed.feed(textClip(t: t0 + 2, foreign: false, source: "browser", hash: "plain"))
+            let mixedLanguageSkipped = !mixed.has(.topicCoherence)
+            checks.append(Check(name: "26 discovery counts tabs, compares embeddings by language",
+                                pass: sameAppCollects && mixedLanguageSkipped,
+                                detail: "same-app collect=\(sameAppCollects), "
+                                      + "cross-language skipped=\(mixedLanguageSkipped)"))
+        }
+
+        // 27 · Study setup must erase all pilot/user tuning except the explicitly
+        //      declared participant language repertoire.
+        do {
+            var contaminated = IntentConfig()
+            contaminated.tier = "aggressive"
+            contaminated.priorOffsets[IntentClass.translation.rawValue] = 1.2
+            contaminated.weights[FeatureID.collectMode.rawValue] = -2
+            contaminated.mutes = ["translation|example.app"]
+            contaminated.userLanguages = ["DE-de", "en", "de"]
+            let frozen = IntentConfig.studyConfiguration(
+                userLanguages: contaminated.userLanguages)
+            let pass = frozen.isFrozenStudyConfiguration
+                && frozen.tier == "balanced"
+                && frozen.priorOffsets.isEmpty
+                && frozen.weights == IntentConfig.defaultWeights
+                && frozen.mutes.isEmpty
+                && frozen.userLanguages == ["de", "en"]
+                && !contaminated.isFrozenStudyConfiguration
+            checks.append(Check(name: "27 study configuration is frozen at cohort boundary",
+                                pass: pass,
+                                detail: pass ? "only normalised participant languages survive"
+                                            : "pilot tuning leaked into frozen config"))
+        }
+
+        // 28 · The accepted-action handoff is a session-scoped one-shot, not a
+        //      time-only payload. A mismatched revision must consume the stale latch,
+        //      while controller lifecycle clears are scoped to the originating log.
+        do {
+            let result = IntentAutoRun.revisionBindingCheckForTesting()
+            let pass = result.mismatchRejected
+                && result.mismatchConsumed
+                && result.wrongLogPreserved
+                && result.exactLogCleared
+                && result.unconditionalCleared
+            checks.append(Check(name: "28 auto-run latch is revision and lifecycle bound",
+                                pass: pass,
+                                detail: "mismatch rejected=\(result.mismatchRejected), "
+                                      + "mismatch consumed=\(result.mismatchConsumed), "
+                                      + "wrong-log preserved=\(result.wrongLogPreserved), "
+                                      + "exact-log clear=\(result.exactLogCleared), "
+                                      + "unconditional clear=\(result.unconditionalCleared)"))
+        }
+
+        // 29 · Withdrawal must not relabel a completed cohort with whatever mutable
+        //      scorer configuration happens to be loaded when export is requested.
+        do {
+            let pass = StudyExporter.deploymentSnapshotCheckForTesting()
+            checks.append(Check(name: "29 export uses frozen deployment snapshot",
+                                pass: pass,
+                                detail: pass
+                                    ? "post-withdraw mutations ignored; active drift rejected"
+                                    : "deployment snapshot/config binding failed"))
         }
 
         return checks

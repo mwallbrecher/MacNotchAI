@@ -9,7 +9,6 @@
 /* Begin PBXBuildFile section */
 		59D7920B2FCCD1D000A261BB /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 59D7920A2FCCD1CF00A261BB /* Cocoa.framework */; };
 		59D792162FCCD1D000A261BB /* AddToAIDrop.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 59D792082FCCD1CF00A261BB /* AddToAIDrop.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
-		59F0A81D2FFAB93B00DBC473 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 59F0A81C2FFAB93B00DBC473 /* Sparkle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -83,7 +82,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				59F0A81D2FFAB93B00DBC473 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -147,7 +145,6 @@
 			);
 			name = MacNotchAI;
 			packageProductDependencies = (
-				59F0A81C2FFAB93B00DBC473 /* Sparkle */,
 			);
 			productName = MacNotchAI;
 			productReference = 59114F5D2F699A5100E47DD9 /* Dragaway.app */;
@@ -203,7 +200,6 @@
 			mainGroup = 59114F542F699A5100E47DD9;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				59F0A81B2FFAB93B00DBC473 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 59114F5E2F699A5100E47DD9 /* Products */;
@@ -400,8 +396,6 @@
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Dragaway uses the microphone for speech-to-text so you can dictate prompts.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Dragaway uses speech recognition to convert your voice into text prompts.";
-				INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/mwallbrecher/Dragaway/main/appcast.xml";
-				INFOPLIST_KEY_SUPublicEDKey = "BOktIK1I9MB/+741Caw4opOxiX2oU1LUb4AN0UGlN6U=";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -410,6 +404,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.wallbrecher.dragaway;
 				PRODUCT_NAME = Dragaway;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "THESIS_STUDY_BUILD $(inherited)";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -438,8 +433,6 @@
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Dragaway uses the microphone for speech-to-text so you can dictate prompts.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Dragaway uses speech recognition to convert your voice into text prompts.";
-				INFOPLIST_KEY_SUFeedURL = "https://raw.githubusercontent.com/mwallbrecher/Dragaway/main/appcast.xml";
-				INFOPLIST_KEY_SUPublicEDKey = "BOktIK1I9MB/+741Caw4opOxiX2oU1LUb4AN0UGlN6U=";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -448,6 +441,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.wallbrecher.dragaway;
 				PRODUCT_NAME = Dragaway;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "THESIS_STUDY_BUILD $(inherited)";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -550,25 +544,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
-/* Begin XCRemoteSwiftPackageReference section */
-		59F0A81B2FFAB93B00DBC473 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/sparkle-project/Sparkle";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.9.4;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		59F0A81C2FFAB93B00DBC473 /* Sparkle */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 59F0A81B2FFAB93B00DBC473 /* XCRemoteSwiftPackageReference "Sparkle" */;
-			productName = Sparkle;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 59114F552F699A5100E47DD9 /* Project object */;
 }
