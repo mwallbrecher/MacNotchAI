@@ -84,22 +84,34 @@ enum TaskResolver {
 
     // MARK: Translation
 
-    static func translateAction(avoiding sourceLanguage: String?) -> AIAction {
+    static func translateAction(preferredTargetLanguage: String? = nil,
+                                avoiding sourceLanguage: String?) -> AIAction {
         let catalog: [String: AIAction] = ["en": .translateEnglish, "de": .translateGerman,
                                            "fr": .translateFrench, "es": .translateSpanish]
-        let source = sourceLanguage.map { String($0.prefix(2)) }
+        let source = sourceLanguage.map { String($0.prefix(2)).lowercased() }
+
+        // An editable AX target's confidently detected language is task-specific and
+        // therefore outranks the participant's general language preferences. Keep the
+        // choice inside the existing finite action catalogue; unsupported/ambiguous
+        // targets fall through to the ordinary preference policy.
+        if let target = preferredTargetLanguage.map({ String($0.prefix(2)).lowercased() }),
+           target != source, let action = catalog[target] {
+            return action
+        }
         // Study setup records the participant's repertoire explicitly. Targeting the
         // host Mac's locale could offer German to an English/Spanish participant.
         // Prefer English (the study's required language), then their other declared
         // supported languages; only ordinary non-study installs fall back to locale.
         let configured = IntentText.userLanguagesOverride.map { languages in
-            languages.sorted { lhs, rhs in
+            languages.map { String($0.prefix(2)).lowercased() }.sorted { lhs, rhs in
                 if lhs == "en" { return true }
                 if rhs == "en" { return false }
                 return lhs < rhs
             }
         }
-        let preferences = configured ?? Locale.preferredLanguages.map { String($0.prefix(2)) }
+        let preferences = configured ?? Locale.preferredLanguages.map {
+            String($0.prefix(2)).lowercased()
+        }
         for preferred in preferences {
             if preferred == source { continue }
             if let action = catalog[preferred] { return action }
@@ -116,7 +128,8 @@ enum TaskResolver {
         let sourceName = candidate.language.flatMap {
             Locale.current.localizedString(forLanguageCode: String($0.prefix(2)))
         }
-        let action = translateAction(avoiding: candidate.language)
+        let action = translateAction(preferredTargetLanguage: candidate.targetLanguage,
+                                     avoiding: candidate.language)
         return IntentSuggestion(interactionID: interactionID, channel: channel, rank: rank,
                                 intentClass: .translation, action: action,
                                 phrase: sourceName.map { "Translate this \($0) text" }
@@ -220,12 +233,21 @@ enum TaskResolver {
         }
     }
 
-    static func pasteboardMatches(_ hash: String) -> Bool {
+    /// Returns the exact trimmed pasteboard text only while it still owns the
+    /// content-free fingerprint captured by the sensor. Accept uses this same read
+    /// for materialisation, so verification and execution cannot silently select
+    /// different clipboard representations.
+    static func verifiedPasteboardText(matching hash: String) -> String? {
         let pb = NSPasteboard.general
         guard !PasteboardPrivacy.isSensitive(pb.types ?? []),
               let text = pb.string(forType: .string)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty else { return false }
-        return IntentText.hashPrefix(text) == hash
+              !text.isEmpty else { return nil }
+        guard IntentText.hashPrefix(text) == hash else { return nil }
+        return text
+    }
+
+    static func pasteboardMatches(_ hash: String) -> Bool {
+        verifiedPasteboardText(matching: hash) != nil
     }
 }

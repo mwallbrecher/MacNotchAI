@@ -8,8 +8,9 @@ import AppKit
 // to that feature. Polling an Int at 2 Hz is negligible.
 //
 // PRIVACY: the pasteboard string is classified (IntentText) and discarded — only
-// derived scalars are published. Sensitive pasteboards (PasteboardPrivacy) are
-// skipped entirely.
+// derived scalars are published. Sensitive pasteboards (PasteboardPrivacy) publish
+// only the same content-free ownership boundary as every other change; no type,
+// source, hash, or content-derived value from the replacement is recorded.
 final class ClipboardSensor: IntentSensor {
 
     let name = "clipboard"
@@ -52,6 +53,13 @@ final class ClipboardSensor: IntentSensor {
     /// segment but has not reached the 0.5-second poll yet. Safe to call repeatedly:
     /// `processChange` advances `lastChangeCount` before it publishes.
     func flushBeforeGap() {
+        flushPendingChange()
+    }
+
+    /// Reconcile a copy before a same-process AX document/window boundary is written.
+    /// This binds the copy to the source object segment instead of whichever document
+    /// happens to be focused at the next 0.5-second poll.
+    func flushPendingChange() {
         guard timer != nil else { return }
         let pb = NSPasteboard.general
         if pb.changeCount != lastChangeCount {
@@ -123,13 +131,20 @@ final class ClipboardSensor: IntentSensor {
 
     private func processChange(on pb: NSPasteboard, sourceApp: String?) {
         lastChangeCount = pb.changeCount
+        // The boundary is part of the trace, not a RAM-only side channel. Replay can
+        // therefore retract the exact same object-bound evidence even when privacy or
+        // unsupported content prevents a following clipboard payload.
+        bus?.publish(.live(
+            kind: .contextBoundary,
+            contextBoundary: ContextBoundaryPayload(scope: "pasteboard", app: nil)))
 
         let types = pb.types ?? []
         // Shared privacy gate (PasteboardPrivacy — the SAME list ClipboardHistoryStore
         // uses, so the two clipboard paths cannot drift): concealed / is-sensitive /
         // transient / auto-generated content never enters the pipeline in any derived
         // form. Auto-generated is also semantic hygiene — a programmatic pasteboard
-        // write is not a user copy, hence not an intent signal.
+        // write is not a user copy, hence not a content signal. Its content-free
+        // ownership boundary above is retained solely to invalidate older aliases.
         guard !PasteboardPrivacy.isSensitive(types) else {
             IntentContentVault.shared.clear()
             return

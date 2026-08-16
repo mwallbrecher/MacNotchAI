@@ -21,7 +21,19 @@ import Combine
 // MARK: - Event model
 
 enum SignalKind: String, Codable {
-    case clipboard, appFocus, scrollBurst, dwell, selection, activity
+    case clipboard, contextBoundary, appFocus, scrollBurst, dwell, selection
+    case accessibilityContext, activity
+}
+
+/// A content-free ownership boundary for mutable objects that other evidence points
+/// at. Recording the boundary keeps live and replay state identical even when the new
+/// pasteboard object is privacy-gated, or an AX target changes before its next bounded
+/// read completes. It deliberately carries no content, title, path, role, or hash.
+struct ContextBoundaryPayload: Codable {
+    /// "pasteboard" | "accessibility_target"
+    let scope: String
+    /// Focused bundle for an Accessibility boundary; nil for pasteboard ownership.
+    let app: String?
 }
 
 /// The participant went idle or came back (ActivityMonitor). Carries NO evidence —
@@ -84,6 +96,37 @@ struct SelectionPayload: Codable {
     let isTranslatorContext: Bool
 }
 
+/// A content-minimised observation of the currently focused Accessibility target.
+/// The sensor may transiently inspect an AX document path or a bounded text sample,
+/// but only this derived contract may cross the bus: no text, path, file name, window
+/// title, AX description, identifier, or absolute character offset is representable.
+struct AccessibilityContextPayload: Codable {
+    /// Bundle identifier of the focused app (best effort).
+    let app: String?
+    /// First 16 hex chars of the document-identity hash; never the document path/title.
+    let docID: String?
+    /// Lowercase extension without a leading dot, from an intentionally bounded field.
+    let documentExtension: String?
+    /// "text_field" | "text_area" | "search_field" | "web_area" | "document" | "other"
+    let focusedRole: String
+    /// true/false only when AX answered authoritatively; nil means unsupported,
+    /// timed out, or otherwise unknown and must not be analysed as read-only.
+    let editable: Bool?
+    /// BCP-47-ish top language guess for the bounded local sample.
+    let language: String?
+    let langConfidence: Double?
+    /// Number of characters actually classified, never the full document length.
+    let sampleCharCount: Int
+    /// "document_file" | "visible_range" | "value" | "range_metadata" | "none"
+    let readStrategy: String
+    /// Rounded progress buckets only. Absolute AX offsets never cross the bus.
+    let caretBucket: Int?
+    let visibleStartBucket: Int?
+    let visibleEndBucket: Int?
+    /// "initial" | "focus" | "selection" | "value" | "layout" | "scroll" | "fallback"
+    let trigger: String
+}
+
 /// The frontmost application changed.
 struct AppFocusPayload: Codable {
     let bundleID: String
@@ -131,10 +174,12 @@ struct SignalEvent: Codable {
     let processID: Int32?
     let clockDiscontinuity: MonotonicClock.Discontinuity?
     var clipboard: ClipboardPayload? = nil
+    var contextBoundary: ContextBoundaryPayload? = nil
     var appFocus: AppFocusPayload? = nil
     var scroll: ScrollBurstPayload? = nil
     var dwell: DwellPayload? = nil
     var selection: SelectionPayload? = nil
+    var accessibilityContext: AccessibilityContextPayload? = nil
     var activity: ActivityPayload? = nil
 
     /// Explicit timestamp construction for golden checks, synthetic traces, and
@@ -142,10 +187,12 @@ struct SignalEvent: Codable {
     /// process-clock metadata. Runtime producers must use `live(...)` below.
     init(t: TimeInterval, kind: SignalKind,
          clipboard: ClipboardPayload? = nil,
+         contextBoundary: ContextBoundaryPayload? = nil,
          appFocus: AppFocusPayload? = nil,
          scroll: ScrollBurstPayload? = nil,
          dwell: DwellPayload? = nil,
          selection: SelectionPayload? = nil,
+         accessibilityContext: AccessibilityContextPayload? = nil,
          activity: ActivityPayload? = nil) {
         self.t = t
         self.kind = kind
@@ -155,10 +202,12 @@ struct SignalEvent: Codable {
         self.processID = nil
         self.clockDiscontinuity = nil
         self.clipboard = clipboard
+        self.contextBoundary = contextBoundary
         self.appFocus = appFocus
         self.scroll = scroll
         self.dwell = dwell
         self.selection = selection
+        self.accessibilityContext = accessibilityContext
         self.activity = activity
     }
 
@@ -167,21 +216,29 @@ struct SignalEvent: Codable {
     /// to that exact same signal snapshot.
     static func live(kind: SignalKind,
                      clipboard: ClipboardPayload? = nil,
+                     contextBoundary: ContextBoundaryPayload? = nil,
                      appFocus: AppFocusPayload? = nil,
                      scroll: ScrollBurstPayload? = nil,
                      dwell: DwellPayload? = nil,
                      selection: SelectionPayload? = nil,
+                     accessibilityContext: AccessibilityContextPayload? = nil,
                      activity: ActivityPayload? = nil) -> SignalEvent {
         let stamp = MonotonicClock.stamp()
         return SignalEvent(stamp: stamp, kind: kind, clipboard: clipboard,
+                           contextBoundary: contextBoundary,
                            appFocus: appFocus, scroll: scroll, dwell: dwell,
-                           selection: selection, activity: activity)
+                           selection: selection, accessibilityContext: accessibilityContext,
+                           activity: activity)
     }
 
     private init(stamp: MonotonicClock.Stamp, kind: SignalKind,
-                 clipboard: ClipboardPayload?, appFocus: AppFocusPayload?,
+                 clipboard: ClipboardPayload?,
+                 contextBoundary: ContextBoundaryPayload?,
+                 appFocus: AppFocusPayload?,
                  scroll: ScrollBurstPayload?, dwell: DwellPayload?,
-                 selection: SelectionPayload?, activity: ActivityPayload?) {
+                 selection: SelectionPayload?,
+                 accessibilityContext: AccessibilityContextPayload?,
+                 activity: ActivityPayload?) {
         t = stamp.uptime
         self.kind = kind
         wallTime = stamp.wallTime
@@ -190,16 +247,19 @@ struct SignalEvent: Codable {
         processID = stamp.processID
         clockDiscontinuity = stamp.discontinuity
         self.clipboard = clipboard
+        self.contextBoundary = contextBoundary
         self.appFocus = appFocus
         self.scroll = scroll
         self.dwell = dwell
         self.selection = selection
+        self.accessibilityContext = accessibilityContext
         self.activity = activity
     }
 
     private enum CodingKeys: String, CodingKey {
         case t, kind, wallTime, uptime, sessionID, processID, clockDiscontinuity
-        case clipboard, appFocus, scroll, dwell, selection, activity
+        case clipboard, contextBoundary, appFocus, scroll, dwell, selection
+        case accessibilityContext, activity
     }
 
     init(from decoder: Decoder) throws {
@@ -213,10 +273,14 @@ struct SignalEvent: Codable {
         clockDiscontinuity = try c.decodeIfPresent(MonotonicClock.Discontinuity.self,
                                                     forKey: .clockDiscontinuity)
         clipboard = try c.decodeIfPresent(ClipboardPayload.self, forKey: .clipboard)
+        contextBoundary = try c.decodeIfPresent(
+            ContextBoundaryPayload.self, forKey: .contextBoundary)
         appFocus = try c.decodeIfPresent(AppFocusPayload.self, forKey: .appFocus)
         scroll = try c.decodeIfPresent(ScrollBurstPayload.self, forKey: .scroll)
         dwell = try c.decodeIfPresent(DwellPayload.self, forKey: .dwell)
         selection = try c.decodeIfPresent(SelectionPayload.self, forKey: .selection)
+        accessibilityContext = try c.decodeIfPresent(
+            AccessibilityContextPayload.self, forKey: .accessibilityContext)
         activity = try c.decodeIfPresent(ActivityPayload.self, forKey: .activity)
     }
 }

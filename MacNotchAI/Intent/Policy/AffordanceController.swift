@@ -163,6 +163,41 @@ private struct AffordanceLogFields {
     }
 }
 
+/// Makes asynchronous AppKit fade completions safe for the shared panel. Every
+/// presentation intent advances the generation; an old hide may order the panel out
+/// only if no newer show/hide intent has superseded it.
+private struct WhisperPresentationState {
+    private(set) var generation: UInt64 = 0
+    private(set) var isPresented = false
+
+    mutating func beginShow() {
+        generation &+= 1
+        isPresented = true
+    }
+
+    mutating func beginHide() -> UInt64 {
+        generation &+= 1
+        isPresented = false
+        return generation
+    }
+
+    func mayCompleteHide(_ hideGeneration: UInt64) -> Bool {
+        !isPresented && generation == hideGeneration
+    }
+}
+
+private enum AffordanceSessionOpenFailure: String, Error {
+    case pasteboardReplaced = "pasteboard_replaced"
+    case targetChangedOrExpired = "target_changed_or_expired"
+    case materializeFailed = "materialize_failed"
+    case sessionOpenerUnavailable = "session_opener_unavailable"
+    case sessionStartFailed = "session_start_failed"
+    case sessionReplacedBeforeOpen = "session_replaced_before_open"
+    case sessionRevisionUnchanged = "session_revision_unchanged"
+    case sessionRevisionMismatch = "session_revision_mismatch"
+    case sessionVerificationFailed = "session_verification_failed"
+}
+
 @MainActor
 final class AffordanceController {
 
@@ -171,12 +206,16 @@ final class AffordanceController {
     private var policy: AffordancePolicy
 
     private var window: WhisperWindow?
+    private var windowPresentation = WhisperPresentationState()
     private var current: IntentSuggestion?
     private var shownAt: TimeInterval = 0
     private var fadeTimer: Timer?
     private var tickerVisible = false
     private var tickerTask: Task<Void, Never>?
     private var tickerInteractionID: UUID?
+    /// In-flight AX resolution for a passive suggestion. Held so the surface can be
+    /// torn down mid-probe and so a second event cannot start a competing resolution.
+    private var passiveTask: Task<Void, Never>?
     private var tickerRows: [TickerRow] = []
 
     private var acceptTask: Task<Void, Never>?
@@ -191,7 +230,10 @@ final class AffordanceController {
 
     private let acceptHotkey = GlobalHotkey()
     private let summonHotkey = GlobalHotkey()
-    private let fadeSeconds: TimeInterval = 8
+    /// The whisper is peripheral by design, so it has to survive a glance that arrives
+    /// late. The decay bar in `WhisperSuggestionView` reads this value, so the two
+    /// cannot drift: the bar empties exactly when the timer fires.
+    private let fadeSeconds: TimeInterval = 12
     private let tickerTimeoutSeconds: TimeInterval = 30
 
     private var logHandle: FileHandle?
@@ -203,12 +245,116 @@ final class AffordanceController {
     private(set) var logHealth = AffordanceLogHealth(state: .stopped, url: nil, error: nil)
     var logStatusDescription: String { logHealth.description }
     private var isStarted = false
+    /// Installed explicitly by AppDelegate. This avoids resolving the SwiftUI app
+    /// delegate dynamically at the exact moment a participant accepts a suggestion.
+    private var sessionOpener: (([URL]) -> UUID?)?
+
+    /// During an active study an affordance nobody recorded is an UNOBSERVED
+    /// intervention: the participant is influenced and the trace accounts for none of
+    /// it, which is worse for the analysis than showing nothing at all. The engine
+    /// supplies this predicate rather than the controller holding a recorder, so the
+    /// gate stays checkable without a live capture file.
+    private var studyCaptureIsRecording: (() -> Bool)?
+
+    /// Absent gate ⇒ nothing requires capture (no study), so affordances may proceed.
+    private var captureAllowsAffordance: Bool { studyCaptureIsRecording?() ?? true }
 
     init(scorer: IntentScorer, extractor: FeatureExtractor) {
         self.scorer = scorer
         self.extractor = extractor
         policy = AffordancePolicy(mutes: scorer.config.mutes)
     }
+
+    func configureStudyCaptureGate(_ isRecording: @escaping () -> Bool) {
+        studyCaptureIsRecording = isRecording
+    }
+
+    func configureSessionOpener(_ opener: @escaping ([URL]) -> UUID?) {
+        sessionOpener = opener
+    }
+
+#if THESIS_STUDY_BUILD
+    static func summonPresentationCheckForTesting()
+        -> (staleHideRejected: Bool, currentHideAllowed: Bool, reopenPresented: Bool) {
+        var state = WhisperPresentationState()
+        let staleHide = state.beginHide()
+        state.beginShow()
+        let staleHideRejected = !state.mayCompleteHide(staleHide)
+            && state.isPresented
+
+        let currentHide = state.beginHide()
+        let currentHideAllowed = state.mayCompleteHide(currentHide)
+        state.beginShow()
+        let reopenPresented = state.isPresented
+            && !state.mayCompleteHide(currentHide)
+        return (staleHideRejected, currentHideAllowed, reopenPresented)
+    }
+
+    static func sessionHandoffVerificationCheckForTesting()
+        -> (openerInvoked: Bool, openerRevisionForwarded: Bool,
+            successAccepted: Bool, unchangedRejected: Bool,
+            mismatchedReturnRejected: Bool, wrongFileRejected: Bool,
+            preOpenReplacementRejected: Bool) {
+        let before = UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!
+        let opened = UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!
+        let other = UUID(uuidString: "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")!
+        let expected = URL(fileURLWithPath: "/tmp/dragaway-golden-source.txt")
+
+        let scorer = IntentScorer(config: IntentConfig())
+        let extractor = FeatureExtractor()
+        let controller = AffordanceController(scorer: scorer, extractor: extractor)
+        var receivedURLs: [URL] = []
+        controller.configureSessionOpener { urls in
+            receivedURLs = urls
+            return opened
+        }
+        let forwardedRevision = controller.requestSessionOpen([expected])
+        let openerInvoked = receivedURLs == [expected]
+        let openerRevisionForwarded = forwardedRevision == opened
+
+        let success = verifyOpenedSession(
+            before: before, returnedRevision: opened, currentRevision: opened,
+            stageIsSession: true, files: [expected], expectedURL: expected)
+        let unchanged = verifyOpenedSession(
+            before: before, returnedRevision: before, currentRevision: before,
+            stageIsSession: true, files: [expected], expectedURL: expected)
+        let mismatch = verifyOpenedSession(
+            before: before, returnedRevision: opened, currentRevision: other,
+            stageIsSession: true, files: [expected], expectedURL: expected)
+        let wrongFile = verifyOpenedSession(
+            before: before, returnedRevision: opened, currentRevision: opened,
+            stageIsSession: true,
+            files: [URL(fileURLWithPath: "/tmp/dragaway-wrong-source.txt")],
+            expectedURL: expected)
+
+        let successAccepted: Bool
+        if case .success(let revision) = success { successAccepted = revision == opened }
+        else { successAccepted = false }
+        let unchangedRejected: Bool
+        if case .failure(.sessionRevisionUnchanged) = unchanged { unchangedRejected = true }
+        else { unchangedRejected = false }
+        let mismatchedReturnRejected: Bool
+        if case .failure(.sessionRevisionMismatch) = mismatch {
+            mismatchedReturnRejected = true
+        } else {
+            mismatchedReturnRejected = false
+        }
+        let wrongFileRejected: Bool
+        if case .failure(.sessionVerificationFailed) = wrongFile {
+            wrongFileRejected = true
+        } else {
+            wrongFileRejected = false
+        }
+        let preOpenReplacementRejected = acceptSessionIsCurrent(
+            expectedRevision: before, currentRevision: before)
+            && !acceptSessionIsCurrent(expectedRevision: before,
+                                       currentRevision: other)
+        return (openerInvoked, openerRevisionForwarded,
+                successAccepted, unchangedRejected,
+                mismatchedReturnRejected, wrongFileRejected,
+                preOpenReplacementRejected)
+    }
+#endif
 
     // MARK: Lifecycle
 
@@ -267,6 +413,8 @@ final class AffordanceController {
             discardPromptState()
             tickerTask?.cancel()
             tickerTask = nil
+            passiveTask?.cancel()
+            passiveTask = nil
             fadeTimer?.invalidate()
             fadeTimer = nil
             current = nil
@@ -275,7 +423,7 @@ final class AffordanceController {
             tickerInteractionID = nil
             acceptHotkey.unregister()
             summonHotkey.unregister()
-            window?.orderOut(nil)
+            orderOutWindowImmediately()
             extractor.clearResolverCandidates()
             IntentContentVault.shared.clear()
             return
@@ -305,6 +453,8 @@ final class AffordanceController {
 
         tickerTask?.cancel()
         tickerTask = nil
+        passiveTask?.cancel()
+        passiveTask = nil
         summonHotkey.unregister()
         logSyncTimer?.invalidate()
         logSyncTimer = nil
@@ -375,54 +525,149 @@ final class AffordanceController {
         policy = AffordancePolicy(mutes: scorer.config.mutes)
     }
 
+    /// A pasteboard replacement is an external target-cancellation, not participant
+    /// rejection. Remove stale passive UI immediately and close a summoned list whose
+    /// pasteboard rows were resolved against the previous object; neither contributes
+    /// an ignored/dismissed label.
+    func pasteboardDidAdvance() {
+        guard isStarted else { return }
+        if tickerVisible {
+            closeTicker(reason: "pasteboard_target_changed")
+            return
+        }
+        guard let suggestion = current,
+              case .pasteboard = suggestion.target else { return }
+        let t = MonotonicClock.now
+        var fields = AffordanceLogFields(suggestion: suggestion)
+        fields.reason = "pasteboard_target_changed"
+        fields.latencySeconds = max(0, t - shownAt)
+        _ = writeEvent("cancelled", at: t, fields: fields)
+        hideWindow(recordIgnoreIfPending: false)
+    }
+
+    /// A conclusive AX window/document transition invalidates rows resolved against
+    /// the old target language or snapshot. Treat it as external cancellation, never
+    /// as participant rejection, and require a fresh evaluation/summon for the new
+    /// target.
+    func accessibilityTargetDidAdvance() {
+        guard isStarted else { return }
+        if tickerVisible {
+            closeTicker(reason: "accessibility_target_changed")
+            return
+        }
+        guard let suggestion = current else { return }
+        let t = MonotonicClock.now
+        var fields = AffordanceLogFields(suggestion: suggestion)
+        fields.reason = "accessibility_target_changed"
+        fields.latencySeconds = max(0, t - shownAt)
+        _ = writeEvent("cancelled", at: t, fields: fields)
+        hideWindow(recordIgnoreIfPending: false)
+    }
+
     // MARK: Passive channel
 
     func evaluate(at eventTime: TimeInterval) {
-        guard isStarted, logHealth.isHealthy,
-              current == nil, !tickerVisible, pendingAcceptance == nil else { return }
-        // Passive M3 exposes translation only. Using the global top class here can
-        // accidentally show a Translation action with a Comprehension probability.
-        guard let translation = scorer.scores(at: eventTime).first(where: {
-                  $0.intentClass == .translation
-              }), translation.probability >= scorer.config.exposureThreshold else { return }
+        guard isStarted, logHealth.isHealthy, captureAllowsAffordance,
+              current == nil, !tickerVisible, pendingAcceptance == nil,
+              passiveTask == nil else { return }
+        // Freshness checks may retract object-bound mismatch evidence. Resolve that
+        // state before reading scores so a replaced/stale clipboard object cannot
+        // surface one last suggestion from its former target.
+        let translationCandidate = extractor.translationCandidate(at: eventTime)
+
+        // Which classes may speak unprompted is configuration (product default:
+        // translation only; the study widens it). `scores` is sorted by descending
+        // probability, so the first eligible entry is the strongest one — and the
+        // class and probability shown are necessarily the SAME entry's, which is what
+        // keeps a Translation action from being labelled with a Comprehension score.
+        guard let top = scorer.scores(at: eventTime).first(where: {
+                  scorer.config.passiveClasses.contains($0.intentClass.rawValue)
+              }), top.probability >= scorer.config.exposureThreshold else { return }
 
         let interactionID = UUID()
         let frontApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-        let verdict = policy.decide(intentClass: .translation,
-                                    probability: translation.probability,
+        let verdict = policy.decide(intentClass: top.intentClass,
+                                    probability: top.probability,
                                     frontApp: frontApp,
                                     quietContext: QuietContext.isQuiet(),
                                     at: eventTime, config: scorer.config)
         guard verdict.isShow else {
             if case .silent(let reason) = verdict {
-                var fields = AffordanceLogFields()
-                fields.interactionID = interactionID
-                fields.channel = .passive
-                fields.rank = 1
-                fields.intentClass = .translation
-                fields.probability = translation.probability
-                fields.reason = reason
-                _ = writeEvent("blocked", at: eventTime, fields: fields)
+                writePassiveBlocked(reason, intentClass: top.intentClass,
+                                    probability: top.probability,
+                                    interactionID: interactionID, at: eventTime)
             }
             return
         }
 
-        guard let suggestion = TaskResolver.resolveTranslation(
-            candidate: extractor.translationCandidate(at: eventTime),
-            probability: translation.probability,
-            interactionID: interactionID, channel: .passive, rank: 1
-        ) else {
-            var fields = AffordanceLogFields()
-            fields.interactionID = interactionID
-            fields.channel = .passive
-            fields.rank = 1
-            fields.intentClass = .translation
-            fields.probability = translation.probability
-            fields.reason = "stale_or_replaced_candidate"
-            _ = writeEvent("blocked", at: eventTime, fields: fields)
+        // Translation resolves entirely from the pasteboard candidate, so it stays
+        // synchronous: no AX round-trip, and no window in which the object can move.
+        if top.intentClass == .translation {
+            guard let suggestion = TaskResolver.resolveTranslation(
+                candidate: translationCandidate,
+                probability: top.probability,
+                interactionID: interactionID, channel: .passive, rank: 1
+            ) else {
+                writePassiveBlocked("stale_or_replaced_candidate",
+                                    intentClass: top.intentClass,
+                                    probability: top.probability,
+                                    interactionID: interactionID, at: eventTime)
+                return
+            }
+            presentPassive(suggestion)
             return
         }
 
+        // Comprehension and discovery name an object the participant is looking at,
+        // which only the AX probe can identify. Freeze the vault and clipboard
+        // coordinates BEFORE awaiting, so a copy made while AX resolves cannot be
+        // smuggled into a decision that was scored without it — the same discipline
+        // the summon path uses.
+        let vault = IntentContentVault.shared.snapshot(at: eventTime)
+        let hasFreshClipboard = extractor.latestTextCandidate(at: eventTime)
+            .map { TaskResolver.pasteboardMatches($0.hash) } ?? false
+        passiveTask = Task { [weak self] in
+            guard let self else { return }
+            let ax = await DocumentReader.probe(includeDocumentFallback: !hasFreshClipboard)
+            self.passiveTask = nil
+            // The surface may have been claimed while AX was resolving.
+            guard !Task.isCancelled, self.isStarted, self.logHealth.isHealthy,
+                  self.current == nil, !self.tickerVisible,
+                  self.pendingAcceptance == nil else { return }
+
+            let context = TaskResolver.makeContext(extractor: self.extractor,
+                                                   at: eventTime, ax: ax, vault: vault)
+            guard let suggestion = TaskResolver.resolve(intentClass: top.intentClass,
+                                                        probability: top.probability,
+                                                        context: context,
+                                                        interactionID: interactionID,
+                                                        channel: .passive, rank: 1) else {
+                self.writePassiveBlocked("no_resolvable_object",
+                                         intentClass: top.intentClass,
+                                         probability: top.probability,
+                                         interactionID: interactionID, at: eventTime)
+                return
+            }
+            self.presentPassive(suggestion)
+        }
+    }
+
+    private func writePassiveBlocked(_ reason: String, intentClass: IntentClass,
+                                     probability: Double, interactionID: UUID,
+                                     at t: TimeInterval) {
+        var fields = AffordanceLogFields()
+        fields.interactionID = interactionID
+        fields.channel = .passive
+        fields.rank = 1
+        fields.intentClass = intentClass
+        fields.probability = probability
+        fields.reason = reason
+        _ = writeEvent("blocked", at: t, fields: fields)
+    }
+
+    /// Commits the rate-limit slot only here, never at decision time, so a resolution
+    /// that turned out stale cannot burn one of the participant's hourly shows.
+    private func presentPassive(_ suggestion: IntentSuggestion) {
         cancelPrompt(reason: "displaced_by_passive", hideSurface: true)
         let displayTime = MonotonicClock.now
         policy.confirmShown(at: displayTime)
@@ -441,14 +686,21 @@ final class AffordanceController {
             closeTicker(reason: "user_closed")
             return
         }
+        // Closing stays available above so an already-open surface can always be
+        // dismissed; only OPENING a new one over an unrecorded interval is refused.
+        guard captureAllowsAffordance else { return }
 
         cancelPrompt(reason: "displaced_by_summon", hideSurface: true)
         hideWindow(recordIgnoreIfPending: true)
+        // An explicit summon outranks a passive resolution still waiting on AX.
+        passiveTask?.cancel()
+        passiveTask = nil
 
         let summonTime = MonotonicClock.now
         shownAt = 0
         tickerRows = []
         let interactionID = UUID()
+        _ = extractor.translationCandidate(at: summonTime)
         let top3 = Array(scorer.scores(at: summonTime).prefix(3))
         let frontApp = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         let passiveSilent = top3.first(where: { $0.intentClass == .translation }).map {
@@ -551,44 +803,60 @@ final class AffordanceController {
         guard pendingAcceptance == nil else { return }
         let requestedAt = MonotonicClock.now
         let latency = max(0, requestedAt - shownAt)
+        let acceptanceBaseRevision = OverlayViewModel.shared.sessionRevision
         hideWindow(recordIgnoreIfPending: false)
         pendingAcceptance = suggestion
         acceptTask = Task { [weak self] in
-            await self?.completeAccept(suggestion, requestedAt: requestedAt, latency: latency)
+            await self?.completeAccept(suggestion, latency: latency,
+                                       acceptanceBaseRevision: acceptanceBaseRevision)
         }
     }
 
     private func completeAccept(_ suggestion: IntentSuggestion,
-                                requestedAt: TimeInterval,
-                                latency: TimeInterval) async {
-        var failure: String?
+                                latency: TimeInterval,
+                                acceptanceBaseRevision: UUID) async {
+        var failure: AffordanceSessionOpenFailure?
         var openedRevision: UUID?
+        var acceptedVaultReferences: [IntentContentVault.Reference]?
 
-        switch suggestion.target {
-        case .pasteboard(let hash):
-            if !TaskResolver.pasteboardMatches(hash) {
-                failure = "pasteboard_replaced"
-            } else {
-                openedRevision = openClipboardSession(suggestion: suggestion)
-                if openedRevision == nil { failure = "session_start_failed" }
-            }
+        if !Self.acceptSessionIsCurrent(
+            expectedRevision: acceptanceBaseRevision,
+            currentRevision: OverlayViewModel.shared.sessionRevision) {
+            failure = .sessionReplacedBeforeOpen
+        } else {
+            switch suggestion.target {
+            case .pasteboard(let hash):
+                switch openClipboardSession(hash: hash) {
+                case .success(let revision): openedRevision = revision
+                case .failure(let error): failure = error
+                }
 
-        case .accessibility, .clipboardVault:
-            guard let text = await TaskResolver.materializedText(for: suggestion.target,
-                                                                 at: MonotonicClock.now) else {
-                failure = "target_changed_or_expired"
-                break
+            case .accessibility, .clipboardVault:
+                guard let text = await TaskResolver.materializedText(
+                    for: suggestion.target, at: MonotonicClock.now) else {
+                    failure = .targetChangedOrExpired
+                    break
+                }
+                guard !Task.isCancelled else { return }
+                guard Self.acceptSessionIsCurrent(
+                    expectedRevision: acceptanceBaseRevision,
+                    currentRevision: OverlayViewModel.shared.sessionRevision) else {
+                    failure = .sessionReplacedBeforeOpen
+                    break
+                }
+                guard let url = DropMaterializer.materialize(.text(text)) else {
+                    failure = .materializeFailed
+                    break
+                }
+                switch openFileSession(url: url) {
+                case .success(let revision):
+                    openedRevision = revision
+                    if case .clipboardVault(let references) = suggestion.target {
+                        acceptedVaultReferences = references
+                    }
+                case .failure(let error): failure = error
+                }
             }
-            guard !Task.isCancelled else { return }
-            guard let url = DropMaterializer.materialize(.text(text)) else {
-                failure = "materialize_failed"
-                break
-            }
-            if case .clipboardVault(let references) = suggestion.target {
-                IntentContentVault.shared.discard(references)
-            }
-            openedRevision = openFileSession(url: url, suggestion: suggestion)
-            if openedRevision == nil { failure = "session_start_failed" }
         }
 
         guard !Task.isCancelled, pendingAcceptance?.interactionID == suggestion.interactionID else {
@@ -598,6 +866,9 @@ final class AffordanceController {
         acceptTask = nil
 
         if let openedRevision {
+            if let acceptedVaultReferences {
+                IntentContentVault.shared.discard(acceptedVaultReferences)
+            }
             let t = MonotonicClock.now
             policy.record(.accepted, intentClass: suggestion.intentClass, at: t,
                           config: scorer.config)
@@ -618,46 +889,71 @@ final class AffordanceController {
             NSSound.beep()
             var fields = AffordanceLogFields(suggestion: suggestion)
             fields.latencySeconds = latency
-            fields.reason = failure ?? "unknown_failure"
+            fields.reason = failure?.rawValue ?? "unknown_failure"
             _ = writeEvent("accept_failed", at: MonotonicClock.now, fields: fields)
         }
     }
 
-    private func openClipboardSession(suggestion: IntentSuggestion) -> UUID? {
-        guard let delegate = NSApp.delegate as? AppDelegate else { return nil }
-        return startSession(suggestion: suggestion, expectedURL: nil) {
-            delegate.openSessionFromClipboard()
+    private func openClipboardSession(hash: String)
+        -> Result<UUID, AffordanceSessionOpenFailure> {
+        guard let text = TaskResolver.verifiedPasteboardText(matching: hash) else {
+            return .failure(.pasteboardReplaced)
         }
+        guard let url = DropMaterializer.materialize(.text(text)) else {
+            return .failure(.materializeFailed)
+        }
+        return openFileSession(url: url)
     }
 
-    private func openFileSession(url: URL, suggestion: IntentSuggestion) -> UUID? {
-        guard let delegate = NSApp.delegate as? AppDelegate else { return nil }
-        return startSession(suggestion: suggestion, expectedURL: url) {
-            delegate.openSessionWithFiles([url])
-        }
-    }
-
-    private func startSession(suggestion: IntentSuggestion, expectedURL: URL?,
-                              open: () -> Void) -> UUID? {
+    private func openFileSession(url: URL)
+        -> Result<UUID, AffordanceSessionOpenFailure> {
+        guard sessionOpener != nil else { return .failure(.sessionOpenerUnavailable) }
         let vm = OverlayViewModel.shared
         let before = vm.sessionRevision
-        open()
+        let returnedRevision = requestSessionOpen([url])
 
         let stageIsSession: Bool
         switch vm.stage {
         case .chips, .loading, .result: stageIsSession = true
         case .waitingForDrop, .fileResult, .error: stageIsSession = false
         }
-        let files = vm.sessionFileURLs
-        let expectedPresent = expectedURL.map { expected in
-            files.contains { $0.standardizedFileURL == expected.standardizedFileURL }
-        } ?? true
-        let success = vm.sessionRevision != before && stageIsSession
-                   && !files.isEmpty && expectedPresent
-        guard success else {
-            return nil
+        return Self.verifyOpenedSession(
+            before: before,
+            returnedRevision: returnedRevision,
+            currentRevision: vm.sessionRevision,
+            stageIsSession: stageIsSession,
+            files: vm.sessionFileURLs,
+            expectedURL: url)
+    }
+
+    private func requestSessionOpen(_ urls: [URL]) -> UUID? {
+        sessionOpener?(urls)
+    }
+
+    private static func acceptSessionIsCurrent(expectedRevision: UUID,
+                                               currentRevision: UUID) -> Bool {
+        expectedRevision == currentRevision
+    }
+
+    private static func verifyOpenedSession(
+        before: UUID,
+        returnedRevision: UUID?,
+        currentRevision: UUID,
+        stageIsSession: Bool,
+        files: [URL],
+        expectedURL: URL
+    ) -> Result<UUID, AffordanceSessionOpenFailure> {
+        guard let returnedRevision else { return .failure(.sessionStartFailed) }
+        guard returnedRevision != before else { return .failure(.sessionRevisionUnchanged) }
+        guard currentRevision == returnedRevision else {
+            return .failure(.sessionRevisionMismatch)
         }
-        return vm.sessionRevision
+        let expected = expectedURL.standardizedFileURL
+        let expectedPresent = files.contains { $0.standardizedFileURL == expected }
+        guard stageIsSession, !files.isEmpty, expectedPresent else {
+            return .failure(.sessionVerificationFailed)
+        }
+        return .success(returnedRevision)
     }
 
     private func dismiss(_ suggestion: IntentSuggestion) {
@@ -767,6 +1063,10 @@ final class AffordanceController {
     }
 
     private func show(content: WhisperContent, size: CGSize) {
+        // Invalidates every pending fade-out completion before the shared panel is
+        // reused. Without this, a close from an earlier summon can order out the new
+        // ticker after its asynchronous AX resolution has already presented it.
+        windowPresentation.beginShow()
         let scale = UIScale.current.multiplier
         let scaledSize = CGSize(width: size.width * scale, height: size.height * scale)
         let win = window ?? WhisperWindow(contentSize: scaledSize)
@@ -777,6 +1077,7 @@ final class AffordanceController {
         case .suggestion(let suggestion):
             root = AnyView(WhisperSuggestionView(
                 suggestion: suggestion,
+                fadeSeconds: fadeSeconds,
                 onAccept: { [weak self] in self?.accept(suggestion) },
                 onDismiss: { [weak self] in self?.dismiss(suggestion) },
                 onHover: { [weak self] hovering in
@@ -813,6 +1114,7 @@ final class AffordanceController {
     }
 
     private func hideWindow(recordIgnoreIfPending: Bool) {
+        let hideGeneration = windowPresentation.beginHide()
         fadeTimer?.invalidate()
         fadeTimer = nil
         acceptHotkey.unregister()
@@ -830,12 +1132,31 @@ final class AffordanceController {
         tickerInteractionID = nil
         tickerRows = []
         guard let win = window else { return }
+        // Calling hide while the reusable panel is already ordered out used to arm a
+        // needless asynchronous completion. A fast AX probe could show a new ticker
+        // before that completion ran, after which the stale callback hid it again.
+        guard win.isVisible || win.alphaValue > 0.001 else {
+            win.alphaValue = 0
+            win.orderOut(nil)
+            return
+        }
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.14
             win.animator().alphaValue = 0
-        }) {
-            win.orderOut(nil)
+        }) { [weak self, weak win] in
+            MainActor.assumeIsolated {
+                guard let self, let win,
+                      self.window === win,
+                      self.windowPresentation.mayCompleteHide(hideGeneration) else { return }
+                win.orderOut(nil)
+            }
         }
+    }
+
+    private func orderOutWindowImmediately() {
+        _ = windowPresentation.beginHide()
+        window?.alphaValue = 0
+        window?.orderOut(nil)
     }
 
     private func armFade() {
@@ -1297,13 +1618,15 @@ final class AffordanceController {
         acceptHotkey.unregister()
         tickerTask?.cancel()
         tickerTask = nil
+        passiveTask?.cancel()
+        passiveTask = nil
         fadeTimer?.invalidate()
         fadeTimer = nil
         current = nil
         tickerVisible = false
         tickerRows = []
         tickerInteractionID = nil
-        window?.orderOut(nil)
+        orderOutWindowImmediately()
         extractor.clearResolverCandidates()
         IntentContentVault.shared.clear()
         NotificationCenter.default.post(name: .intentAffordanceLogFailed,

@@ -2772,3 +2772,161 @@ cross-participant export filtering is not required.
       sleep/wake, force-kill/manual recovery, reboot/login item, midnight, independent ZIP extraction,
       AX app coverage, CPU/Energy/RSS, and sufficient per-class/label counts. Do not call the build the
       final participant artefact until this passes.
+
+## Participant-controlled recent-trace erasure (IMPLEMENTED 2026-08-14; owner smoke pending)
+
+**Owner-confirmed scope:** add only a duration slider that permanently removes the most recent study
+recording interval, from **5 minutes through 4 hours in 5-minute steps**. There is no calendar/time
+picker, natural-language prompt, file lookup, app/action filter, or remote AI call. Broader semantics
+are explained organisationally during onboarding rather than added to this build.
+
+- [x] Add an active-study menu action and compact confirmation window with a 5–240 minute slider;
+      show only the selected relative duration and make the destructive action explicit.
+- [x] Stop and close both live writers before mutation, persist a crash-recoverable redaction request,
+      remove every trace event at or after the cutoff, and remove complete affordance interactions when
+      any of their lifecycle rows falls inside the erased suffix.
+- [x] Keep the operation idempotent and export-visible without retaining a reason or prompt: append one
+      content-free redaction receipt, reject export while a redaction is pending, validate every retained
+      JSONL artefact, reset inference state, and start a fresh capture segment afterward when appropriate.
+- [x] Add deterministic checks for the 5-minute/4-hour bounds, trace suffix filtering, complete
+      interaction removal, retry/idempotency, receipt validation, and malformed-source fail-closed paths.
+- [x] Update the 24-hour handoff documentation and lessons, run diff hygiene plus clean Debug and Release
+      builds, execute the built golden checks, and leave the final destructive UI smoke to the owner.
+- [ ] Owner destructive smoke on a disposable cohort: exercise 5 minutes active, 4 hours paused and
+      post-withdrawal; inspect the resulting ZIP and delete any pre-erasure export separately.
+
+## Summon and accepted-action pilot blockers (IMPLEMENTED 2026-08-14; owner smoke pending)
+
+**Observed contract:** `⌃⌥⌘I` must repeatedly toggle the manually summoned ticker. Choosing an
+actionable row must open a new overlay session for that row's accept-time-verified source and run the
+exact suggested `AIAction` once. The live content-minimised affordance log currently proves two separate
+failures: later hotkeys reach the controller but a stale panel-hide completion suppresses the new window,
+and row acceptance ends at `accept_failed/session_start_failed` before Auto-Run is armed.
+
+- [x] **Make WhisperWindow presentation generation-safe** — invalidate every older hide completion when
+      showing new content, avoid animating an already ordered-out panel, and ensure close/timeout state
+      cannot hide a later summon. Preserve the global Carbon hotkey registration and its intentional
+      keystroke consumption.
+- [x] **Replace the implicit application-delegate cast with an explicit session handoff** — configure a
+      weakly captured, main-actor session opener from `AppDelegate`; return the exact opened overlay
+      revision from clipboard/file session creation; distinguish unavailable content, materialisation,
+      opener, and session-verification failures in the content-free affordance log.
+- [x] **Keep accepted-action causality exact** — only write `accepted` after the returned revision owns a
+      non-empty supported session, then arm the revision-bound latch and run the chosen action once through
+      the existing chip/provider path (`accepted → action_started → completed|failed|cancelled`). Snapshot
+      the click-time overlay revision and reject a delayed AX/vault accept if a newer explicit session won.
+- [x] **Verify the two regressions independently in the artefact** — add deterministic
+      lifecycle/handoff checks, cover every new `accept_failed` category in the strict export fixture,
+      run diff hygiene, and pass fresh signing-disabled Debug plus clean optimized Release builds with
+      32/32 built Golden checks.
+- [ ] **Owner interaction smoke** — in the real thesis build, exercise `open → close → open` repeatedly
+      with warm AX resolution, then accept one pasteboard row and one AX row through Loading to Result.
+
+## Thesis Intent menu cleanup (IMPLEMENTED 2026-08-14; owner visual smoke pending)
+
+**Implemented participant/operator boundary:** the top level of `Intent Engine (Thesis)` contains only
+recording status/recovery plus participant-facing pause, recent-trace erasure, summon-hint, export and
+withdrawal controls. Researcher/developer setup and diagnostics move behind one `Debugging` submenu.
+
+- [x] Move `Study Setup…` and every inactive-only manual engine/recording/replay, trace-folder, score,
+      ticker, Accessibility sensor, participant-language, Golden-check, AX-probe and config control into
+      `Debugging`, retaining their existing order, state indicators and actions.
+- [x] Keep post-withdraw participant actions (`Export Existing Study Data…` and
+      `Erase Recent Traces…`) at the top level.
+- [x] Preserve the active-deployment safety invariant: operator mutators remain unavailable while a
+      study is active rather than becoming reachable through the new submenu.
+- [x] Verify the inactive, active and post-withdraw source menu matrices, run diff hygiene and clean
+      Debug plus Release builds, then document the resulting participant-facing menu contract.
+- [ ] Owner visual smoke: inspect the menu before setup, during an active recording and after withdrawal
+      on a disposable Study installation without changing the real participant cohort.
+
+## Typed confirmation for destructive Study actions (IMPLEMENTED 2026-08-14; owner smoke pending)
+
+**Owner-confirmed semantics:** both recent-trace erasure and withdrawal require the exact text
+`CONFIRM`. Only erasure says that selected data will be lost. Withdrawal keeps existing data locally
+and truthfully warns only that recording and participation end. Both retain the exact closing sentence:
+“That is okay, but be aware that this can’t be undone.”
+
+- [x] Add an exact, case-sensitive `CONFIRM` field to the recent-trace slider and disable its destructive
+      button until the field matches; keep the 5-minute-to-4-hour selection unchanged.
+- [x] Replace the Withdrawal `NSAlert` with a scaled confirmation window that accurately states the
+      retained-data behaviour and gates the existing withdrawal operation behind `CONFIRM`.
+- [x] Preserve Cancel/window-close paths without side effects and keep all writer/state transitions in
+      the existing post-confirm action methods.
+- [x] Document the confirmation contract, run diff hygiene, clean Debug/Release builds and 30/30 checks;
+      leave destructive visual/interaction smoke to the owner on a disposable cohort.
+
+## Accessibility target-context upgrade (IMPLEMENTED 2026-08-14; owner app smoke pending)
+
+**Research target:** make situations such as a German-reading participant copying German text and
+moving into an English Word `.docx` observable as strong translation intent. Accessibility is a
+required, openly disclosed part of this manually distributed Thesis instrument. Raw AX text, window
+titles and document paths may exist transiently in local memory for classification but must never be
+written to the trace/export; secure fields are a hard no-read boundary.
+
+- [x] **Add a distinct, content-minimised AX-context record** — extend the trace contract with the
+      focused app, hashed document identity, allowlisted extension, coarse focused-role category,
+      tri-state editability (`true` / `false` / unknown), document/sample language plus confidence,
+      bounded character counts, read strategy, rounded caret/visible-range progress buckets and trigger.
+      Never persist raw text, path, filename, title, AX description/identifier, absolute caret offset,
+      or unsupported arbitrary AX values; update strict canonical export validation to trace v5 and
+      consent v4 for new deployments while retaining trace-v4 read compatibility. Add the v5-only,
+      content-free `contextBoundary` payload (`pasteboard` or `accessibility_target`, optional app) so
+      live capture and replay share object invalidation without storing replacement details.
+- [x] **Make collection observer-first and lifecycle-safe** — replace the 1–3 second selection poll as
+      the primary trigger with per-frontmost-app `AXObserver` notifications for focused-element,
+      selected-text and value/layout changes, rebinding on app switches. Debounce event storms, retain
+      only a slow unsupported-app/trust fallback plus existing scroll/mouse triggers, execute reads on
+      one timeout-bounded utility queue, and discard completions by lifecycle generation, PID and
+      same-PID observation revision across pause, sleep, inactivity, revocation, app/object mutation
+      and shutdown.
+- [x] **Read only the smallest useful target context** — range-gate `AXSelectedText` for explicit
+      selections; resolve `AXDocument` locally to a same-document hash and extension. Import `.docx`
+      only when it is a regular, non-symlink, non-iCloud file on a local volume, at most 8 MiB
+      compressed and preflighted to at most 32 MiB total expansion / 2 MiB `word/document.xml`; reject
+      ZIP64, encryption and malformed archives, cache only derived scalars by `docID + mtime`, and
+      throttle full attempts per document to once per 60 seconds. Prefer a ≤4,000-character
+      `AXStringForRange(AXVisibleCharacterRange/near-caret)` sample first. Read whole focused-element
+      `AXValue` only when `AXNumberOfCharacters` first reports a non-negative length ≤12,000 and the
+      role is text-bearing, then classify at most 4,000 characters; use eligible DOCX import only as
+      the final text fallback. Keep the existing broader window
+      walk only for explicit Summon/accept-time actions, not continuous recording. Reject
+      `AXSecureTextField` before every window/document/value/range/selected-text read.
+- [x] **Turn target context into testable evidence** — compare any fresh text copy's detected language
+      with an editable target document's language independently of the participant's own language
+      repertoire; emit a dedicated strong `copy_target_language_mismatch` feature, promote that exact
+      clipboard object as the revision/hash-verified translation target, and choose the detected target
+      language when Dragaway has a matching translation action. Require `editable == true` and a real
+      destination transition (different app, a known source `docID` changing inside the same app, or a
+      replayable AX document/window boundary between copy and target), so unknown editability and same-
+      document selection/copy remain non-actionable. Bind the one evidence row to that clipboard object/
+      target, replace it on material confidence/language change, and retract it plus bound UI on every
+      later object boundary. Record one content-free v5 boundary for each pasteboard ownership revision
+      and each supported AX window/title change; never record replacement type/content/hash. Flush a
+      pending same-app copy before the AX boundary. Record focus role now but keep the postponed
+      `copy_to_search` affordance out of scope.
+- [x] **Replace scroll-only re-reading with AX-supported evidence where available** — derive a separate
+      visible-range revisit feature from rounded, same-`(app, docID)` progress buckets while retaining the
+      old scroll heuristic as a labelled fallback for apps that do not expose ranges. Keep enough
+      source/availability metadata in the trace to report coverage rather than treating missing AX
+      support as negative behaviour.
+- [x] **Make permission and transient reading unmissable in onboarding** — say plainly that while
+      recording is active and not paused, Dragaway can inspect the focused role, current selection,
+      open-document path and bounded document text to infer language/context/reading progress; raw
+      content/path is immediately discarded after local derivation, but accepting an AI action re-reads
+      its exact source for the configured provider. Show live Accessibility `Granted/Required` and
+      Launch-at-Login `Enabled/Needs approval` rows during researcher-led setup, do not start capture
+      before AX is granted, and show the same explicit AX status plus a repair action in the active
+      participant menu.
+- [ ] **OWNER — verify app-specific data value and 24-hour behaviour** — deterministic checks cover
+      German-copy → English editable DOCX, same-language silence, known bilingual-user mismatch,
+      same-document silence versus a real destination transition, editability-unknown no-mismatch,
+      secure-field exclusion in both continuous capture and explicit Summon/accept reads (including
+      secure descendants of the bounded walk), same-PID stale-read rejection, `(app, docID)` isolation, clipboard/AX
+      boundary invalidation and replay, copy-before-versus-after same-app transition, confidence
+      replacement without duplicate refresh, range revisit/dedup, legacy trace decode and strict
+      export/replay rejection.
+      Owner-smoke Word, Pages, Notes, Chrome and Preview for permission round-trip, observer
+      coverage/rebinding, lifecycle cancellation, DOCX eligibility/fallback/throttling, CPU,
+      responsiveness and actual passive translation execution before the 24-hour recording. Record
+      fresh build/check results only after the final artefact has actually run them.

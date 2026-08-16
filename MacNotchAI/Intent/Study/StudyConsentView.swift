@@ -1,3 +1,6 @@
+import AppKit
+import ApplicationServices
+import Combine
 import SwiftUI
 
 // THESIS (study instrumentation, M5) — informed consent, at the point of installation.
@@ -18,16 +21,24 @@ struct StudyConsentView: View {
 
     var onAccept: (String, [String]) -> Void
     var onCancel: () -> Void
+    var onRequestAccessibility: () -> Void
+    var onFixLoginLaunch: () -> Void
 
     @State private var participantID = ""
     @State private var readIt = false
     @State private var selectedLanguages: Set<String>
+    @State private var accessibilityGranted = AXIsProcessTrusted()
+    @State private var loginLaunchState = StudyLaunchManager.state
 
     init(initialLanguages: [String],
          onAccept: @escaping (String, [String]) -> Void,
-         onCancel: @escaping () -> Void) {
+         onCancel: @escaping () -> Void,
+         onRequestAccessibility: @escaping () -> Void,
+         onFixLoginLaunch: @escaping () -> Void) {
         self.onAccept = onAccept
         self.onCancel = onCancel
+        self.onRequestAccessibility = onRequestAccessibility
+        self.onFixLoginLaunch = onFixLoginLaunch
         let initial = Set(initialLanguages).union(["en"])
         _selectedLanguages = State(initialValue: initial)
     }
@@ -35,6 +46,7 @@ struct StudyConsentView: View {
     private var canAccept: Bool {
         readIt && !participantID.trimmingCharacters(in: .whitespaces).isEmpty
             && selectedLanguages.contains("en")
+            && accessibilityGranted
     }
 
     var body: some View {
@@ -53,6 +65,10 @@ struct StudyConsentView: View {
 
                     section("What is recorded",
                             "· when you copy, scroll, pause, switch apps, or step away\n"
+                          + "· when clipboard ownership changes; if the new item is marked "
+                          + "sensitive or cannot be safely classified, only a content-free "
+                          + "replacement marker is kept so old evidence and suggestions can be "
+                          + "cancelled\n"
                           + "· which applications are in front\n"
                           + "· measurements of text — its length, language and shape, such as "
                           + "prose or code\n"
@@ -60,6 +76,9 @@ struct StudyConsentView: View {
                           + "again' from 'something new'\n"
                           + "· compact numerical language representations, used to measure whether "
                           + "several copied passages concern the same topic\n"
+                          + "· derived Accessibility context: focused-field category and "
+                          + "editability, document type, target language, read method, and rounded "
+                          + "caret or visible-range progress\n"
                           + "· every suggestion you were shown or asked for, and what you did "
                           + "with it")
 
@@ -67,21 +86,30 @@ struct StudyConsentView: View {
                             "· the study log and export never contain the actual text you read, "
                           + "write, copy or select\n"
                           + "· no screenshots, no keystrokes, no passwords\n"
-                          + "· nothing from password managers or fields marked secure\n"
+                          + "· no content, item type, source application or fingerprint from "
+                          + "password managers or other clipboard items marked sensitive; only "
+                          + "the content-free replacement marker described above\n"
+                          + "· nothing is read from fields marked secure\n"
                           + "· no web addresses, file paths or document names")
 
                     section("When the system does read a document",
-                            "When you ask for help, Dragaway briefly checks the current selection "
-                          + "or document on this Mac to decide which actions are possible. It keeps "
-                          + "only a fingerprint and measurements and immediately discards the text. "
-                          + "The actual text is read again and handed to an action only after you "
-                          + "choose that action; this never happens in the background.")
+                            "While study recording is active and not paused, Dragaway uses macOS "
+                          + "Accessibility to inspect the focused field's role, selected text, the "
+                          + "path or window title of the open document, and a bounded text range. "
+                          + "For an eligible local Word file, a size-limited .docx archive may be "
+                          + "temporarily imported so that only a bounded sample can be classified. "
+                          + "These local reads derive language, context and approximate reading or "
+                          + "caret progress. Raw text, paths, document names and window titles are "
+                          + "not written to the study log or export and are discarded after those "
+                          + "measurements are derived. If you accept an AI action, Dragaway reads the "
+                          + "exact copied, selected or document source again and sends it to the AI "
+                          + "provider configured in Dragaway.")
 
                     section("Where it stays",
                             "The recorded study data stays on this machine and is never uploaded "
                           + "automatically. At the end you create a file yourself and send it only "
-                          + "if you still want to. It lists everything inside it in plain language "
-                          + "before you do. AI actions use the provider configured in Dragaway; "
+                          + "if you still want to. The archive contains a plain-language manifest "
+                          + "that you can inspect before sending it. AI actions use the provider configured in Dragaway; "
                           + "their normal provider traffic is not part of the study recording or "
                           + "the exported study file.")
 
@@ -109,6 +137,14 @@ struct StudyConsentView: View {
             footer
         }
         .frame(width: 590, height: 700)
+        .onAppear(perform: refreshReadiness)
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            // macOS exposes no dedicated "permission changed" notification. Returning
+            // from System Settings is the reliable, non-polling reconciliation point.
+            refreshReadiness()
+        }
     }
 
     private var header: some View {
@@ -125,6 +161,8 @@ struct StudyConsentView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 14) {
+            readiness
+
             HStack(spacing: 10) {
                 Text("Participant ID")
                     .font(.callout.weight(.medium))
@@ -162,6 +200,13 @@ struct StudyConsentView: View {
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("Start recording") {
+                    // The displayed state can become stale if permission is revoked
+                    // while this window is open, so enforce trust again at the click.
+                    guard AXIsProcessTrusted() else {
+                        refreshReadiness()
+                        onRequestAccessibility()
+                        return
+                    }
                     onAccept(participantID.trimmingCharacters(in: .whitespaces),
                              selectedLanguages.sorted())
                 }
@@ -170,6 +215,88 @@ struct StudyConsentView: View {
             }
         }
         .padding(22)
+    }
+
+    private var readiness: some View {
+        GroupBox("Study readiness") {
+            VStack(alignment: .leading, spacing: 10) {
+                readinessRow(
+                    title: "Accessibility",
+                    detail: "Required for the disclosed focused-selection and document-context reads.",
+                    ready: accessibilityGranted,
+                    status: accessibilityGranted ? "Granted" : "Required",
+                    actionTitle: accessibilityGranted ? nil : "Grant…",
+                    action: {
+                        onRequestAccessibility()
+                        refreshReadiness()
+                    })
+
+                Divider()
+
+                readinessRow(
+                    title: "Launch at Login",
+                    detail: "Keeps a 24-hour recording available after a restart.",
+                    ready: loginLaunchState == .enabled,
+                    status: loginLaunchStatus,
+                    actionTitle: loginLaunchState == .enabled ? nil : loginLaunchActionTitle,
+                    action: {
+                        onFixLoginLaunch()
+                        refreshReadiness()
+                    })
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var loginLaunchStatus: String {
+        switch loginLaunchState {
+        case .enabled: return "Enabled"
+        case .requiresApproval: return "Approval required"
+        case .notRegistered: return "Not registered"
+        case .unavailable: return "Unavailable"
+        }
+    }
+
+    private var loginLaunchActionTitle: String {
+        switch loginLaunchState {
+        case .enabled: return ""
+        case .requiresApproval: return "Open Settings…"
+        case .notRegistered: return "Register…"
+        case .unavailable: return "Check…"
+        }
+    }
+
+    private func readinessRow(title: String,
+                              detail: String,
+                              ready: Bool,
+                              status: String,
+                              actionTitle: String?,
+                              action: @escaping () -> Void) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(ready ? Color.green : Color.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(title)
+                        .font(.callout.weight(.medium))
+                    Text(status)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(ready ? Color.green : Color.orange)
+                }
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if let actionTitle {
+                Button(actionTitle, action: action)
+            }
+        }
+    }
+
+    private func refreshReadiness() {
+        accessibilityGranted = AXIsProcessTrusted()
+        loginLaunchState = StudyLaunchManager.state
     }
 
     private func languageToggle(_ name: String, code: String,

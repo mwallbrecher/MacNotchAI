@@ -30,10 +30,18 @@ enum StudyExporter {
     }
 
     static func exportToDesktop() throws -> URL {
+        guard !StudyTraceRedactor.hasPendingRequest else {
+            throw ExportError.captureUnavailable(
+                "participant-requested trace erasure is unfinished")
+        }
         let studyIsActive = StudyMode.isActive
-        if studyIsActive,
-           IntentEngine.shared.scorer.config != IntentConfig.studyConfiguration(
-                userLanguages: StudyMode.participantLanguages) {
+        // "Some legitimate frozen baseline", not "the newest one this build compiles":
+        // a cohort deployed under an earlier baseline runs on that baseline for its
+        // whole life, and comparing it against the current one stops its export dead.
+        // That the live config is also the SAME baseline this cohort was deployed with
+        // is the stronger claim, enforced by `configurationForExport` with its own
+        // message so the two failures stay distinguishable.
+        if studyIsActive, !IntentEngine.shared.scorer.config.isFrozenStudyConfiguration {
             throw ExportError.copyFailed(
                 "IntentConfig is not the frozen study configuration; export stopped")
         }
@@ -75,6 +83,16 @@ enum StudyExporter {
                 if source.lastPathComponent.hasPrefix("trace-") { validTraceCount += 1 }
                 if source.lastPathComponent == "affordance-log.jsonl" {
                     actionLifecycleAudit = try auditActionLifecycles(in: source)
+                }
+                if source.lastPathComponent == StudyTraceRedactor.receiptFileName {
+                    let receipts = try redactionReceipts(in: source)
+                    guard receipts.allSatisfy({
+                        $0.participant == deployment.participantID
+                            && $0.consentVersion == deployment.consentVersion
+                            && $0.consentAcceptedAt == deployment.consentAcceptedAt
+                    }) else {
+                        throw ExportError.invalidJSONL(source.lastPathComponent)
+                    }
                 }
             case .recoveryOnly:
                 // Recovery-only metadata has no behavioural event and therefore does
@@ -286,11 +304,14 @@ enum StudyExporter {
     }
 
     /// Structural JSON is not enough for a research artefact: `{}` is valid JSON but
-    /// unusable data. Trace line 1 must be a real v4 study header and every later line
-    /// a semantically matching SignalEvent. Every affordance line must satisfy the v4
-    /// mandatory schema, study provenance, and numerical bounds.
+    /// unusable data. Trace line 1 must be a real v4/v5 study header and every later
+    /// line a semantically matching SignalEvent. Accessibility context is v5-only;
+    /// legacy v4 remains exportable. Every affordance line must satisfy its unchanged
+    /// v4 mandatory schema, study provenance, and numerical bounds.
     private enum JSONLValidation: Equatable { case valid, recoveryOnly, headerOnly, invalid }
-    private enum JSONLKind { case trace, affordance, traceRecovery, affordanceRecovery }
+    private enum JSONLKind {
+        case trace, affordance, traceRecovery, affordanceRecovery, redaction
+    }
 
     private struct TraceEnvelope: Codable {
         struct Header: Codable {
@@ -324,6 +345,21 @@ enum StudyExporter {
         let action: String
         let affectedBytes: UInt64
         let recoveredWallTime: TimeInterval
+    }
+
+    /// The redactor uses this exact validator before replacing any live JSONL. It
+    /// deliberately accepts a header-only trace because a clean segment may contain
+    /// no retained event after suffix deletion; export itself still omits that file.
+    static func validateJSONLForRedaction(_ url: URL) throws {
+        let result = try validateJSONL(url)
+        guard result != .invalid else { throw ExportError.invalidJSONL(url.lastPathComponent) }
+    }
+
+    static func validateJSONLForRedaction(_ data: Data, named name: String) throws {
+        guard let kind = jsonlKind(for: name),
+              validateJSONLData(data, kind: kind) != .invalid else {
+            throw ExportError.invalidJSONL(name)
+        }
     }
 
     private struct AffordanceEnvelope: Codable {
@@ -442,6 +478,7 @@ enum StudyExporter {
     private static func jsonlKind(for name: String) -> JSONLKind? {
         if name == "trace-recovery-journal.jsonl" { return .traceRecovery }
         if name == "affordance-recovery-journal.jsonl" { return .affordanceRecovery }
+        if name == StudyTraceRedactor.receiptFileName { return .redaction }
         if name.hasPrefix("trace-") { return .trace }
         if name == "affordance-log.jsonl" { return .affordance }
         return nil
@@ -496,12 +533,33 @@ enum StudyExporter {
                       validAffordanceRecovery(row) else { return .invalid }
             }
             return .recoveryOnly
+
+        case .redaction:
+            var ids = Set<String>()
+            for raw in lines {
+                guard let row = try? decoder.decode(StudyRedactionReceipt.self,
+                                                    from: Data(raw.utf8)),
+                      StudyTraceRedactor.isValidReceipt(row),
+                      ids.insert(row.redactionID).inserted else { return .invalid }
+            }
+            return .valid
+        }
+    }
+
+    private static func redactionReceipts(in url: URL) throws
+        -> [StudyRedactionReceipt] {
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard data.last == 0x0A, let text = String(data: data, encoding: .utf8) else {
+            throw ExportError.invalidJSONL(url.lastPathComponent)
+        }
+        return try text.split(separator: "\n", omittingEmptySubsequences: true).map {
+            try JSONDecoder().decode(StudyRedactionReceipt.self, from: Data($0.utf8))
         }
     }
 
     private static func validTraceHeader(_ header: TraceEnvelope.Header) -> Bool {
         let study = header.study
-        guard header.v == 4,
+        guard [4, 5].contains(header.v),
               !header.app.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               header.startedWallTime.isFinite, header.startedWallTime > 0,
               header.startedUptime.isFinite, header.startedUptime >= 0,
@@ -540,6 +598,59 @@ enum StudyExporter {
             && recovery.recoveredWallTime > 0
     }
 
+    /// Shared semantic boundary for live export and deterministic replay. Keeping
+    /// this in one place prevents the replay harness from learning from rows that the
+    /// same build would later reject at export.
+    static func validAccessibilityContext(_ p: AccessibilityContextPayload,
+                                          traceVersion: Int) -> Bool {
+        guard traceVersion == 5 else { return false }
+        let roles = Set(["text_field", "text_area", "search_field", "web_area",
+                         "document", "other"])
+        let strategies = Set(["document_file", "visible_range", "value",
+                              "range_metadata", "none"])
+        let triggers = Set(["initial", "focus", "selection", "value", "layout",
+                            "scroll", "fallback"])
+        let extensions = Set(["txt", "md", "markdown", "rtf", "rtfd", "pdf",
+                              "doc", "docx", "odt", "pages", "csv", "tsv",
+                              "xls", "xlsx", "numbers", "ppt", "pptx", "key",
+                              "html", "htm"])
+        let buckets = [p.caretBucket, p.visibleStartBucket, p.visibleEndBucket]
+            .compactMap { $0 }
+        let visibleOrderIsValid: Bool
+        if let start = p.visibleStartBucket, let end = p.visibleEndBucket {
+            visibleOrderIsValid = start <= end
+        } else {
+            visibleOrderIsValid = p.visibleStartBucket == nil && p.visibleEndBucket == nil
+        }
+        guard roles.contains(p.focusedRole), strategies.contains(p.readStrategy),
+              triggers.contains(p.trigger),
+              p.app.map(validBundleIdentifier) != false,
+              p.docID.map(isHashPrefix) != false,
+              p.documentExtension.map({ extensions.contains($0) }) != false,
+              p.documentExtension == nil || p.docID != nil,
+              validLanguageCode(p.language), validConfidence(p.langConfidence),
+              (p.language == nil) == (p.langConfidence == nil),
+              (0...4_000).contains(p.sampleCharCount),
+              buckets.allSatisfy({ (0...20).contains($0) }),
+              (p.visibleStartBucket == nil) == (p.visibleEndBucket == nil),
+              visibleOrderIsValid else {
+            return false
+        }
+        if p.readStrategy == "none" {
+            return p.language == nil && p.langConfidence == nil
+                && p.sampleCharCount == 0 && buckets.isEmpty
+        }
+        if p.readStrategy == "range_metadata" {
+            return p.language == nil && p.langConfidence == nil
+                && p.sampleCharCount == 0 && !buckets.isEmpty
+        }
+        guard p.sampleCharCount > 0 else { return false }
+        if p.readStrategy == "document_file" {
+            return p.documentExtension == "docx" && p.docID != nil
+        }
+        return true
+    }
+
     private static func validSignalEvent(_ event: SignalEvent,
                                          header: TraceEnvelope.Header) -> Bool {
         guard event.t.isFinite, event.t >= 0,
@@ -550,8 +661,10 @@ enum StudyExporter {
               validDiscontinuity(event.clockDiscontinuity, wall: wall, uptime: uptime) else {
             return false
         }
-        let payloads = [event.clipboard != nil, event.appFocus != nil, event.scroll != nil,
-                        event.dwell != nil, event.selection != nil, event.activity != nil]
+        let payloads = [event.clipboard != nil, event.contextBoundary != nil,
+                        event.appFocus != nil, event.scroll != nil,
+                        event.dwell != nil, event.selection != nil,
+                        event.accessibilityContext != nil, event.activity != nil]
         guard payloads.filter({ $0 }).count == 1 else { return false }
         switch event.kind {
         case .clipboard:
@@ -584,6 +697,9 @@ enum StudyExporter {
             default:
                 return false
             }
+        case .contextBoundary:
+            guard let p = event.contextBoundary else { return false }
+            return validContextBoundary(p, traceVersion: header.v)
         case .appFocus:
             guard let p = event.appFocus else { return false }
             let categories = Set(["browser", "translator", "pdf", "notes", "editor",
@@ -627,6 +743,9 @@ enum StudyExporter {
                 && validConfidence(p.langConfidence)
                 && p.docID.map({ isHashPrefix($0) }) != false
                 && p.app.map({ !$0.isEmpty }) != false
+        case .accessibilityContext:
+            guard let p = event.accessibilityContext else { return false }
+            return validAccessibilityContext(p, traceVersion: header.v)
         case .activity:
             guard let p = event.activity else { return false }
             let states = Set(["inactive", "extended_inactivity", "active", "paused",
@@ -634,6 +753,21 @@ enum StudyExporter {
                               "terminated", "withdrawn", "accessibility_unavailable",
                               "accessibility_restored"])
             return states.contains(p.state) && p.seconds.isFinite && p.seconds >= 0
+        }
+    }
+
+    /// Shared by export and replay so a hand-edited trace cannot invent lifecycle
+    /// resets that the live v5 writer could not have produced.
+    static func validContextBoundary(_ payload: ContextBoundaryPayload,
+                                     traceVersion: Int) -> Bool {
+        guard traceVersion == 5 else { return false }
+        switch payload.scope {
+        case "pasteboard":
+            return payload.app == nil
+        case "accessibility_target":
+            return payload.app.map(validBundleIdentifier) != false
+        default:
+            return false
         }
     }
 
@@ -670,6 +804,26 @@ enum StudyExporter {
 
     private static func validConfidence(_ value: Double?) -> Bool {
         value.map { $0.isFinite && (0...1).contains($0) } ?? true
+    }
+
+    private static func validLanguageCode(_ value: String?) -> Bool {
+        guard let value else { return true }
+        return value.count == 2 && value.allSatisfy {
+            $0.isASCII && $0.isLowercase && $0.isLetter
+        }
+    }
+
+    /// Bundle identifiers are useful categorical context, but this field must never
+    /// become an escape hatch for a title, URL, or path. Keep it to the finite syntax
+    /// used by bundle IDs and cap its length before canonical export.
+    private static func validBundleIdentifier(_ value: String) -> Bool {
+        let components = value.split(separator: ".", omittingEmptySubsequences: false)
+        return value.count <= 200 && components.count >= 2
+            && components.allSatisfy({ !$0.isEmpty })
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
+                    .contains($0)
+            }
     }
 
     private static func isHashPrefix(_ value: String) -> Bool {
@@ -764,6 +918,46 @@ enum StudyExporter {
         "extended_inactivity", "sleep", "terminated", "withdrawn",
     ])
 
+    private static let objectLifecycleReasons = Set([
+        "pasteboard_target_changed", "accessibility_target_changed",
+    ])
+
+    private static let acceptFailureReasons = Set([
+        "pasteboard_replaced", "target_changed_or_expired", "materialize_failed",
+        "session_opener_unavailable", "session_start_failed",
+        "session_replaced_before_open",
+        "session_revision_unchanged", "session_revision_mismatch",
+        "session_verification_failed", "unknown_failure",
+    ])
+
+    /// The complete set of silences `AffordancePolicy.decide` can report, plus the two
+    /// the controller adds when a resolution comes back empty. Two of them are
+    /// parameterised by the sensitivity tier and are therefore matched STRUCTURALLY,
+    /// not by literal: pinning "hourly rate limit (6/h)" to the balanced tier meant a
+    /// cohort on the aggressive tier wrote "(12/h)" and lost its entire export to a
+    /// single record. The bound on the parameter is what preserves the anti-smuggling
+    /// property — an error description or file path still cannot pass through here.
+    static func validBlockedReason(_ reason: String) -> Bool {
+        let fixed: Set<String> = [
+            "class is ticker-only",
+            "quiet context",
+            "muted for this app",
+            "cooldown after dismiss/ignore",
+            "stale_or_replaced_candidate",
+            "no_resolvable_object",
+        ]
+        if fixed.contains(reason) { return true }
+        if reason.hasPrefix("hourly rate limit ("), reason.hasSuffix("/h)") {
+            let value = reason.dropFirst("hourly rate limit (".count).dropLast("/h)".count)
+            return (1...2).contains(value.count) && value.allSatisfy(\.isNumber)
+        }
+        if reason.hasPrefix("below θ("), reason.hasSuffix(")") {
+            let tier = String(reason.dropFirst("below θ(".count).dropLast())
+            return IntentConfig().thresholds.keys.contains(tier)
+        }
+        return false
+    }
+
     /// Every producer writes categorical reason codes. Keeping this an exact enum-like
     /// contract prevents a future error description, file path or content fragment from
     /// being smuggled through a known Codable field and into an otherwise canonical export.
@@ -776,20 +970,17 @@ enum StudyExporter {
                     || $0 == "discarded_incomplete_tail"
             }) == true
         case "blocked":
-            return record.reason.map({
-                ["quiet context", "cooldown after dismiss/ignore",
-                 "hourly rate limit (6/h)", "stale_or_replaced_candidate"].contains($0)
-            }) == true
+            return record.reason.map({ validBlockedReason($0) }) == true
         case "ticker_closed", "cancelled":
             return record.reason.map({
-                controllerStopReasons.contains($0) || $0 == "user_closed" || $0 == "timeout"
+                controllerStopReasons.contains($0) || objectLifecycleReasons.contains($0)
+                    || $0 == "user_closed" || $0 == "timeout"
             }) == true
         case "ignored":
             return record.reason == nil || record.reason == "displaced"
         case "accept_failed":
             return record.reason.map({
-                ["pasteboard_replaced", "session_start_failed", "target_changed_or_expired",
-                 "materialize_failed", "unknown_failure"].contains($0)
+                acceptFailureReasons.contains($0)
                     || controllerStopReasons.contains($0)
             }) == true
         case "action_failed": return record.reason == "provider_or_extraction_error"
@@ -832,8 +1023,14 @@ enum StudyExporter {
                     || $0 == "discarded_incomplete_tail"
             }) == true && record.recoveryAffectedBytes != nil && !hasInteraction
         case "blocked":
+            // The passive channel is no longer translation-only: which classes may
+            // speak unprompted is configuration (IntentConfig.passiveClasses), and a
+            // study cohort deliberately widens it. Pinning the schema to translation
+            // rejected an entire day's log the first time a comprehension suggestion
+            // was blocked. The class is already constrained to a known IntentClass by
+            // validAffordanceRecord, so requiring its presence is the real invariant.
             return hasInteraction && record.channel == "passive" && record.rank == 1
-                && record.intentClass == IntentClass.translation.rawValue
+                && record.intentClass != nil
                 && record.probability != nil && record.reason != nil
                 && record.action == nil && record.targetKind == nil
         case "summon":
@@ -1084,30 +1281,122 @@ enum StudyExporter {
     /// Small pure seam for CI/golden checks without touching the user's trace folder.
     static func schemaValidationCheckForTesting() -> Bool {
         let session = "11111111-1111-4111-8111-111111111111"
-        let header: [String: Any] = ["header": [
-            "v": 4, "app": "test", "startedWallTime": 1_700_000_000.0,
+        func header(version: Int) -> [String: Any] { ["header": [
+            "v": version, "app": "test", "startedWallTime": 1_700_000_000.0,
             "startedUptime": 100.0, "day": "20260812", "sessionID": session,
             "processID": 42, "study": ["study": "true", "participant": "P-test",
                 "boot": session, "session": session, "process": "42",
-                "consent_version": "2", "consent_accepted_at": "1700000000.0"],
+                "consent_version": "4", "consent_accepted_at": "1700000000.0"],
             "recoveredTails": [] as [Any],
-        ]]
-        let event: [String: Any] = [
+        ]] }
+        func traceJSONL(_ rows: [[String: Any]]) -> Data? {
+            var data = Data()
+            for row in rows {
+                guard let encoded = try? JSONSerialization.data(withJSONObject: row) else {
+                    return nil
+                }
+                data.append(encoded)
+                data.append(0x0A)
+            }
+            return data
+        }
+
+        var axPayload: [String: Any] = [
+            "app": "com.microsoft.Word", "docID": "aaaaaaaaaaaaaaaa",
+            "documentExtension": "docx", "focusedRole": "text_area",
+            "editable": true, "language": "en", "langConfidence": 0.96,
+            "sampleCharCount": 800, "readStrategy": "document_file",
+            "caretBucket": 4, "visibleStartBucket": 3, "visibleEndBucket": 8,
+            "trigger": "focus",
+        ]
+        // Unknown raw fields may exist in a poisoned staging row. Typed canonical
+        // re-encoding must remove them even when every known field is valid.
+        axPayload["rawText"] = "must-not-leave-staging"
+        axPayload["path"] = "/Users/example/private.docx"
+        axPayload["title"] = "Private thesis notes"
+        let axEvent: [String: Any] = [
+            "t": 101.0, "kind": "accessibilityContext",
+            "wallTime": 1_700_000_001.0, "uptime": 101.0,
+            "sessionID": session, "processID": 42,
+            "accessibilityContext": axPayload,
+        ]
+        let activityEvent: [String: Any] = [
             "t": 101.0, "kind": "activity", "wallTime": 1_700_000_001.0,
             "uptime": 101.0, "sessionID": session, "processID": 42,
             "activity": ["state": "active", "seconds": 1.0],
         ]
-        guard let headerData = try? JSONSerialization.data(withJSONObject: header),
-              let eventData = try? JSONSerialization.data(withJSONObject: event) else {
+        let boundaryEvent: [String: Any] = [
+            "t": 102.0, "kind": "contextBoundary", "wallTime": 1_700_000_002.0,
+            "uptime": 102.0, "sessionID": session, "processID": 42,
+            "contextBoundary": [
+                "scope": "pasteboard", "rawText": "must-not-leave-staging",
+            ],
+        ]
+        var invalidBoundaryEvent = boundaryEvent
+        invalidBoundaryEvent["contextBoundary"] = ["scope": "unknown"]
+        var rangeOnlyPayload = axPayload
+        rangeOnlyPayload["sampleCharCount"] = 0
+        rangeOnlyPayload["readStrategy"] = "range_metadata"
+        rangeOnlyPayload.removeValue(forKey: "language")
+        rangeOnlyPayload.removeValue(forKey: "langConfidence")
+        var rangeOnlyEvent = axEvent
+        rangeOnlyEvent["accessibilityContext"] = rangeOnlyPayload
+        guard let traceV5 = traceJSONL([header(version: 5), axEvent, boundaryEvent]),
+              let rangeOnlyV5 = traceJSONL([header(version: 5), rangeOnlyEvent]),
+              let legacyV4 = traceJSONL([header(version: 4), activityEvent]),
+              let forbiddenV4 = traceJSONL([header(version: 4), axEvent]),
+              let forbiddenBoundaryV4 = traceJSONL([header(version: 4), boundaryEvent]),
+              let invalidBoundaryV5 = traceJSONL(
+                [header(version: 5), invalidBoundaryEvent]),
+              case .valid = validateJSONLData(traceV5, kind: .trace),
+              case .valid = validateJSONLData(rangeOnlyV5, kind: .trace),
+              case .valid = validateJSONLData(legacyV4, kind: .trace),
+              case .invalid = validateJSONLData(forbiddenV4, kind: .trace),
+              case .invalid = validateJSONLData(forbiddenBoundaryV4, kind: .trace),
+              case .invalid = validateJSONLData(invalidBoundaryV5, kind: .trace),
+              let canonicalTrace = try? canonicalJSONL(traceV5, kind: .trace),
+              !["rawText", "private.docx", "Private thesis notes"].contains(where: {
+                  String(decoding: canonicalTrace, as: UTF8.self).contains($0)
+              }),
+              case .invalid = validateJSONLData(Data("{}\n".utf8), kind: .affordance) else {
             return false
         }
-        var trace = Data()
-        trace.append(headerData)
-        trace.append(0x0A)
-        trace.append(eventData)
-        trace.append(0x0A)
-        guard case .valid = validateJSONLData(trace, kind: .trace),
-              case .invalid = validateJSONLData(Data("{}\n".utf8), kind: .affordance) else {
+
+        var invalidRolePayload = axPayload
+        invalidRolePayload["focusedRole"] = "AXSecureTextField"
+        var invalidRoleEvent = axEvent
+        invalidRoleEvent["accessibilityContext"] = invalidRolePayload
+        var invalidExtensionPayload = axPayload
+        invalidExtensionPayload["documentExtension"] = "/Users/example/private.docx"
+        var invalidExtensionEvent = axEvent
+        invalidExtensionEvent["accessibilityContext"] = invalidExtensionPayload
+        var invalidBucketPayload = axPayload
+        invalidBucketPayload["caretBucket"] = 21
+        var invalidBucketEvent = axEvent
+        invalidBucketEvent["accessibilityContext"] = invalidBucketPayload
+        var emptyReadPayload = axPayload
+        emptyReadPayload["sampleCharCount"] = 0
+        emptyReadPayload.removeValue(forKey: "language")
+        emptyReadPayload.removeValue(forKey: "langConfidence")
+        var emptyReadEvent = axEvent
+        emptyReadEvent["accessibilityContext"] = emptyReadPayload
+        var emptyRangePayload = rangeOnlyPayload
+        emptyRangePayload.removeValue(forKey: "caretBucket")
+        emptyRangePayload.removeValue(forKey: "visibleStartBucket")
+        emptyRangePayload.removeValue(forKey: "visibleEndBucket")
+        var emptyRangeEvent = axEvent
+        emptyRangeEvent["accessibilityContext"] = emptyRangePayload
+        guard let invalidRoleTrace = traceJSONL([header(version: 5), invalidRoleEvent]),
+              let invalidExtensionTrace = traceJSONL(
+                [header(version: 5), invalidExtensionEvent]),
+              let invalidBucketTrace = traceJSONL([header(version: 5), invalidBucketEvent]),
+              let emptyReadTrace = traceJSONL([header(version: 5), emptyReadEvent]),
+              let emptyRangeTrace = traceJSONL([header(version: 5), emptyRangeEvent]),
+              case .invalid = validateJSONLData(invalidRoleTrace, kind: .trace),
+              case .invalid = validateJSONLData(invalidExtensionTrace, kind: .trace),
+              case .invalid = validateJSONLData(invalidBucketTrace, kind: .trace),
+              case .invalid = validateJSONLData(emptyReadTrace, kind: .trace),
+              case .invalid = validateJSONLData(emptyRangeTrace, kind: .trace) else {
             return false
         }
 
@@ -1198,6 +1487,28 @@ enum StudyExporter {
             return false
         }
 
+        // Keep every content-free session handoff failure exportable. This set is shared
+        // with production validation so adding a new producer reason cannot silently make
+        // a participant's complete export fail schema validation.
+        for reason in acceptFailureReasons {
+            var failedAccept = accepted
+            failedAccept["event"] = "accept_failed"
+            failedAccept["reason"] = reason
+            failedAccept.removeValue(forKey: "latencySeconds")
+            guard let failedAcceptLog = jsonl([boundary, shown, failedAccept]),
+                  case .valid = validateJSONLData(failedAcceptLog, kind: .affordance) else {
+                return false
+            }
+        }
+        var unsupportedAcceptFailure = accepted
+        unsupportedAcceptFailure["event"] = "accept_failed"
+        unsupportedAcceptFailure["reason"] = "unregistered_session_failure"
+        unsupportedAcceptFailure.removeValue(forKey: "latencySeconds")
+        guard let unsupportedAcceptLog = jsonl([boundary, shown, unsupportedAcceptFailure]),
+              case .invalid = validateJSONLData(unsupportedAcceptLog, kind: .affordance) else {
+            return false
+        }
+
         var actionCancelled = base("action_cancelled", "affordance_event", 204)
         actionCancelled.merge([
             "interactionID": interaction, "channel": "passive", "rank": 1,
@@ -1258,7 +1569,8 @@ enum StudyExporter {
               decoded == snapshot else { return false }
 
         var changedAfterWithdraw = frozen
-        changedAfterWithdraw.tier = "aggressive"
+        // Must differ from the frozen posture, which is itself aggressive.
+        changedAfterWithdraw.tier = "lazy"
         changedAfterWithdraw.userLanguages = ["fr"]
         guard let completedExport = try? configurationForExport(
                 activeStudy: false,
@@ -1341,6 +1653,10 @@ enum StudyExporter {
             for line in lines {
                 try append(decoder.decode(AffordanceRecoveryEnvelope.self, from: Data(line.utf8)))
             }
+        case .redaction:
+            for line in lines {
+                try append(decoder.decode(StudyRedactionReceipt.self, from: Data(line.utf8)))
+            }
         }
         return output
     }
@@ -1415,6 +1731,8 @@ enum StudyExporter {
             switch file.lastPathComponent {
             case "trace-recovery-journal.jsonl": what = "durable trace-tail recovery audit"
             case "affordance-recovery-journal.jsonl": what = "durable affordance-tail recovery audit"
+            case StudyTraceRedactor.receiptFileName:
+                what = "participant-requested recent-recording redaction intervals"
             case let n where n.hasPrefix("trace-"): what = "interaction signals for one recording segment"
             case "affordance-log.jsonl": what = "suggestions, outcomes, prompts, and model evidence"
             case "ax-probe-results.txt": what = "technical Accessibility coverage checks"
@@ -1438,6 +1756,7 @@ enum StudyExporter {
                     · no screenshots, keystrokes or passwords
                     · no web addresses, file paths or document names
                     · no content from periods explicitly paused
+                    · no recording events from participant-erased recent intervals
                   """, "", "HONEST NOTE ON ANONYMITY", String(repeating: "-", count: 60),
                   """
                   This content-minimised behavioural record is NOT anonymous. Hashes permit

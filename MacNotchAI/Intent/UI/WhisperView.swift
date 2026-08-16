@@ -101,10 +101,25 @@ struct InSituPrompt {
 
 struct WhisperSuggestionView: View {
     let suggestion: IntentSuggestion
+    /// Supplied by the controller so the bar and the actual dismiss timer are the same
+    /// number. A bar that empties early or late would misreport how much time the
+    /// participant had, which is exactly the quantity the study measures.
+    let fadeSeconds: TimeInterval
     let onAccept: () -> Void
     let onDismiss: () -> Void
     let onHover: (Bool) -> Void
     @Environment(\.uiScale) private var scale
+
+    @State private var startedAt = Date()
+    /// Non-nil while the pointer rests on the whisper: the controller invalidates its
+    /// timer then, so the bar has to stop too rather than keep draining.
+    @State private var frozenAfter: TimeInterval?
+
+    private func remainingFraction(at now: Date) -> Double {
+        guard fadeSeconds > 0 else { return 0 }
+        let spent = frozenAfter ?? now.timeIntervalSince(startedAt)
+        return min(1, max(0, 1 - spent / fadeSeconds))
+    }
 
     var body: some View {
         HStack(spacing: 10 * scale) {
@@ -149,7 +164,39 @@ struct WhisperSuggestionView: View {
             Capsule().fill(Color.black.opacity(0.92))
                 .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1 * scale))
         )
-        .onHover(perform: onHover)
+        .overlay(alignment: .bottom) { decayBar }
+        .onHover { hovering in
+            if hovering {
+                frozenAfter = Date().timeIntervalSince(startedAt)
+            } else {
+                // The controller arms a FULL fade again on exit, so the bar refills
+                // rather than resuming — otherwise it would claim less time than the
+                // participant actually has.
+                startedAt = Date()
+                frozenAfter = nil
+            }
+            onHover(hovering)
+        }
+    }
+
+    /// Sits inside the capsule, inset far enough to clear the rounded ends at any ui
+    /// scale. `.animation` drives it from the clock instead of a stored animation, so
+    /// freezing on hover is a value change rather than an animation to interrupt.
+    private var decayBar: some View {
+        TimelineView(.animation) { context in
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.white.opacity(0.10))
+                    Capsule()
+                        .fill(.white.opacity(frozenAfter == nil ? 0.45 : 0.7))
+                        .frame(width: geo.size.width * remainingFraction(at: context.date))
+                }
+            }
+        }
+        .frame(height: 2 * scale)
+        .padding(.horizontal, 22 * scale)
+        .padding(.bottom, 3.5 * scale)
+        .allowsHitTesting(false)
     }
 }
 

@@ -64,8 +64,14 @@ final class IntentEngine {
         let persistedStudyLanguages = StudyMode.participantLanguages
         let launchStudyLanguages = persistedStudyLanguages.isEmpty
             ? loadedConfig.userLanguages : persistedStudyLanguages
+        // The deployment snapshot is the durable record of what THIS cohort started
+        // with. Rebuilding from the current compiled baseline instead re-tunes a
+        // running study every time the binary changes, and makes its export fail the
+        // frozen-configuration check. The compiled baseline is only the fallback for a
+        // pre-hardening pilot that has no snapshot yet.
         let launchConfig = StudyMode.isActive
-            ? IntentConfig.studyConfiguration(userLanguages: launchStudyLanguages)
+            ? (StudyMode.deploymentSnapshot?.configuration
+                ?? IntentConfig.studyConfiguration(userLanguages: launchStudyLanguages))
             : loadedConfig
         if StudyMode.isActive {
             // One-time migration for an already-armed pre-hardening pilot.
@@ -77,11 +83,19 @@ final class IntentEngine {
         let scorer = IntentScorer(config: launchConfig)
         self.scorer = scorer
         affordances = AffordanceController(scorer: scorer, extractor: extractor)
+        // A study that offers affordances while the recorder is stopped or failed
+        // produces interventions the trace cannot account for. Outside a study there
+        // is nothing to record against, so the gate passes.
+        affordances.configureStudyCaptureGate { [weak self] in
+            guard StudyMode.isActive else { return true }
+            return self?.recorder.isRecording == true
+        }
         Self.applyLanguageConfig(scorer.config)
         // L2/L3 are ALWAYS attached: live capture and trace replay take the same
         // path. L4/L5 (the affordance surface) only reacts while the engine is
         // RUNNING — a replay must never pop UI out of historical events.
         extractor.emit = { [weak self] evidence in self?.scorer.add(evidence) }
+        extractor.invalidate = { [weak self] feature in self?.scorer.remove(feature) }
         pipelineSink = bus.events.sink { [weak self] event in
             guard let self else { return }
             // Suspension should stop every sensor at source. This guard is the second
@@ -90,6 +104,23 @@ final class IntentEngine {
             // an affordance across a pause/sleep/inactivity boundary.
             if self.captureIsSuppressed, event.kind != .activity { return }
             self.extractor.handle(event)
+            if event.kind == .contextBoundary {
+                if self.isRunning, !self.isReadOnly,
+                   !self.captureIsSuppressed, !self.isClosingGap,
+                   let boundary = event.contextBoundary {
+                    switch boundary.scope {
+                    case "pasteboard":
+                        self.affordances.pasteboardDidAdvance()
+                    case "accessibility_target":
+                        self.affordances.accessibilityTargetDidAdvance()
+                    default:
+                        break
+                    }
+                }
+                // A boundary only retracts object-bound state. It must never evaluate
+                // the remaining score and surface a new affordance by itself.
+                return
+            }
             // Read-only mode: sensors + scorer + recorder run, but the affordance
             // surface never reacts — pure capture, no whisper. This is the formative
             // (Phase 1) and general data-collection mode; observing behaviour must
@@ -373,12 +404,22 @@ final class IntentEngine {
         if wantSelection, haveIndex == nil, mayPoll {
             let sensor = SelectionSensor()
             sensor.onTrustLost = { [weak self] in self?.handleSelectionTrustLost() }
-            sensor.start(bus: bus)
+            sensor.onAccessibilityTargetBoundary = { [weak self] app in
+                self?.recordAccessibilityTargetBoundary(app: app)
+            }
+            // Insert before start: trust can be revoked between the preflight above
+            // and SelectionSensor.resume(). Its synchronous loss callback must be able
+            // to find/remove this exact sensor instead of leaving a suspended orphan.
             sensors.append(sensor)
-            markSelectionCoverageAvailable()
+            sensor.start(bus: bus)
+            if AXIsProcessTrusted(), sensors.contains(where: { $0 is SelectionSensor }) {
+                markSelectionCoverageAvailable()
+            }
         } else if wantSelection, let i = haveIndex, mayPoll {
             sensors[i].resume()
-            markSelectionCoverageAvailable()
+            if AXIsProcessTrusted(), sensors.contains(where: { $0 is SelectionSensor }) {
+                markSelectionCoverageAvailable()
+            }
         } else if !wantSelection, let i = haveIndex {
             sensors[i].stop()
             sensors.remove(at: i)
@@ -393,6 +434,19 @@ final class IntentEngine {
     private func handleSelectionTrustLost() {
         guard isRunning, !captureFailed else { return }
         reconcileSensors()
+    }
+
+    /// AX window/title notifications arrive before the replacement read. Flush a
+    /// pending copy while the extractor still owns the source segment, then persist
+    /// the content-free transition that clears it. This ordering is shared by live
+    /// capture and replay and removes the 0.5-second same-app attribution race.
+    private func recordAccessibilityTargetBoundary(app: String?) {
+        guard isRunning, !captureIsSuppressed, !isClosingGap, !captureFailed else { return }
+        (sensors.first { $0 is ClipboardSensor } as? ClipboardSensor)?.flushPendingChange()
+        bus.publish(.live(
+            kind: .contextBoundary,
+            contextBoundary: ContextBoundaryPayload(
+                scope: "accessibility_target", app: app)))
     }
 
     private func markSelectionCoverageUnavailable(notify: Bool) {
@@ -601,12 +655,32 @@ final class IntentEngine {
         scorer.reset()
     }
 
+    /// Study capture can be switched on while the engine is ALREADY running, in which
+    /// case `start()` short-circuits on `guard !isRunning` and the recorder is never
+    /// armed — the affordance surface would then sit live over an interval nothing
+    /// writes down. The capture gate refuses affordances in that state; this brings the
+    /// recorder back in line so the study resumes rather than silently staying mute.
+    @discardableResult
+    func reconcileStudyRecorder() -> Bool {
+        guard isRunning, StudyMode.isActive, !recorder.isRecording else { return true }
+        do {
+            try recorder.startOrThrow(bus: bus)
+            return true
+        } catch {
+            print("[intent] study recorder reconcile failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func reloadConfig() {
         let loaded = IntentConfig.load()
+        // Same rule as at launch: a running study reloads the configuration it was
+        // DEPLOYED with, never the one this build happens to compile now.
         scorer.config = StudyMode.isActive
-            ? .studyConfiguration(userLanguages:
-                StudyMode.participantLanguages.isEmpty
-                    ? loaded.userLanguages : StudyMode.participantLanguages)
+            ? (StudyMode.deploymentSnapshot?.configuration
+                ?? .studyConfiguration(userLanguages:
+                    StudyMode.participantLanguages.isEmpty
+                        ? loaded.userLanguages : StudyMode.participantLanguages))
             : loaded
         if StudyMode.isActive { scorer.config.save() }
         Self.applyLanguageConfig(scorer.config)

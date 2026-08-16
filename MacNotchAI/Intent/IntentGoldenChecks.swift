@@ -24,7 +24,10 @@ enum IntentGoldenChecks {
     private final class Pipeline {
         let extractor = FeatureExtractor()
         let scorer = IntentScorer(config: IntentConfig())
-        init() { extractor.emit = { [scorer] in scorer.add($0) } }
+        init() {
+            extractor.emit = { [scorer] in scorer.add($0) }
+            extractor.invalidate = { [scorer] in scorer.remove($0) }
+        }
         func feed(_ e: SignalEvent) { extractor.handle(e) }
         func p(_ c: IntentClass, at t: TimeInterval) -> Double {
             scorer.scores(at: t).first { $0.intentClass == c }?.probability ?? 0
@@ -37,10 +40,11 @@ enum IntentGoldenChecks {
     private static func textClip(t: TimeInterval, foreign: Bool, conf: Double = 0.9,
                                  chars: Int = 200, shape: String = "prose",
                                  source: String, hash: String,
+                                 language: String? = nil,
                                  embedding: [Double]? = nil) -> SignalEvent {
         SignalEvent(t: t, kind: .clipboard, clipboard: ClipboardPayload(
             contentClass: "text", charCount: chars, wordCount: chars / 6,
-            language: foreign ? "fr" : "en", langConfidence: conf,
+            language: language ?? (foreign ? "fr" : "en"), langConfidence: conf,
             isForeignLanguage: foreign, shape: shape, hasURL: false,
             hashPrefix: hash, sourceApp: source, fileExtensions: nil,
             embedding: embedding))
@@ -50,6 +54,26 @@ enum IntentGoldenChecks {
         SignalEvent(t: t, kind: .appFocus, appFocus: AppFocusPayload(
             bundleID: bundle, appName: bundle, category: category,
             previousBundleID: "com.apple.Preview", secondsInPrevious: 30))
+    }
+
+    private static func accessibilityContext(
+        t: TimeInterval, language: String? = nil, confidence: Double? = nil,
+        editable: Bool? = false, docID: String? = "dddddddddddddddd",
+        app: String = "com.microsoft.Word",
+        start: Int? = nil, end: Int? = nil, trigger: String = "focus"
+    ) -> SignalEvent {
+        SignalEvent(t: t, kind: .accessibilityContext,
+                    accessibilityContext: AccessibilityContextPayload(
+                        app: app, docID: docID,
+                        documentExtension: docID == nil ? nil : "docx",
+                        focusedRole: "text_area",
+                        editable: editable, language: language,
+                        langConfidence: confidence,
+                        sampleCharCount: language == nil ? 0 : 400,
+                        readStrategy: start != nil ? "visible_range"
+                            : (docID == nil ? "none" : "document_file"),
+                        caretBucket: nil, visibleStartBucket: start,
+                        visibleEndBucket: end, trigger: trigger))
     }
 
     nonisolated private static func pct(_ v: Double) -> String {
@@ -354,7 +378,7 @@ enum IntentGoldenChecks {
             let clipboard = FeatureExtractor.ClipCandidate(
                 t: t0, hash: "not-a-valid-hash-prefix", language: "en",
                 langConfidence: 1, source: "golden.clipboard", shape: "prose",
-                charCount: 2_000)
+                charCount: 2_000, targetLanguage: nil)
             let context = TaskResolver.Context(
                 now: t0, translationCandidate: nil, latestTextCandidate: clipboard,
                 recentCopies: 1,
@@ -464,9 +488,9 @@ enum IntentGoldenChecks {
         }
         do {
             let pass = StudyExporter.schemaValidationCheckForTesting()
-            checks.append(Check(name: "23 exporter enforces typed v4/v4 schemas",
+            checks.append(Check(name: "23 exporter enforces typed trace v5 + affordance v4",
                                 pass: pass,
-                                detail: pass ? "valid trace/lifecycle accepted; bad link rejected; unknown field stripped"
+                                detail: pass ? "v5 AX + legacy v4 accepted; AX forbidden in v4; raw fields stripped"
                                              : "schema validator fixture failed"))
         }
         do {
@@ -512,7 +536,10 @@ enum IntentGoldenChecks {
         //      declared participant language repertoire.
         do {
             var contaminated = IntentConfig()
-            contaminated.tier = "aggressive"
+            // "lazy" is the deviation marker: the frozen study posture is itself
+            // aggressive, so tuning the tier DOWN is what a contaminated install
+            // would look like.
+            contaminated.tier = "lazy"
             contaminated.priorOffsets[IntentClass.translation.rawValue] = 1.2
             contaminated.weights[FeatureID.collectMode.rawValue] = -2
             contaminated.mutes = ["translation|example.app"]
@@ -520,7 +547,11 @@ enum IntentGoldenChecks {
             let frozen = IntentConfig.studyConfiguration(
                 userLanguages: contaminated.userLanguages)
             let pass = frozen.isFrozenStudyConfiguration
-                && frozen.tier == "balanced"
+                // Study posture, inverted against the product default on purpose: a
+                // missed offer produces no observation, a premature one still does.
+                && frozen.tier == "aggressive"
+                && Set(frozen.passiveClasses) == Set(IntentClass.allCases.map(\.rawValue))
+                && IntentConfig().passiveClasses == [IntentClass.translation.rawValue]
                 && frozen.priorOffsets.isEmpty
                 && frozen.weights == IntentConfig.defaultWeights
                 && frozen.mutes.isEmpty
@@ -560,6 +591,688 @@ enum IntentGoldenChecks {
                                 detail: pass
                                     ? "post-withdraw mutations ignored; active drift rejected"
                                     : "deployment snapshot/config binding failed"))
+        }
+
+        // 30 · Participant erasure is a bounded recent suffix, never an arbitrary
+        //      content query. Any interaction crossing the cutoff disappears as one
+        //      lifecycle unit, and retrying the same durable request adds one receipt.
+        do {
+            let result = StudyTraceRedactor.redactionCheckForTesting()
+            checks.append(Check(name: "30 recent-trace erasure is bounded and idempotent",
+                                pass: result.pass,
+                                detail: result.detail))
+        }
+
+        // 31 · A warm AX probe can finish before an older fade-out callback. That
+        //      callback must not order out the newly presented summon surface, while
+        //      the current hide intent must still be allowed to complete normally.
+        do {
+            let result = AffordanceController.summonPresentationCheckForTesting()
+            let pass = result.staleHideRejected
+                && result.currentHideAllowed
+                && result.reopenPresented
+            checks.append(Check(name: "31 summon re-open rejects stale window hide",
+                                pass: pass,
+                                detail: "stale rejected=\(result.staleHideRejected), "
+                                      + "current allowed=\(result.currentHideAllowed), "
+                                      + "re-open presented=\(result.reopenPresented)"))
+        }
+
+        // 32 · Accept may advance only through a returned revision that is both the
+        //      live overlay revision and owner of the exact materialised source.
+        do {
+            let result = AffordanceController.sessionHandoffVerificationCheckForTesting()
+            let pass = result.openerInvoked
+                && result.openerRevisionForwarded
+                && result.successAccepted
+                && result.unchangedRejected
+                && result.mismatchedReturnRejected
+                && result.wrongFileRejected
+                && result.preOpenReplacementRejected
+            checks.append(Check(name: "32 accepted-action handoff verifies exact session",
+                                pass: pass,
+                                detail: "opener=\(result.openerInvoked), "
+                                      + "revision forwarded=\(result.openerRevisionForwarded), "
+                                      + "success=\(result.successAccepted), "
+                                      + "unchanged rejected=\(result.unchangedRejected), "
+                                      + "mismatch rejected=\(result.mismatchedReturnRejected), "
+                                      + "wrong file rejected=\(result.wrongFileRejected), "
+                                      + "pre-open replacement rejected="
+                                      + "\(result.preOpenReplacementRejected)"))
+        }
+
+        // 33 · Target language is task context, not participant foreignness. A
+        //      German+English reader copying German into an English editable DOCX
+        //      still crosses balanced and selects the English catalogue action.
+        do {
+            let saved = IntentText.userLanguagesOverride
+            defer { IntentText.userLanguagesOverride = saved }
+            IntentText.userLanguagesOverride = ["de", "en"]
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: false, conf: 0.95,
+                               source: "com.apple.Notes", hash: "golden-de-copy",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                           confidence: 0.96, editable: true))
+            let probability = pipe.p(.translation, at: t0 + 2)
+            let candidate = pipe.extractor.translationCandidate(at: t0 + 2)
+            let action = TaskResolver.translateAction(
+                preferredTargetLanguage: candidate?.targetLanguage,
+                avoiding: candidate?.language)
+            let invalidHashStillRejected = TaskResolver.resolveTranslation(
+                candidate: candidate, probability: probability) == nil
+            let pass = pipe.has(.copyTargetLanguageMismatch)
+                && probability >= balanced
+                && candidate?.targetLanguage == "en"
+                && action.rawValue == AIAction.translateEnglish.rawValue
+                && invalidHashStillRejected
+            checks.append(Check(name: "33 bilingual copy/target mismatch selects target language",
+                                pass: pass,
+                                detail: "translation=\(pct(probability)), target="
+                                      + "\(candidate?.targetLanguage ?? "nil"), action="
+                                      + "\(action.rawValue), hash guard=\(invalidHashStillRejected)"))
+        }
+
+        // 34 · An editable destination in the copy's own language is ordinary paste,
+        //      not translation intent, even when Accessibility supplies rich context.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: false, conf: 0.95,
+                               source: "com.apple.Notes", hash: "golden-de-same",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 2, language: "de",
+                                           confidence: 0.96, editable: true))
+            let probability = pipe.p(.translation, at: t0 + 2)
+            let pass = !pipe.has(.copyTargetLanguageMismatch)
+                && pipe.extractor.translationCandidate(at: t0 + 2) == nil
+                && probability < balanced
+            checks.append(Check(name: "34 same-language editable target stays silent",
+                                pass: pass,
+                                detail: "mismatch=\(pipe.has(.copyTargetLanguageMismatch)), "
+                                      + "translation=\(pct(probability))"))
+        }
+
+        // 35 · Returning A → B → A is a coarse same-document revisit. A duplicate
+        //      observer callback for unchanged A must not add another evidence row.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(accessibilityContext(t: t0, docID: "aaaaaaaaaaaaaaaa",
+                                           start: 2, end: 5))
+            pipe.feed(accessibilityContext(t: t0 + 5, docID: "aaaaaaaaaaaaaaaa",
+                                           start: 8, end: 11))
+            pipe.feed(accessibilityContext(t: t0 + 10, docID: "aaaaaaaaaaaaaaaa",
+                                           start: 2, end: 5))
+            pipe.feed(accessibilityContext(t: t0 + 20, docID: "aaaaaaaaaaaaaaaa",
+                                           start: 2, end: 5))
+            let count = pipe.scorer.evidence.filter {
+                $0.feature == .visibleRangeRevisit
+            }.count
+            checks.append(Check(name: "35 visible-range revisit works and deduplicates",
+                                pass: count == 1,
+                                detail: "revisit evidence rows=\(count) (want 1)"))
+        }
+
+        // 36 · The sensor's pure privacy/normalisation helpers retain the exact
+        //      4k sample, allowlist, language and 0...20 bucket contract.
+        do {
+            let result = SelectionSensor.accessibilityContextHelpersCheckForTesting()
+            checks.append(Check(name: "36 AX context helper contract",
+                                pass: result.passed, detail: result.detail))
+        }
+
+        // 37 · A copy outside the 15-second pairing window must not retain a target
+        //      language merely because general clipboard metadata lives for 90 s.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: false, conf: 0.95,
+                               source: "com.apple.Notes", hash: "stale-de-copy",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 16, language: "en",
+                                           confidence: 0.96, editable: true))
+            let pass = !pipe.has(.copyTargetLanguageMismatch)
+                && pipe.extractor.translationCandidate(at: t0 + 16) == nil
+            checks.append(Check(name: "37 stale target-language pairing is rejected",
+                                pass: pass,
+                                detail: "mismatch=\(pipe.has(.copyTargetLanguageMismatch)), "
+                                      + "candidate=\(pipe.extractor.translationCandidate(at: t0 + 16) != nil)"))
+        }
+
+        // 38 · Delivery order can legitimately be AX target first, delayed 0.5 s
+        //      clipboard poll second. The tight reverse-pairing path must recover the
+        //      cross-app Word scenario without pairing an arbitrary stale context.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(focus(t: t0, bundle: "com.microsoft.Word", category: "editor"))
+            pipe.feed(accessibilityContext(t: t0 + 0.2, language: "en",
+                                           confidence: 0.96, editable: true))
+            pipe.feed(textClip(t: t0 + 0.5, foreign: false, conf: 0.95,
+                               source: "com.apple.Notes", hash: "late-de-copy",
+                               language: "de"))
+            let candidate = pipe.extractor.translationCandidate(at: t0 + 0.5)
+            let probability = pipe.p(.translation, at: t0 + 0.5)
+            let pass = pipe.has(.copyTargetLanguageMismatch)
+                && candidate?.targetLanguage == "en"
+                && probability >= balanced
+            checks.append(Check(name: "38 delayed clipboard pairs with focused AX target",
+                                pass: pass,
+                                detail: "translation=\(pct(probability)), target="
+                                      + "\(candidate?.targetLanguage ?? "nil")"))
+        }
+
+        // 39 · A language just over the confidence floor may be useful data, but it
+        //      must not be promoted to certainty and trigger a passive suggestion.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: false, conf: 0.61,
+                               source: "com.apple.Notes", hash: "weak-de-copy",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                           confidence: 0.61, editable: true))
+            let probability = pipe.p(.translation, at: t0 + 2)
+            let pass = pipe.has(.copyTargetLanguageMismatch) && probability < balanced
+            checks.append(Check(name: "39 weak target-language confidence stays sub-threshold",
+                                pass: pass, detail: "translation=\(pct(probability))"))
+        }
+
+        // 40 · The finite action catalogue cannot truthfully target Italian. Keep the
+        //      raw AX/clipboard scalars for offline analysis, but do not emit decisive
+        //      actionable mismatch evidence that would silently fall back to English.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: false, conf: 0.95,
+                               source: "com.apple.Notes", hash: "unsupported-target",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 2, language: "it",
+                                           confidence: 0.96, editable: true))
+            let pass = !pipe.has(.copyTargetLanguageMismatch)
+                && pipe.extractor.translationCandidate(at: t0 + 2) == nil
+            checks.append(Check(name: "40 unsupported target language is not actionable",
+                                pass: pass,
+                                detail: "mismatch=\(pipe.has(.copyTargetLanguageMismatch))"))
+        }
+
+        // 41 · Target-classifier changes update routing but cannot stack another
+        //      weight-5 row. Unknown AX data preserves the valid join, conclusive
+        //      same-language data retracts it, and a later valid target can re-arm it.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: true, conf: 0.95,
+                               source: "com.apple.Notes", hash: "foreign-target-flip",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                           confidence: 0.96, editable: true))
+            pipe.feed(accessibilityContext(t: t0 + 4, language: "fr",
+                                           confidence: 0.96, editable: true))
+            let mismatchRows = pipe.scorer.evidence.filter {
+                $0.feature == .copyTargetLanguageMismatch
+            }.count
+            let updatedTarget = pipe.extractor.translationCandidate(at: t0 + 4)?.targetLanguage
+            pipe.feed(accessibilityContext(t: t0 + 5, language: "fr",
+                                           confidence: 0.96, editable: nil))
+            let unknownPreserved = pipe.scorer.evidence.contains {
+                $0.feature == .copyTargetLanguageMismatch
+            } && pipe.extractor.translationCandidate(at: t0 + 5)?.targetLanguage == "fr"
+            pipe.feed(accessibilityContext(t: t0 + 6, language: "de",
+                                           confidence: 0.96, editable: true))
+            let restored = pipe.extractor.translationCandidate(at: t0 + 6)
+            let remainingMismatchRows = pipe.scorer.evidence.filter {
+                $0.feature == .copyTargetLanguageMismatch
+            }.count
+            pipe.feed(accessibilityContext(t: t0 + 8, language: "en",
+                                           confidence: 0.96, editable: true))
+            let rearmedRows = pipe.scorer.evidence.filter {
+                $0.feature == .copyTargetLanguageMismatch
+            }.count
+            let rearmedTarget = pipe.extractor.translationCandidate(at: t0 + 8)?.targetLanguage
+            let pass = mismatchRows == 1 && updatedTarget == "fr" && unknownPreserved
+                && remainingMismatchRows == 0
+                && restored != nil && restored?.targetLanguage == nil
+                && rearmedRows == 1 && rearmedTarget == "en"
+            checks.append(Check(name: "41 mismatch state retracts, preserves unknown, and re-arms",
+                                pass: pass,
+                                detail: "rows valid/retracted/rearmed=\(mismatchRows)/"
+                                      + "\(remainingMismatchRows)/\(rearmedRows), unknown="
+                                      + "\(unknownPreserved), "
+                                      + "updated=\(updatedTarget ?? "nil"), "
+                                      + "restoredForeign=\(restored != nil && restored?.targetLanguage == nil), "
+                                      + "rearmed=\(rearmedTarget ?? "nil")"))
+        }
+
+        // 42 · Replay and export share one exact AX schema boundary: only v5 and
+        //      only semantically valid strategies/buckets may enter the pipeline.
+        do {
+            let encoder = JSONEncoder()
+            let event = accessibilityContext(t: t0, language: "en",
+                                             confidence: 0.95, editable: true)
+            let encoded = (try? encoder.encode(event)).flatMap {
+                String(data: $0, encoding: .utf8)
+            } ?? ""
+            let directory = FileManager.default.temporaryDirectory
+            let v4 = directory.appendingPathComponent("golden-ax-v4-\(UUID().uuidString).jsonl")
+            let v5 = directory.appendingPathComponent("golden-ax-v5-\(UUID().uuidString).jsonl")
+            let headerless = directory.appendingPathComponent(
+                "golden-ax-headerless-\(UUID().uuidString).jsonl")
+            let v6 = directory.appendingPathComponent("golden-ax-v6-\(UUID().uuidString).jsonl")
+            let invalidBucket = directory.appendingPathComponent(
+                "golden-ax-bucket-\(UUID().uuidString).jsonl")
+            let invalidRangeMetadata = directory.appendingPathComponent(
+                "golden-ax-range-metadata-\(UUID().uuidString).jsonl")
+            defer {
+                try? FileManager.default.removeItem(at: v4)
+                try? FileManager.default.removeItem(at: v5)
+                try? FileManager.default.removeItem(at: headerless)
+                try? FileManager.default.removeItem(at: v6)
+                try? FileManager.default.removeItem(at: invalidBucket)
+                try? FileManager.default.removeItem(at: invalidRangeMetadata)
+            }
+            try? "{\"header\":{\"v\":4}}\n\(encoded)\n".write(
+                to: v4, atomically: true, encoding: .utf8)
+            try? "{\"header\":{\"v\":5}}\n\(encoded)\n".write(
+                to: v5, atomically: true, encoding: .utf8)
+            try? "\(encoded)\n".write(to: headerless, atomically: true, encoding: .utf8)
+            try? "{\"header\":{\"v\":6}}\n\(encoded)\n".write(
+                to: v6, atomically: true, encoding: .utf8)
+            let bucketEvent = accessibilityContext(t: t0, language: "en",
+                                                    confidence: 0.95, editable: true,
+                                                    start: 99, end: 99)
+            let bucketEncoded = (try? encoder.encode(bucketEvent)).flatMap {
+                String(data: $0, encoding: .utf8)
+            } ?? ""
+            try? "{\"header\":{\"v\":5}}\n\(bucketEncoded)\n".write(
+                to: invalidBucket, atomically: true, encoding: .utf8)
+            let rangeMetadataEvent = SignalEvent(
+                t: t0, kind: .accessibilityContext,
+                accessibilityContext: AccessibilityContextPayload(
+                    app: "com.microsoft.Word", docID: "dddddddddddddddd",
+                    documentExtension: "docx", focusedRole: "text_area",
+                    editable: true, language: "en", langConfidence: 0.95,
+                    sampleCharCount: 400, readStrategy: "range_metadata",
+                    caretBucket: nil, visibleStartBucket: 2, visibleEndBucket: 5,
+                    trigger: "focus"))
+            let rangeMetadataEncoded = (try? encoder.encode(rangeMetadataEvent)).flatMap {
+                String(data: $0, encoding: .utf8)
+            } ?? ""
+            try? "{\"header\":{\"v\":5}}\n\(rangeMetadataEncoded)\n".write(
+                to: invalidRangeMetadata, atomically: true, encoding: .utf8)
+            var v4Rejected = false
+            do { _ = try TraceReplayer.load(v4) } catch { v4Rejected = true }
+            var headerlessRejected = false
+            do { _ = try TraceReplayer.load(headerless) } catch { headerlessRejected = true }
+            var v6Rejected = false
+            do { _ = try TraceReplayer.load(v6) } catch { v6Rejected = true }
+            var bucketRejected = false
+            do { _ = try TraceReplayer.load(invalidBucket) } catch { bucketRejected = true }
+            var rangeMetadataRejected = false
+            do { _ = try TraceReplayer.load(invalidRangeMetadata) } catch {
+                rangeMetadataRejected = true
+            }
+            let v5Events = (try? TraceReplayer.load(v5).events.count) ?? -1
+            checks.append(Check(name: "42 replay enforces trace-v5 AX boundary",
+                                pass: v4Rejected && headerlessRejected && v6Rejected
+                                    && bucketRejected && rangeMetadataRejected && v5Events == 1,
+                                detail: "v4/headerless/v6 rejected=\(v4Rejected)/"
+                                      + "\(headerlessRejected)/\(v6Rejected), bucket/range="
+                                      + "\(bucketRejected)/\(rangeMetadataRejected), "
+                                      + "v5 events=\(v5Events)"))
+        }
+
+        // 43 · A decisive mismatch belongs to one exact clipboard object. Every
+        //      published replacement class, plus the local privacy-gated boundary,
+        //      retracts score and resolver aliases immediately.
+        do {
+            func primed() -> Pipeline {
+                let pipe = Pipeline()
+                pipe.feed(textClip(t: t0, foreign: false, conf: 0.95,
+                                   source: "com.apple.Notes", hash: "object-a",
+                                   language: "de"))
+                pipe.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                               confidence: 0.96, editable: true))
+                return pipe
+            }
+            func replacement(_ contentClass: String) -> SignalEvent {
+                SignalEvent(t: t0 + 4, kind: .clipboard,
+                            clipboard: ClipboardPayload(
+                                contentClass: contentClass,
+                                charCount: contentClass == "url" ? 20 : 0,
+                                wordCount: contentClass == "url" ? 1 : 0,
+                                language: nil, langConfidence: nil,
+                                isForeignLanguage: false, shape: "",
+                                hasURL: contentClass == "url",
+                                hashPrefix: contentClass == "image" ? "" : "replacement-hash",
+                                sourceApp: "com.microsoft.Word",
+                                fileExtensions: contentClass == "files" ? ["pdf"] : nil))
+            }
+            func wasRetracted(_ pipe: Pipeline) -> Bool {
+                !pipe.has(.copyTargetLanguageMismatch)
+                    && pipe.extractor.translationCandidate(at: t0 + 4) == nil
+                    && pipe.p(.translation, at: t0 + 4) < balanced
+            }
+
+            let textPipe = primed()
+            textPipe.feed(textClip(t: t0 + 4, foreign: false, conf: 0.95,
+                                   source: "com.microsoft.Word", hash: "object-b",
+                                   language: "en"))
+            let text = wasRetracted(textPipe)
+                && textPipe.extractor.latestTextCandidate(at: t0 + 4)?.hash == "object-b"
+            var classes: [String: Bool] = [:]
+            for contentClass in ["url", "image", "files"] {
+                let pipe = primed()
+                pipe.feed(replacement(contentClass))
+                classes[contentClass] = wasRetracted(pipe)
+                    && pipe.extractor.latestTextCandidate(at: t0 + 4) == nil
+            }
+            let privatePipe = primed()
+            privatePipe.feed(SignalEvent(
+                t: t0 + 4, kind: .contextBoundary,
+                contextBoundary: ContextBoundaryPayload(scope: "pasteboard", app: nil)))
+            let privateBoundary = wasRetracted(privatePipe)
+                && privatePipe.extractor.latestTextCandidate(at: t0 + 4) == nil
+            let pass = text && classes.values.allSatisfy { $0 } && privateBoundary
+            checks.append(Check(name: "43 clipboard replacement retracts target mismatch",
+                                pass: pass,
+                                detail: "text=\(text), url=\(classes["url"] == true), "
+                                      + "image=\(classes["image"] == true), "
+                                      + "files=\(classes["files"] == true), "
+                                      + "private/unsupported=\(privateBoundary)"))
+        }
+
+        // 44 · Same-bundle copies bind to the document/window segment that existed
+        //      when the clipboard event was ordered. A boundary after the copy is a
+        //      destination transition; the same boundary before the copy is not.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(accessibilityContext(t: t0, language: "en", confidence: 0.96,
+                                           editable: true, docID: "source-document-a"))
+            pipe.feed(textClip(t: t0 + 60, foreign: false, conf: 0.95,
+                               source: "com.microsoft.Word", hash: "same-doc-copy",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 60.5, language: "en", confidence: 0.96,
+                                           editable: true, docID: "source-document-a"))
+            let sameDocumentSilent = !pipe.has(.copyTargetLanguageMismatch)
+            pipe.feed(SignalEvent(
+                t: t0 + 60.75, kind: .contextBoundary,
+                contextBoundary: ContextBoundaryPayload(
+                    scope: "accessibility_target", app: "com.microsoft.Word")))
+            pipe.feed(accessibilityContext(t: t0 + 61, language: "en", confidence: 0.96,
+                                           editable: true, docID: "target-document-b"))
+            let differentDocumentDetected = pipe.has(.copyTargetLanguageMismatch)
+                && pipe.extractor.translationCandidate(at: t0 + 61)?.targetLanguage == "en"
+
+            let copiedAfterBoundary = Pipeline()
+            copiedAfterBoundary.feed(accessibilityContext(
+                t: t0, language: "en", confidence: 0.96,
+                editable: true, docID: "source-document-a"))
+            copiedAfterBoundary.feed(SignalEvent(
+                t: t0 + 1, kind: .contextBoundary,
+                contextBoundary: ContextBoundaryPayload(
+                    scope: "accessibility_target", app: "com.microsoft.Word")))
+            copiedAfterBoundary.feed(textClip(
+                t: t0 + 1.2, foreign: false, conf: 0.95,
+                source: "com.microsoft.Word", hash: "copy-in-target-doc",
+                language: "de"))
+            copiedAfterBoundary.feed(accessibilityContext(
+                t: t0 + 2, language: "en", confidence: 0.96,
+                editable: true, docID: "target-document-b"))
+            let postBoundaryCopySilent = !copiedAfterBoundary.has(.copyTargetLanguageMismatch)
+            checks.append(Check(name: "44 mismatch requires a destination transition",
+                                pass: sameDocumentSilent && differentDocumentDetected
+                                    && postBoundaryCopySilent,
+                                detail: "60 s source binding silent=\(sameDocumentSilent), "
+                                      + "different doc detected=\(differentDocumentDetected), "
+                                      + "copy after boundary silent=\(postBoundaryCopySilent)"))
+        }
+
+        // 45 · A common title such as "Untitled" may hash to the same docID in two
+        //      apps. Document evidence is keyed by (app, docID), so cross-app rows
+        //      cannot manufacture repeat-selection or A→B→A revisit evidence.
+        do {
+            let selectionPipe = Pipeline()
+            func selection(_ t: TimeInterval, app: String) -> SignalEvent {
+                SignalEvent(t: t, kind: .selection, selection: SelectionPayload(
+                    app: app, charCount: 40, wordCount: 7,
+                    language: "en", langConfidence: 1, isForeignLanguage: false,
+                    shape: "prose", hashPrefix: "same-selection-hash",
+                    docID: "same-untitled-id", isTranslatorContext: false))
+            }
+            selectionPipe.feed(selection(t0, app: "golden.app.one"))
+            selectionPipe.feed(selection(t0 + 5, app: "golden.app.two"))
+            let repeatSilent = !selectionPipe.has(.repeatSelection)
+
+            let rangePipe = Pipeline()
+            rangePipe.feed(accessibilityContext(t: t0, app: "golden.app.one",
+                                                start: 2, end: 5))
+            rangePipe.feed(accessibilityContext(t: t0 + 5, app: "golden.app.two",
+                                                start: 8, end: 11))
+            rangePipe.feed(accessibilityContext(t: t0 + 10, app: "golden.app.one",
+                                                start: 2, end: 5))
+            let revisitSilent = !rangePipe.has(.visibleRangeRevisit)
+            checks.append(Check(name: "45 document evidence includes app identity",
+                                pass: repeatSilent && revisitSilent,
+                                detail: "cross-app repeat silent=\(repeatSilent), "
+                                      + "cross-app revisit silent=\(revisitSilent)"))
+        }
+
+        // 46 · Material confidence changes replace the one object-bound row. A
+        //      weak first target can become actionable, a weaker reclassification can
+        //      lower it again, and identical observer duplicates never refresh time.
+        do {
+            let rising = Pipeline()
+            rising.feed(textClip(t: t0, foreign: false, conf: 0.96,
+                                 source: "com.apple.Notes", hash: "confidence-rises",
+                                 language: "de"))
+            rising.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                             confidence: 0.61, editable: true))
+            let weakProbability = rising.p(.translation, at: t0 + 2)
+            rising.feed(accessibilityContext(t: t0 + 4, language: "en",
+                                             confidence: 0.96, editable: true))
+            let strongProbability = rising.p(.translation, at: t0 + 4)
+            let replacedAt = rising.scorer.evidence.first {
+                $0.feature == .copyTargetLanguageMismatch
+            }?.t
+            rising.feed(accessibilityContext(t: t0 + 6, language: "en",
+                                             confidence: 0.96, editable: true))
+            let duplicateDidNotRefresh = rising.scorer.evidence.first {
+                $0.feature == .copyTargetLanguageMismatch
+            }?.t == replacedAt
+
+            let falling = Pipeline()
+            falling.feed(textClip(t: t0, foreign: false, conf: 0.96,
+                                  source: "com.apple.Notes", hash: "confidence-falls",
+                                  language: "de"))
+            falling.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                              confidence: 0.96, editable: true))
+            falling.feed(accessibilityContext(t: t0 + 4, language: "en",
+                                              confidence: 0.61, editable: true))
+            let loweredProbability = falling.p(.translation, at: t0 + 4)
+            let oneRow = rising.scorer.evidence.filter {
+                $0.feature == .copyTargetLanguageMismatch
+            }.count == 1 && falling.scorer.evidence.filter {
+                $0.feature == .copyTargetLanguageMismatch
+            }.count == 1
+            let pass = weakProbability < balanced && strongProbability >= balanced
+                && loweredProbability < balanced && duplicateDidNotRefresh && oneRow
+            checks.append(Check(name: "46 mismatch confidence replaces without stacking",
+                                pass: pass,
+                                detail: "weak/strong/lowered=\(pct(weakProbability))/"
+                                      + "\(pct(strongProbability))/\(pct(loweredProbability)), "
+                                      + "duplicate stable=\(duplicateDidNotRefresh), rows=\(oneRow)"))
+        }
+
+        // 47 · Content-free object boundaries are first-class v5 trace data. Replay
+        //      must retract the same mismatch as live capture, and an AX boundary
+        //      remains conclusive even if the replacement target has no docID/read.
+        do {
+            let pipe = Pipeline()
+            pipe.feed(textClip(t: t0, foreign: false, conf: 0.95,
+                               source: "com.apple.Notes", hash: "boundary-object",
+                               language: "de"))
+            pipe.feed(accessibilityContext(t: t0 + 2, language: "en",
+                                           confidence: 0.96, editable: true))
+            pipe.feed(SignalEvent(
+                t: t0 + 3, kind: .contextBoundary,
+                contextBoundary: ContextBoundaryPayload(
+                    scope: "accessibility_target", app: "com.microsoft.Word")))
+            pipe.feed(accessibilityContext(t: t0 + 4, language: nil,
+                                           confidence: nil, editable: nil,
+                                           docID: nil))
+            let missingTargetRetracted = !pipe.has(.copyTargetLanguageMismatch)
+                && pipe.extractor.translationCandidate(at: t0 + 4) == nil
+
+            let boundary = SignalEvent(
+                t: t0, kind: .contextBoundary,
+                contextBoundary: ContextBoundaryPayload(scope: "pasteboard", app: nil))
+            let invalidBoundary = SignalEvent(
+                t: t0, kind: .contextBoundary,
+                contextBoundary: ContextBoundaryPayload(scope: "unknown", app: nil))
+            let encoder = JSONEncoder()
+            let encoded = (try? encoder.encode(boundary)).flatMap {
+                String(data: $0, encoding: .utf8)
+            } ?? ""
+            let invalidEncoded = (try? encoder.encode(invalidBoundary)).flatMap {
+                String(data: $0, encoding: .utf8)
+            } ?? ""
+            let directory = FileManager.default.temporaryDirectory
+            let v4 = directory.appendingPathComponent(
+                "golden-boundary-v4-\(UUID().uuidString).jsonl")
+            let v5 = directory.appendingPathComponent(
+                "golden-boundary-v5-\(UUID().uuidString).jsonl")
+            let invalid = directory.appendingPathComponent(
+                "golden-boundary-invalid-\(UUID().uuidString).jsonl")
+            defer {
+                try? FileManager.default.removeItem(at: v4)
+                try? FileManager.default.removeItem(at: v5)
+                try? FileManager.default.removeItem(at: invalid)
+            }
+            try? "{\"header\":{\"v\":4}}\n\(encoded)\n".write(
+                to: v4, atomically: true, encoding: .utf8)
+            try? "{\"header\":{\"v\":5}}\n\(encoded)\n".write(
+                to: v5, atomically: true, encoding: .utf8)
+            try? "{\"header\":{\"v\":5}}\n\(invalidEncoded)\n".write(
+                to: invalid, atomically: true, encoding: .utf8)
+            var v4Rejected = false
+            do { _ = try TraceReplayer.load(v4) } catch { v4Rejected = true }
+            var invalidRejected = false
+            do { _ = try TraceReplayer.load(invalid) } catch { invalidRejected = true }
+            let v5Count = (try? TraceReplayer.load(v5).events.count) ?? -1
+            let pass = missingTargetRetracted && v4Rejected && invalidRejected && v5Count == 1
+            checks.append(Check(name: "47 context boundaries replay and retract exactly",
+                                pass: pass,
+                                detail: "missing target retracted=\(missingTargetRetracted), "
+                                      + "v4/invalid rejected=\(v4Rejected)/\(invalidRejected), "
+                                      + "v5 events=\(v5Count)"))
+        }
+
+        // 48 · The separate accept-time DocumentReader must enforce the same hard
+        //      secure-field boundary as the background sensor. Missing/ambiguous role
+        //      transport is fail-closed; an ordinary optional subrole may proceed.
+        do {
+            let result = DocumentReader.secureReadBoundaryCheckForTesting()
+            checks.append(Check(name: "48 document reader secure gate fails closed",
+                                pass: result.passed, detail: result.detail))
+        }
+
+        // 49 · Accept-time re-verification is scope-dependent. A selection claims exact
+        //      words and must match byte for byte; an IDENTIFIED document claims "what
+        //      you are working in", which survives editing between offer and accept.
+        //      An unidentified document has nothing to anchor sameness on and stays
+        //      strict, so a switch to another file in the same app cannot slip through.
+        do {
+            let selectionStrict = DocumentReader.requiresExactContent(
+                scope: .selection, docID: "doc-1")
+            let selectionStrictWithoutID = DocumentReader.requiresExactContent(
+                scope: .selection, docID: nil)
+            let documentRelaxed = !DocumentReader.requiresExactContent(
+                scope: .document, docID: "doc-1")
+            let unidentifiedStrict = DocumentReader.requiresExactContent(
+                scope: .document, docID: nil)
+            let pass = selectionStrict && selectionStrictWithoutID
+                && documentRelaxed && unidentifiedStrict
+            checks.append(Check(name: "49 accept re-verification is scope-dependent",
+                                pass: pass,
+                                detail: "selection_strict=\(selectionStrict), "
+                                      + "selection_strict_no_id=\(selectionStrictWithoutID), "
+                                      + "document_relaxed=\(documentRelaxed), "
+                                      + "unidentified_strict=\(unidentifiedStrict)"))
+        }
+
+        // 50 · EVERY known frozen baseline must stay exportable, not just the newest.
+        //      A deployment recorded under an earlier baseline has to validate after
+        //      the study posture moves; when this check fails, a study already running
+        //      in the field has just lost the ability to export its capture.
+        do {
+            let languages = ["de", "en"]
+            let allValidate = IntentConfig.StudyBaseline.allCases.allSatisfy {
+                IntentConfig.studyConfiguration(userLanguages: languages, baseline: $0)
+                    .isFrozenStudyConfiguration
+            }
+            // Baselines must remain distinguishable, otherwise appending one is a no-op.
+            let distinct = Set(IntentConfig.StudyBaseline.allCases.map {
+                IntentConfig.studyConfiguration(userLanguages: languages, baseline: $0).tier
+            }).count == IntentConfig.StudyBaseline.allCases.count
+            var handTuned = IntentConfig.studyConfiguration(userLanguages: languages)
+            handTuned.weights[FeatureID.collectMode.rawValue] = -2
+            let rejectsTuning = !handTuned.isFrozenStudyConfiguration
+            let pass = allValidate && distinct && rejectsTuning
+            checks.append(Check(name: "50 every known study baseline stays exportable",
+                                pass: pass,
+                                detail: "baselines=\(IntentConfig.StudyBaseline.allCases.count), "
+                                      + "all_validate=\(allValidate), distinct=\(distinct), "
+                                      + "rejects_hand_tuning=\(rejectsTuning)"))
+        }
+
+        // 51 · Every silence the policy can report must survive export. One reason the
+        //      exporter does not recognise invalidates the ENTIRE affordance log, and a
+        //      day of capture with it. This drives the real producer through each
+        //      branch instead of restating its strings — restating them is exactly how
+        //      the two drifted apart.
+        do {
+            let config = IntentConfig.studyConfiguration(userLanguages: ["de", "en"])
+            let t: TimeInterval = 1_000
+            var reasons: [String] = []
+            func capture(_ verdict: AffordancePolicy.Verdict) {
+                if case .silent(let reason) = verdict { reasons.append(reason) }
+            }
+            func decide(_ policy: inout AffordancePolicy, probability: Double,
+                        app: String, quiet: Bool, at time: TimeInterval,
+                        config: IntentConfig) {
+                capture(policy.decide(intentClass: .translation, probability: probability,
+                                      frontApp: app, quietContext: quiet,
+                                      at: time, config: config))
+            }
+
+            var tickerOnlyConfig = config
+            tickerOnlyConfig.passiveClasses = []
+            var policy = AffordancePolicy()
+            decide(&policy, probability: 0.99, app: "a.app", quiet: false,
+                   at: t, config: tickerOnlyConfig)                       // ticker-only
+            decide(&policy, probability: 0.01, app: "a.app", quiet: false,
+                   at: t, config: config)                                 // below θ(tier)
+            decide(&policy, probability: 0.99, app: "a.app", quiet: true,
+                   at: t, config: config)                                 // quiet context
+            policy.mute(intentClass: .translation, app: "a.app")
+            decide(&policy, probability: 0.99, app: "a.app", quiet: false,
+                   at: t, config: config)                                 // muted
+
+            var cooled = AffordancePolicy()
+            cooled.record(.dismissed, intentClass: .translation, at: t, config: config)
+            decide(&cooled, probability: 0.99, app: "b.app", quiet: false,
+                   at: t + 1, config: config)                             // cooldown
+
+            var limited = AffordancePolicy()
+            for i in 0..<config.rateLimitPerHour { limited.confirmShown(at: t + Double(i)) }
+            decide(&limited, probability: 0.99, app: "b.app", quiet: false,
+                   at: t + 100, config: config)                           // rate limit (tier!)
+
+            // The controller adds these two when a resolution comes back empty.
+            let all = reasons + ["stale_or_replaced_candidate", "no_resolvable_object"]
+            let unexportable = all.filter { !StudyExporter.validBlockedReason($0) }
+            let pass = reasons.count == 6 && unexportable.isEmpty
+            checks.append(Check(name: "51 every policy silence is exportable",
+                                pass: pass,
+                                detail: pass
+                                    ? "\(all.count) reasons, all accepted"
+                                    : "branches=\(reasons.count)/6, unexportable: "
+                                        + unexportable.joined(separator: " | ")))
         }
 
         return checks

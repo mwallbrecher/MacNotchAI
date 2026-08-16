@@ -27,7 +27,7 @@ enum StudyMode {
 
     /// Current consent text version. Bump when the wording changes so the log records
     /// which version a participant actually agreed to.
-    static let consentVersion = 3
+    static let consentVersion = 4
 
     // MARK: State
 
@@ -52,7 +52,9 @@ enum StudyMode {
         }
     }
 
-    /// Consent is recorded per version: a wording change re-asks rather than assuming.
+    /// Reports whether the current wording was accepted. This is provenance/readiness
+    /// state only: an already-active deployment is not stopped merely because a later
+    /// build contains a newer consent version.
     static var hasConsented: Bool {
         UserDefaults.standard.integer(forKey: consentKey) >= consentVersion
     }

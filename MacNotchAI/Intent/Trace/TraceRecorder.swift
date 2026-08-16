@@ -306,7 +306,7 @@ final class TraceRecorder {
 
         do {
             let header = TraceHeader(
-                v: 4,
+                v: 5,
                 app: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?",
                 startedWallTime: MonotonicClock.wallNow,
                 startedUptime: MonotonicClock.uptimeNow,
@@ -509,7 +509,7 @@ final class TraceRecorder {
     }
 
     /// Journal before mutating the source tail. If opening the next trace fails, the
-    /// repair remains durable and will be folded into the next successful v4 header.
+    /// repair remains durable and will be folded into the next successful v5 header.
     private static func appendRecoveryJournal(_ recovery: TraceTailRecovery,
                                               in directory: URL) throws {
         let url = recoveryJournalURL(in: directory)

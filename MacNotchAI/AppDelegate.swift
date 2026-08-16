@@ -11,6 +11,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     private var feedbackWindow: NSWindow?
     /// THESIS: the consent sheet shown once, at the onboarding meeting.
     private var studyConsentWindow: NSWindow?
+    /// Participant-owned recent-trace deletion control (study build only).
+    private var studyTraceEraseWindow: NSWindow?
+    /// Typed confirmation for ending the active study (study build only).
+    private var studyWithdrawalWindow: NSWindow?
     private var exposeWindow: NSWindow?
     private var joinWindow: NSWindow?
     private var tutorialWindow: NSWindow?
@@ -71,18 +75,41 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // existing installations keep their exact previous route.
         _ = AIModelCatalogStore.shared
 
-        // Core Dragaway behavior requests no permissions. Drag detection, hotkeys,
-        // the radial launcher, and Esc all use ungated APIs. The sole exception is
-        // the default-off Enhanced Access setting: after explicit user intent it can
-        // request event-posting access for Clipboard History paste-on-pick. Never
-        // make any core path depend on that optional permission.
+        // Core product behavior remains permission-free. The default-off Enhanced
+        // Access feature is still only for Clipboard History paste-on-pick. Separately,
+        // a THESIS study deployment requires the explicitly disclosed Accessibility
+        // context sensor before its researcher-led recording can start.
         DragMonitor.shared.startMonitoring()
+
+        // Finish a crash-interrupted participant erasure before opening either live
+        // writer. A pending request is a privacy write-ahead journal, not an optional
+        // cleanup; capture/export remain stopped until it succeeds.
+        var studyRedactionStartupIssue: String?
+#if THESIS_STUDY_BUILD
+        do { try StudyTraceRedactor.resumePendingIfNeeded() }
+        catch { studyRedactionStartupIssue = error.localizedDescription }
+#endif
 
         // THESIS (Computational Intent Pipeline): passive signal capture — inert
         // unless the research flag is set (Debug menu → Intent Engine, or
         // `defaults write com.wallbrecher.dragaway intentEngineEnabled -bool YES`).
         // M1 uses zero permissions. See docs/thesis/ARCHITECTURE.md.
-        IntentEngine.shared.startIfEnabled()
+        let intentEngine = IntentEngine.shared
+        intentEngine.affordances.configureSessionOpener { [weak self] urls in
+            self?.openSessionWithFiles(urls)
+        }
+        var studyAXStartupIssue: String?
+#if THESIS_STUDY_BUILD
+        if StudyMode.isActive, !intentEngine.isPaused,
+           (!intentEngine.axSensorEnabled || !AXIsProcessTrusted()) {
+            // Fail closed on relaunch: do not open a new trace or arm the
+            // permission-free sensors before the required AX context coverage exists.
+            studyAXStartupIssue = "Accessibility context is not ready; recording was not started"
+        }
+#endif
+        if studyRedactionStartupIssue == nil, studyAXStartupIssue == nil {
+            intentEngine.startIfEnabled()
+        }
         observeDragState()
         observeDragOutState()
         observeStageChanges()
@@ -94,7 +121,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
 #if THESIS_STUDY_BUILD
         // Startup failures must be participant-visible without requiring them to
         // inspect Console or happen to open the status menu.
-        if StudyMode.isActive, let issue = studyCaptureIssue(IntentEngine.shared) {
+        if let issue = studyRedactionStartupIssue {
+            DispatchQueue.main.async { [weak self] in
+                self?.showStudyCaptureFailure("recent-trace erasure: \(issue)")
+            }
+        } else if let issue = studyAXStartupIssue {
+            DispatchQueue.main.async { [weak self] in self?.showStudyCaptureFailure(issue) }
+        } else if StudyMode.isActive, let issue = studyCaptureIssue(IntentEngine.shared) {
             DispatchQueue.main.async { [weak self] in self?.showStudyCaptureFailure(issue) }
         }
 #endif
@@ -237,6 +270,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // THESIS: invalidate event sources before flushing/closing the two JSONL
         // streams. This also generation-cancels any AX request still in flight.
         IntentEngine.shared.prepareForTermination()
+        // Unconditional: enhanced-accessibility flags may have been raised before the
+        // engine stopped, and no observed application may outlive Dragaway in a mode
+        // Dragaway put it into.
+        DocumentReader.releaseEnhancedAccessibility()
     }
 
 #if THESIS_STUDY_BUILD
@@ -290,10 +327,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// Open Stage 2 (chips) for files handed over by the Finder Quick Action. Mirrors
     /// restoreMinimizedSession()'s window bring-up: cancel any pending dismiss, reuse or
     /// build the overlay window, populate the session, size/place, and bring forward.
+    @discardableResult
     @MainActor
-    func openSessionWithFiles(_ urls: [URL]) {
+    func openSessionWithFiles(_ urls: [URL]) -> UUID? {
         let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
-        guard !supported.isEmpty else { return }
+        guard !supported.isEmpty else { return nil }
 
         // Cancel any pending dismiss so a fading window isn't torn down under us.
         dismissToken       = UUID()
@@ -303,6 +341,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // dismissal. Revive the shared view model explicitly so an early handoff
         // cannot inherit `isCollapsing == true` and open an invisible chips card.
         let vm = OverlayViewModel.shared
+        let priorRevision = vm.sessionRevision
         vm.isCollapsing = false
 
         if overlayWindow == nil {
@@ -328,6 +367,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         overlayWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         startDismissMonitors()
+        guard vm.sessionRevision != priorRevision,
+              !vm.sessionFileURLs.isEmpty else { return nil }
+        return vm.sessionRevision
     }
 
     /// Called by macOS whenever the user switches Mission Control spaces.
@@ -527,6 +569,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // Menu open is also a reconcile moment: for a menu-bar app it's the likeliest
         // "user came back from System Settings after granting AX" trigger.
         IntentEngine.shared.reconcileSensors()
+        // Same moment, same reason: a study whose recorder stopped while the engine
+        // kept running is mute but still armed. The capture gate refuses affordances
+        // until this succeeds, so recovering here is what ends the silence.
+        IntentEngine.shared.reconcileStudyRecorder()
         menu.addItem(.separator())
         let intentItem = NSMenuItem(title: "Intent Engine (Thesis)", action: nil, keyEquivalent: "")
         let intentSub = NSMenu()
@@ -553,6 +599,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
                             : (issue == nil
                                 ? "● Recording · \(StudyMode.participantID ?? "?") · \(day) · \(events) events"
                                 : "⛔︎ INCOMPLETE RECORDING · \(StudyMode.participantID ?? "?")"))
+            let axTrusted = AXIsProcessTrusted()
+            let axReady = axTrusted && engine.axSensorEnabled
+            addInfoItem(to: intentSub,
+                        title: axReady
+                            ? "✓ Accessibility · Granted"
+                            : (axTrusted
+                                ? "⚠︎ Accessibility · Granted, sensor disabled"
+                                : "⚠︎ Accessibility · Required"))
+            if !axReady {
+                addItem(to: intentSub,
+                        title: axTrusted ? "Enable Context Sensor" : "Grant Accessibility…",
+                        action: #selector(menuStudyFixAccessibility))
+            }
             if let issue {
                 addInfoItem(to: intentSub, title: "⚠︎ \(issue)")
                 addItem(to: intentSub, title: "Retry Study Capture",
@@ -567,65 +626,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
                                     title: paused ? "Resume Recording" : "Pause Recording",
                                     action: #selector(menuStudyTogglePause))
             pauseItem.state = paused ? .on : .off
+            addItem(to: intentSub, title: "Erase Recent Traces…",
+                    action: #selector(menuStudyEraseRecentTraces))
             addItem(to: intentSub, title: "Show Summon Hint", action: #selector(menuStudyShowHint))
             addItem(to: intentSub, title: "Export Study Data…", action: #selector(menuStudyExport))
+            // Next to the export on purpose: when an export is refused it names a file,
+            // and the folder holding it has to be one click away rather than a path to
+            // be typed out.
+            addItem(to: intentSub, title: "Open Traces Folder",
+                    action: #selector(menuIntentOpenTraces))
             addItem(to: intentSub, title: "Stop Taking Part…", action: #selector(menuStudyWithdraw))
         } else {
-            addItem(to: intentSub, title: "Study Setup…", action: #selector(menuStudySetup))
             if StudyMode.participantID != nil {
                 addItem(to: intentSub, title: "Export Existing Study Data…",
                         action: #selector(menuStudyExport))
+                addItem(to: intentSub, title: "Open Traces Folder",
+                        action: #selector(menuIntentOpenTraces))
+                addItem(to: intentSub, title: "Erase Recent Traces…",
+                        action: #selector(menuStudyEraseRecentTraces))
+                intentSub.addItem(.separator())
             }
-        }
-        intentSub.addItem(.separator())
 
-        // Operator-only mutators are intentionally hidden during an active deployment:
-        // stopping only one layer creates an unmarked, unrecoverable data gap and the
-        // persisted Engine switch would otherwise survive the next reboot.
-        if !StudyMode.isActive {
-            let toggle = addItem(to: intentSub,
-                                 title: engineRunning ? "Stop Signal Capture" : "Start Signal Capture",
-                                 action: #selector(menuIntentToggle))
-            toggle.state = engineRunning ? .on : .off
-            let readOnly = addItem(to: intentSub, title: "Read-Only Capture (no affordances)",
-                                   action: #selector(menuIntentReadOnly))
-            readOnly.state = IntentEngine.shared.isReadOnly ? .on : .off
-            let recording = IntentEngine.shared.recorder.isRecording
-            let record = addItem(to: intentSub,
-                                 title: recording
-                                    ? "Stop Recording (\(IntentEngine.shared.recorder.eventCount) events)"
-                                    : "Record Trace",
-                                 action: #selector(menuIntentRecord))
-            record.state = recording ? .on : .off
-            addItem(to: intentSub, title: "Replay Trace…", action: #selector(menuIntentReplay))
-            addItem(to: intentSub, title: "Open Traces Folder", action: #selector(menuIntentOpenTraces))
-            intentSub.addItem(.separator())
-            addItem(to: intentSub, title: "Show Intent Scores", action: #selector(menuIntentScores))
-            addItem(to: intentSub, title: "Summon Intent Ticker (⌃⌥⌘I)",
-                    action: #selector(menuIntentTicker))
-            let axOn = IntentEngine.shared.axSensorEnabled
-            let axTrusted = AXIsProcessTrusted()
-            let ax = addItem(to: intentSub,
-                             title: axOn && !axTrusted
-                                ? "Selection Sensor (grant Accessibility…)"
-                                : "Selection Sensor (Accessibility)",
-                             action: #selector(menuIntentAXSensor))
-            ax.state = (axOn && axTrusted) ? .on : .off
-            intentSub.addItem(.separator())
-            let langItem = NSMenuItem(title: "Participant Languages…", action: nil,
-                                      keyEquivalent: "")
-            langItem.submenu = buildParticipantLanguagesMenu()
-            intentSub.addItem(langItem)
-            intentSub.addItem(.separator())
-            addItem(to: intentSub, title: "Run Golden Checks",
-                    action: #selector(menuIntentGoldenChecks))
-            addItem(to: intentSub, title: "Probe Document Reader (2 s delay)",
-                    action: #selector(menuIntentProbeDocument))
-            addItem(to: intentSub, title: "Show AX Probe Results",
-                    action: #selector(menuIntentShowProbeResults))
-            addItem(to: intentSub, title: "Open Intent Config",
-                    action: #selector(menuIntentOpenConfig))
-            addItem(to: intentSub, title: "Reload Intent Config", action: #selector(menuIntentReloadConfig))
+            // Operator-only mutators stay unavailable throughout an active deployment:
+            // stopping only one layer creates an unmarked, unrecoverable data gap and
+            // the persisted Engine switch would otherwise survive the next reboot.
+            let debugging = NSMenuItem(title: "Debugging", action: nil, keyEquivalent: "")
+            debugging.submenu = buildIntentDebuggingMenu(engineRunning: engineRunning)
+            intentSub.addItem(debugging)
         }
         intentItem.submenu = intentSub
         menu.addItem(intentItem)
@@ -1552,10 +1579,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// ⌃⌘N: open a session from whatever the clipboard holds — copied files directly,
     /// anything else (text / link / image) through the same materializer the
     /// drag-anything pipeline uses. Beeps when the clipboard has nothing usable.
-    // Internal (not private): the THESIS whisper-accept path reuses exactly this
-    // flow — AffordanceController hands off here so raw clipboard text enters a
-    // session only after explicit user consent (docs/thesis/ARCHITECTURE.md §7).
-    func openSessionFromClipboard() {
+    // Internal (not private) so session-opening callers receive the exact revision.
+    // The THESIS accept path verifies and materialises its fingerprinted text itself,
+    // then uses the explicitly configured `openSessionWithFiles` handoff.
+    @discardableResult
+    func openSessionFromClipboard() -> UUID? {
         let pb = NSPasteboard.general
         var urls = (pb.readObjects(forClasses: [NSURL.self],
                                    options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
@@ -1564,9 +1592,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
            let materialized = DropMaterializer.materialize(payload) {
             urls = [materialized]
         }
-        guard !urls.isEmpty else { NSSound.beep(); return }
+        guard !urls.isEmpty else { NSSound.beep(); return nil }
         NotificationCenter.default.post(name: .tutorialEvent, object: "clipboard")
-        openSessionWithFiles(urls)
+        return openSessionWithFiles(urls)
     }
 
     @objc private func menuCaptureSettings() { showSettings(section: .clipboard) }
@@ -2272,6 +2300,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         IntentEngine.shared.affordances.toggleTicker()
     }
 
+    /// Researcher/developer controls are deliberately one level below the
+    /// participant surface. This submenu is created only while no study is active;
+    /// nesting must never weaken the active-deployment mutation guard.
+    private func buildIntentDebuggingMenu(engineRunning: Bool) -> NSMenu {
+        let menu = NSMenu()
+
+        addItem(to: menu, title: "Study Setup…", action: #selector(menuStudySetup))
+        menu.addItem(.separator())
+
+        let toggle = addItem(to: menu,
+                             title: engineRunning ? "Stop Signal Capture" : "Start Signal Capture",
+                             action: #selector(menuIntentToggle))
+        toggle.state = engineRunning ? .on : .off
+        let readOnly = addItem(to: menu, title: "Read-Only Capture (no affordances)",
+                               action: #selector(menuIntentReadOnly))
+        readOnly.state = IntentEngine.shared.isReadOnly ? .on : .off
+        let recording = IntentEngine.shared.recorder.isRecording
+        let record = addItem(to: menu,
+                             title: recording
+                                ? "Stop Recording (\(IntentEngine.shared.recorder.eventCount) events)"
+                                : "Record Trace",
+                             action: #selector(menuIntentRecord))
+        record.state = recording ? .on : .off
+        addItem(to: menu, title: "Replay Trace…", action: #selector(menuIntentReplay))
+        addItem(to: menu, title: "Open Traces Folder", action: #selector(menuIntentOpenTraces))
+        menu.addItem(.separator())
+
+        addItem(to: menu, title: "Show Intent Scores", action: #selector(menuIntentScores))
+        addItem(to: menu, title: "Summon Intent Ticker (⌃⌥⌘I)",
+                action: #selector(menuIntentTicker))
+        let axOn = IntentEngine.shared.axSensorEnabled
+        let axTrusted = AXIsProcessTrusted()
+        let ax = addItem(to: menu,
+                         title: axOn && !axTrusted
+                            ? "Context Sensor (grant Accessibility…)"
+                            : "Context Sensor (Accessibility)",
+                         action: #selector(menuIntentAXSensor))
+        ax.state = (axOn && axTrusted) ? .on : .off
+        menu.addItem(.separator())
+
+        let langItem = NSMenuItem(title: "Participant Languages…", action: nil,
+                                  keyEquivalent: "")
+        langItem.submenu = buildParticipantLanguagesMenu()
+        menu.addItem(langItem)
+        menu.addItem(.separator())
+
+        addItem(to: menu, title: "Run Golden Checks",
+                action: #selector(menuIntentGoldenChecks))
+        addItem(to: menu, title: "Probe Document Reader (2 s delay)",
+                action: #selector(menuIntentProbeDocument))
+        addItem(to: menu, title: "Show AX Probe Results",
+                action: #selector(menuIntentShowProbeResults))
+        addItem(to: menu, title: "Open Intent Config",
+                action: #selector(menuIntentOpenConfig))
+        addItem(to: menu, title: "Reload Intent Config",
+                action: #selector(menuIntentReloadConfig))
+        return menu
+    }
+
     /// THESIS: the participant's language repertoire — what `foreign_language_clip` is
     /// judged against. Sessions run on the RESEARCHER's Mac, so the machine locale is
     /// always the wrong answer; this menu is the per-participant setup step.
@@ -2373,11 +2460,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// researcher present — never triggered silently.
     @objc private func menuStudySetup() {
         if studyConsentWindow == nil {
+            // Keep the disclosure window outside every recording boundary. An
+            // operator may have left the non-study debug engine running; quiesce it
+            // before an Accessibility round-trip can attach the context sensor.
+            if !StudyMode.isActive {
+                // Clear the persisted debug toggle too: leaving `isEnabled == true`
+                // after stop would silently restart capture on relaunch and make the
+                // menu's next toggle move in the wrong direction after Cancel.
+                IntentEngine.shared.isEnabled = false
+                IntentEngine.shared.resetPipeline()
+            }
             let currentLanguages = IntentEngine.shared.hasExplicitLanguages
                 ? Array(IntentText.userLanguages) : ["en"]
             let hosting = NSHostingController(rootView: StudyConsentView(
                 initialLanguages: currentLanguages,
                 onAccept: { [weak self] id, languages in
+                    // This is the authoritative setup boundary. The SwiftUI button is
+                    // also disabled, but trust is checked again in case macOS revoked
+                    // it between the last readiness refresh and this callback.
+                    guard AXIsProcessTrusted() else {
+                        self?.requestStudyAccessibility()
+                        return
+                    }
                     let engine = IntentEngine.shared
                     // Setup may be opened after an operator used the non-study debug
                     // controls. Stop and wipe inference state BEFORE recording consent
@@ -2421,7 +2525,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
                         self?.showStudyCaptureFailure(issue)
                     }
                     self?.finishStudyLaunchSetup()
-                    if !AXIsProcessTrusted() { engine.requestAXPermission() }
                     // The persisted pending flag survives the expected round-trip to
                     // Accessibility settings. Show once only after capture is healthy.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -2431,6 +2534,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
                 onCancel: { [weak self] in
                     self?.studyConsentWindow?.close()
                     self?.studyConsentWindow = nil
+                },
+                onRequestAccessibility: { [weak self] in
+                    self?.requestStudyAccessibility()
+                },
+                onFixLoginLaunch: { [weak self] in
+                    self?.finishStudyLaunchSetup()
                 }))
             let win = NSWindow(contentViewController: hosting)
             win.title = "Research participation"
@@ -2474,6 +2583,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         finishStudyLaunchSetup()
     }
 
+    /// Study Accessibility is separate from the product's optional Enhanced Access.
+    /// The setup flow keeps the intent engine quiescent while this registers/opens the
+    /// macOS permission pane; the sensor is armed by the accepted deployment.
+    private func requestStudyAccessibility() {
+        IntentEngine.shared.requestAXPermission()
+    }
+
+    @objc private func menuStudyFixAccessibility() {
+        let engine = IntentEngine.shared
+        engine.axSensorEnabled = true
+        if AXIsProcessTrusted() {
+            engine.reconcileSensors()
+            if StudyMode.isActive, !engine.isPaused, !engine.isRunning {
+                menuStudyRetryCapture()
+            }
+        } else {
+            requestStudyAccessibility()
+        }
+    }
+
     /// Restarts both JSONL streams as one capture unit. A partial retry is unsafe:
     /// keeping sensors live while only one writer recovers creates another unmarked
     /// interval in the other stream.
@@ -2481,6 +2610,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         let engine = IntentEngine.shared
         engine.stop()
         engine.resetPipeline()
+        do { try StudyTraceRedactor.resumePendingIfNeeded() }
+        catch {
+            showStudyCaptureFailure("recent-trace erasure: \(error.localizedDescription)")
+            return
+        }
+        if !engine.isPaused {
+            engine.axSensorEnabled = true
+            guard AXIsProcessTrusted() else {
+                requestStudyAccessibility()
+                showStudyCaptureFailure(
+                    "Accessibility context is not ready; recording remains stopped")
+                return
+            }
+        }
         engine.isEnabled = true
         if let issue = studyCaptureIssue(engine) {
             showStudyCaptureFailure(issue)
@@ -2508,7 +2651,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         }
         if !engine.isPaused {
             guard engine.axSensorEnabled && AXIsProcessTrusted() else {
-                return "Accessibility is unavailable; selection and quiet-reader data are incomplete"
+                return "Accessibility is unavailable; focused role, selection, document context, and reading-progress data are incomplete"
             }
             guard engine.hasExplicitLanguages,
                   IntentText.userLanguages.contains("en") else {
@@ -2551,7 +2694,111 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// other way round, which would let people record only what they think is
     /// interesting and quietly exclude the quiet reader.
     @objc private func menuStudyTogglePause() {
-        IntentEngine.shared.isPaused.toggle()
+        let engine = IntentEngine.shared
+        if engine.isPaused {
+            guard engine.isRunning else {
+                showStudyCaptureFailure("intent engine is stopped; choose Retry Study Capture first")
+                return
+            }
+            engine.axSensorEnabled = true
+            guard AXIsProcessTrusted() else {
+                requestStudyAccessibility()
+                showStudyCaptureFailure(
+                    "Accessibility context is not ready; recording remains paused")
+                return
+            }
+            engine.isPaused = false
+            if let issue = studyCaptureIssue(engine) { showStudyCaptureFailure(issue) }
+        } else {
+            engine.isPaused = true
+        }
+    }
+
+    /// Opens only the deliberately bounded relative-duration control. There is no
+    /// hidden calendar picker, content query, file matching, or provider-backed parser.
+    @objc private func menuStudyEraseRecentTraces() {
+        guard StudyMode.deploymentSnapshot != nil else {
+            showStudyCaptureFailure("no study deployment exists for trace erasure")
+            return
+        }
+        if studyTraceEraseWindow == nil {
+            let scale = UIScale.current.multiplier
+            let root = StudyTraceEraseView(
+                onErase: { [weak self] duration in
+                    self?.performStudyTraceErase(duration: duration)
+                },
+                onCancel: { [weak self] in
+                    self?.studyTraceEraseWindow?.close()
+                    self?.studyTraceEraseWindow = nil
+                })
+                .environment(\.uiScale, scale)
+            let hosting = NSHostingController(rootView: root)
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Erase recent traces"
+            window.styleMask = [.titled, .closable]
+            window.level = .floating + 1
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            studyTraceEraseWindow = window
+        }
+        studyTraceEraseWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func performStudyTraceErase(duration: TimeInterval) {
+        studyTraceEraseWindow?.close()
+        studyTraceEraseWindow = nil
+
+        let engine = IntentEngine.shared
+        let shouldRestart = StudyMode.isActive && engine.isRunning
+        let wasPaused = engine.isPaused
+        // stop() writes and synchronizes final lifecycle rows before closing both
+        // handles. They fall inside the selected suffix and are removed transactionally.
+        engine.stop()
+        engine.resetPipeline()
+
+        do {
+            let summary = try StudyTraceRedactor.eraseRecent(durationSeconds: duration)
+            if shouldRestart {
+                if !wasPaused {
+                    engine.axSensorEnabled = true
+                    guard AXIsProcessTrusted() else {
+                        requestStudyAccessibility()
+                        showStudyCaptureFailure(
+                            "Recent traces were erased, but Accessibility context is not ready; recording remains stopped")
+                        return
+                    }
+                }
+                engine.start()
+                if let issue = studyCaptureIssue(engine) {
+                    showStudyCaptureFailure(
+                        "Recent traces were erased, but capture could not restart: \(issue)")
+                    return
+                }
+            }
+            let alert = NSAlert()
+            alert.messageText = "Recent traces erased"
+            alert.informativeText = "The last \(studyDurationLabel(summary.durationSeconds)) of recorded activity will not appear in future study exports."
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not finish trace erasure"
+            alert.informativeText = error.localizedDescription
+                + "\n\nRecording and export remain stopped while the pending erasure is retried."
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
+
+    private func studyDurationLabel(_ seconds: TimeInterval) -> String {
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes) minutes" }
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        if remainder == 0 { return hours == 1 ? "1 hour" : "\(hours) hours" }
+        return "\(hours) h \(remainder) min"
     }
 
     /// Re-shows the hotkey card on request. Deliberately participant- or
@@ -2573,17 +2820,36 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         StudyMode.markSummonHintShown()
     }
 
-    /// Ends participation. Capture stops; collected data stays on disk so it can still
-    /// be exported — or not.
+    /// Opens a truthful, typed confirmation before ending participation. Withdrawal
+    /// does not delete the retained cohort; erasure remains a separate participant act.
     @objc private func menuStudyWithdraw() {
-        let alert = NSAlert()
-        alert.messageText = "Stop taking part?"
-        alert.informativeText = "Recording stops immediately. Data already collected stays on this "
-                              + "machine and is only used if you choose to send it."
-        alert.addButton(withTitle: "Stop recording")
-        alert.addButton(withTitle: "Cancel")
+        if studyWithdrawalWindow == nil {
+            let scale = UIScale.current.multiplier
+            let root = StudyWithdrawalConfirmationView(
+                onConfirm: { [weak self] in self?.performStudyWithdrawal() },
+                onCancel: { [weak self] in
+                    self?.studyWithdrawalWindow?.close()
+                    self?.studyWithdrawalWindow = nil
+                })
+                .environment(\.uiScale, scale)
+            let hosting = NSHostingController(rootView: root)
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Stop taking part"
+            window.styleMask = [.titled, .closable]
+            window.level = .floating + 1
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            studyWithdrawalWindow = window
+        }
+        studyWithdrawalWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+    }
+
+    private func performStudyWithdrawal() {
+        studyWithdrawalWindow?.close()
+        studyWithdrawalWindow = nil
+
         // Stop and flush while the terminal records still carry study=true; only then
         // clear the study state. This cleanly distinguishes withdrawal from a crash.
         IntentEngine.shared.prepareForWithdrawal()
@@ -2615,6 +2881,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             exposeWindow = nil
         } else if window === joinWindow {
             joinWindow = nil
+        } else if window === studyTraceEraseWindow {
+            studyTraceEraseWindow = nil
+        } else if window === studyWithdrawalWindow {
+            studyWithdrawalWindow = nil
         }
     }
 }

@@ -23,9 +23,12 @@ struct AffordancePolicy {
         case accepted, dismissed, ignored
     }
 
-    /// M3: the passive channel speaks for translation only — the noisier classes
-    /// stay ticker-only until they are evaluated on real labelled traces (ARCHITECTURE §11).
-    static let passiveClasses: Set<IntentClass> = [.translation]
+    /// M3 product default: the passive channel speaks for translation only — the
+    /// noisier classes stay ticker-only until they are evaluated on real labelled
+    /// traces (ARCHITECTURE §11). Which classes actually qualify is read from the
+    /// config per decision, so a study deployment can widen it (IntentConfig
+    /// .studyConfiguration) without a second policy implementation.
+    static let defaultPassiveClasses: Set<IntentClass> = [.translation]
 
     private(set) var cooldownUntil: [String: TimeInterval] = [:]
     private(set) var recentShows: [TimeInterval] = []
@@ -40,8 +43,8 @@ struct AffordancePolicy {
     func decide(intentClass: IntentClass, probability: Double,
                 frontApp: String?, quietContext: Bool,
                 at t: TimeInterval, config: IntentConfig) -> Verdict {
-        guard Self.passiveClasses.contains(intentClass) else {
-            return .silent(reason: "class is ticker-only in M3")
+        guard config.passiveClasses.contains(intentClass.rawValue) else {
+            return .silent(reason: "class is ticker-only")
         }
         guard probability >= config.exposureThreshold else {
             return .silent(reason: "below θ(\(config.tier))")

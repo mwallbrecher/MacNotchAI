@@ -36,6 +36,11 @@ struct IntentConfig: Codable, Equatable {
     var rateLimits: [String: Int] = ["lazy": 3, "balanced": 6, "aggressive": 12]
     /// "class|bundleID" pairs the user muted ("do not suggest again").
     var mutes: [String] = []
+    /// Classes allowed to speak on the PASSIVE channel, i.e. without being summoned.
+    /// The product default is translation alone: the noisier classes stay ticker-only
+    /// until they have been evaluated on labelled traces (ARCHITECTURE §11). Expressed
+    /// as data so a study deployment can widen it without forking the policy.
+    var passiveClasses: [String] = [IntentClass.translation.rawValue]
     /// Languages the USER reads comfortably ("de", "en", …). Empty ⇒ derive from the
     /// machine locale. **Must be set explicitly for every study session**: Phase 1 runs
     /// on the researcher's Mac, so participants would otherwise all inherit the
@@ -49,14 +54,19 @@ struct IntentConfig: Codable, Equatable {
     //   · translation: foreign clip + translator switch ⇒ fires on balanced (~73%);
     //     either signal alone stays silent (12% / 29%). The switch is the strongest
     //     tell (w=3.0 ⇒ LR ≈ e^3 ≈ 20 — the user literally opened a translator).
+    //     A confident copy/target language mismatch is independently decisive: unlike
+    //     participant-relative "foreignness", it identifies the language required by
+    //     the editable destination and therefore crosses balanced on its own.
     //   · comprehension/discovery: noisier signal families — deliberately need
     //     near-max combined evidence to speak unprompted; below that they surface
     //     through the summon ticker until personalization lifts their priors (§9).
     static let defaultWeights: [String: Double] = [
         "foreign_language_clip":        2.2,
         "copy_then_translator_switch":  3.0,
+        "copy_target_language_mismatch": 5.0,
         "format_mismatch":              0.8,
         "re_reading":                   2.4,
+        "visible_range_revisit":        2.8,
         "dense_dwell":                  1.6,
         "repeat_selection":             2.0,
         "collect_mode":                 2.2,
@@ -65,8 +75,10 @@ struct IntentConfig: Codable, Equatable {
     static let defaultTaus: [String: Double] = [
         "foreign_language_clip":        60,
         "copy_then_translator_switch":  60,
+        "copy_target_language_mismatch": 60,
         "format_mismatch":              60,
         "re_reading":                  180,
+        "visible_range_revisit":       180,
         "dense_dwell":                 180,
         "repeat_selection":            120,
         "collect_mode":                 90,
@@ -91,8 +103,35 @@ struct IntentConfig: Codable, Equatable {
     /// are the sole per-participant input; every inferential and exposure parameter is
     /// reset to the compiled baseline so a reused pilot install cannot leak learned or
     /// hand-edited state into a new cohort.
-    static func studyConfiguration(userLanguages: [String]) -> IntentConfig {
+    /// Names a frozen study baseline. Deployments already in the field were created
+    /// under whichever baseline shipped at the time and must still export afterwards,
+    /// so cases are APPENDED here and the body of an existing case is never edited.
+    enum StudyBaseline: Int, CaseIterable, Sendable {
+        /// Product exposure posture: balanced tier, translation-only passive channel.
+        case v1 = 1
+        /// Study posture, a deliberate inversion of the product's. Shipping, an
+        /// unwanted interruption costs trust, so silence is the safe default. In the
+        /// experiment a missed offer yields NO observation at all, while a premature
+        /// one still yields a labelled event plus the participant's reaction to it —
+        /// which is the data the thresholds are supposed to be calibrated against.
+        /// Ticker-only classes would likewise never produce the labels needed to
+        /// decide whether they belong on the passive channel.
+        case v2 = 2
+
+        static let current = StudyBaseline.v2
+    }
+
+    static func studyConfiguration(userLanguages: [String],
+                                   baseline: StudyBaseline = .current) -> IntentConfig {
         var config = IntentConfig()
+        switch baseline {
+        case .v1:
+            config.tier = "balanced"
+            config.passiveClasses = [IntentClass.translation.rawValue]
+        case .v2:
+            config.tier = "aggressive"
+            config.passiveClasses = IntentClass.allCases.map(\.rawValue).sorted()
+        }
         config.userLanguages = Array(Set(userLanguages.compactMap { raw in
             let code = String(raw.prefix(2)).lowercased()
             return code.count == 2 && code.allSatisfy(\.isLetter) ? code : nil
@@ -100,16 +139,24 @@ struct IntentConfig: Codable, Equatable {
         return config
     }
 
-    /// Exact invariant checked before a live Study export. The selected language
-    /// repertoire is intentionally preserved while all other fields are compared with
-    /// the compiled, frozen configuration.
+    /// Invariant checked before a Study export: this configuration came from SOME
+    /// legitimate frozen baseline rather than from learned or hand-edited state. The
+    /// selected language repertoire is intentionally preserved while every other field
+    /// is compared.
+    ///
+    /// Deliberately NOT a comparison against the newest baseline. A deployment recorded
+    /// weeks ago has to remain exportable after the baseline moves, and checking it
+    /// against "whatever this build compiles today" silently invalidated exactly that —
+    /// a full day of capture became unexportable the moment the study posture changed.
     var isFrozenStudyConfiguration: Bool {
-        self == Self.studyConfiguration(userLanguages: userLanguages)
+        StudyBaseline.allCases.contains {
+            self == Self.studyConfiguration(userLanguages: userLanguages, baseline: $0)
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
         case v, tier, basePriorLogOdds, priorOffsets, weights, taus, thresholds,
-             dismissCooldownSeconds, rateLimits, mutes, userLanguages
+             dismissCooldownSeconds, rateLimits, mutes, userLanguages, passiveClasses
     }
 
     init(from decoder: Decoder) throws {
@@ -126,6 +173,7 @@ struct IntentConfig: Codable, Equatable {
         rateLimits             = try c.decodeIfPresent([String: Int].self, forKey: .rateLimits) ?? d.rateLimits
         mutes                  = try c.decodeIfPresent([String].self, forKey: .mutes) ?? d.mutes
         userLanguages          = try c.decodeIfPresent([String].self, forKey: .userLanguages) ?? d.userLanguages
+        passiveClasses         = try c.decodeIfPresent([String].self, forKey: .passiveClasses) ?? d.passiveClasses
     }
 
     /// Normalised repertoire ("DE-de" → "de"); empty ⇒ caller falls back to the locale.
@@ -159,8 +207,14 @@ struct IntentConfig: Codable, Equatable {
             notes.append("basePriorLogOdds \(c.basePriorLogOdds) → -3.89")
             c.basePriorLogOdds = -3.89
         }
-        for (k, v) in c.weights where !v.isFinite || abs(v) > 4 {
-            let fixed = v.isFinite ? max(-4, min(4, v)) : (Self.defaultWeights[k] ?? 1)
+        for (k, v) in c.weights {
+            // The destination-language mismatch is intentionally strong enough to
+            // cross balanced by itself. Less-direct signals retain the historical
+            // tighter guardrail.
+            let limit = k == FeatureID.copyTargetLanguageMismatch.rawValue ? 6.0 : 4.0
+            guard !v.isFinite || abs(v) > limit else { continue }
+            let fixed = v.isFinite ? max(-limit, min(limit, v))
+                                   : (Self.defaultWeights[k] ?? 1)
             notes.append("weight \(k)=\(v) → \(fixed)"); c.weights[k] = fixed
         }
         for (k, v) in c.taus where !v.isFinite || v <= 0 || v > 3600 {
@@ -192,6 +246,16 @@ struct IntentConfig: Codable, Equatable {
         if !badLangs.isEmpty {
             notes.append("userLanguages dropped invalid: \(badLangs.joined(separator: ","))")
             c.userLanguages = c.userLanguages.filter { !badLangs.contains($0) }
+        }
+        let knownClasses = Set(IntentClass.allCases.map(\.rawValue))
+        let unknownPassive = c.passiveClasses.filter { !knownClasses.contains($0) }
+        if !unknownPassive.isEmpty {
+            notes.append("passiveClasses dropped unknown: \(unknownPassive.joined(separator: ","))")
+            let kept = c.passiveClasses.filter(knownClasses.contains)
+            // An explicit [] means "never speak unprompted" and is honoured above,
+            // because nothing was dropped. Reaching empty only by dropping unknown
+            // names is a typo, and silently muting the passive channel would hide it.
+            c.passiveClasses = kept.isEmpty ? IntentConfig().passiveClasses : kept
         }
         return (c, notes)
     }
@@ -259,6 +323,13 @@ final class IntentScorer {
             evidence.append(e)
         }
         evidence.removeAll { $0.t < e.t - window }
+    }
+
+    /// Removes evidence whose validity is tied to a mutable external object. Most
+    /// detector rows naturally decay, but a clipboard/target-language join must stop
+    /// contributing as soon as either side of that exact join is replaced.
+    func remove(_ feature: FeatureID) {
+        evidence.removeAll { $0.feature == feature }
     }
 
     func reset() { evidence = [] }
