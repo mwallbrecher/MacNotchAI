@@ -102,14 +102,20 @@ class OverlayViewModel: ObservableObject {
         let role: ChatRole
         let display: String
         let modelText: String
+        /// Model-suggested next prompts, parsed off the end of an assistant reply
+        /// (see FollowUpSuggestions). Empty for user turns, and for any reply where the
+        /// model didn't supply them — the UI then falls back to its static list.
+        let followUps: [String]
 
         // Explicit id so a streamed bubble can be UPDATED in place (same identity →
         // SwiftUI diffs the text instead of recreating the row on every delta).
-        init(id: UUID = UUID(), role: ChatRole, display: String, modelText: String) {
+        init(id: UUID = UUID(), role: ChatRole, display: String, modelText: String,
+             followUps: [String] = []) {
             self.id = id
             self.role = role
             self.display = display
             self.modelText = modelText
+            self.followUps = followUps
         }
     }
 
@@ -131,6 +137,10 @@ class OverlayViewModel: ObservableObject {
     // non-streaming providers never create the bubble, so the caller falls back to a
     // plain append.
     private var streamingMessageID: UUID?
+    /// Raw streamed text INCLUDING any partially arrived follow-up block. The bubble
+    /// shows only `visiblePrefix` of this, so the marker never flashes on screen; the
+    /// unedited text has to be kept separately to know where that prefix ends.
+    private var streamingRaw = ""
 
     /// Exactly one provider turn may own the shared transcript/streaming slot. The
     /// token also gives reset/back navigation a concrete Task to cancel instead of
@@ -154,13 +164,19 @@ class OverlayViewModel: ObservableObject {
                 stage = .result(url: url, action: action, text: "")
             }
         }
+        // Self-correcting reset: a new bubble always starts from an empty raw buffer,
+        // whatever happened to the previous turn.
+        if streamingMessageID == nil { streamingRaw = "" }
+        streamingRaw += delta
+        let visible = FollowUpSuggestions.visiblePrefix(of: streamingRaw)
+
         if let id = streamingMessageID,
            let i = conversation.firstIndex(where: { $0.id == id }) {
             let old = conversation[i]
             conversation[i] = ChatMessage(id: old.id, role: .assistant,
-                                          display: old.display + delta, modelText: "")
+                                          display: visible, modelText: "")
         } else {
-            let msg = ChatMessage(role: .assistant, display: delta, modelText: "")
+            let msg = ChatMessage(role: .assistant, display: visible, modelText: "")
             streamingMessageID = msg.id
             conversation.append(msg)
         }
@@ -170,13 +186,13 @@ class OverlayViewModel: ObservableObject {
     /// Returns false when no stream bubble exists (provider didn't stream) —
     /// the caller appends a fresh message instead.
     @discardableResult
-    func finalizeStreamedReply(_ full: String) -> Bool {
-        defer { streamingMessageID = nil }
+    func finalizeStreamedReply(_ full: String, followUps: [String] = []) -> Bool {
+        defer { streamingMessageID = nil; streamingRaw = "" }
         guard let id = streamingMessageID,
               let i = conversation.firstIndex(where: { $0.id == id }) else { return false }
         let old = conversation[i]
         conversation[i] = ChatMessage(id: old.id, role: .assistant,
-                                      display: full, modelText: full)
+                                      display: full, modelText: full, followUps: followUps)
         return true
     }
 
@@ -184,7 +200,7 @@ class OverlayViewModel: ObservableObject {
     /// assistant reply. Returning nil means no delta arrived, so the caller should append the note
     /// as a new bubble. The same returned text is persisted and shared verbatim.
     func finalizeFailedStream(with note: String) -> String? {
-        defer { streamingMessageID = nil }
+        defer { streamingMessageID = nil; streamingRaw = "" }
         guard let id = streamingMessageID,
               let i = conversation.firstIndex(where: { $0.id == id }) else { return nil }
         let old = conversation[i]
@@ -237,6 +253,7 @@ class OverlayViewModel: ObservableObject {
         }
         conversationBeforeActiveTurn = nil
         streamingMessageID = nil
+        streamingRaw = ""
         isAwaitingReply = false
         isAITurnActive = false
     }

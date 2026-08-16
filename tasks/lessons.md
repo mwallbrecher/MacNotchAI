@@ -1649,3 +1649,70 @@
   and make the explicit walk reject each secure or ambiguous node before its value or children.
 - **Rule:** enumerate all readers behind a data-source permission and enforce the same no-read boundary
   at every entry and recursion point; never infer end-to-end privacy from one sensor's output schema.
+### [CAPTURE-01] `NSMetadataQuery` accepts only Spotlight's restricted predicate dialect
+
+- **What was wrong:** the recent-file bootstrap used a general Foundation predicate that compared the
+  content-change-date metadata attribute with `nil`. It compiled, but starting the real Spotlight query
+  raised an `NSInvalidArgumentException` at runtime.
+- **Why:** `NSMetadataQuery` does not support every expression accepted by `NSPredicate`; in particular,
+  a `nil` right-hand side is invalid in Spotlight's query parser.
+- **Fix:** constrain the query with supported filename-extension and visibility predicates, then skip
+  results without a usable change date while reading the returned metadata. A live smoke test now starts
+  the actual query and FSEvents stream instead of treating compilation as sufficient verification.
+- **Rule:** never assume a valid `NSPredicate` is valid for `NSMetadataQuery`. Exercise every Spotlight
+  predicate against a real query, avoid `nil` comparisons, and apply unsupported checks to the results.
+
+### [CAPTURE-02] Unfinished filesystem candidates need ordering, cleanup, and a hard bound
+
+- **What was wrong:** the first recent-file resolver treated every unresolved live path as a blocker,
+  even when that event was older than an already stable file, and kept invalid rename-out paths without
+  an independent size limit.
+- **Why:** “not stable yet” is not sufficient ordering information. A menu-bar process also lives long
+  enough that even small per-event leaks become an unbounded lookup and latency problem.
+- **Fix:** unresolved candidates are capped at 128 and ordered by FSEvent ID. Invalid paths are removed,
+  changing paths receive one bounded retry, and only an unresolved event newer than the best stable
+  candidate may delay opening it. The resolver checks its deadline inside that decision loop.
+- **Rule:** every long-lived event queue needs an explicit bound and terminal cleanup. Pending work may
+  block a fallback only when its logical source order proves that it is actually newer.
+
+### [CAPTURE-03] Bootstrap discovery must not sit in front of an authoritative live source
+
+- **What was wrong:** Spotlight bootstrap filtering could resolve thousands of paths on MainActor, and
+  the resolver waited for the query even after FSEvents had already supplied a valid live candidate.
+- **Why:** metadata APIs can touch iCloud, external, or network-backed storage; compilation and local
+  SSD testing hide that latency. A historical seed is also lower-authority than a post-launch event.
+- **Fix:** query-result snapshots are read in yielded batches, filesystem policy checks run on a
+  cancellable utility task, and valid live work bypasses an in-progress bootstrap. Fully excluded roots
+  are not subscribed at all.
+- **Rule:** keep discovery backfills subordinate to live data, and move all path resolution or metadata
+  validation off the UI actor even when the query API itself must be driven from that actor.
+
+### [COMPRESS-01] A max height is not a fitting height in an auto-sized hosting window
+
+- **What was wrong:** the batch-compression header correctly reported all candidates as selected, but
+  the file selector itself appeared empty between two dividers.
+- **Why:** the native compression window is initially sized from an `NSHostingController`. A SwiftUI
+  `ScrollView` constrained only with `maxHeight` can report an ideal height of zero during that fitting
+  pass, so AppKit legitimately collapses it even though its rows exist.
+- **Fix:** derive one explicit nonzero list height from the candidate count and cap it at 210 pt. Small
+  batches now contribute their actual height to window fitting; large batches retain scrolling.
+- **Rule:** any scroll container inside an auto-sized AppKit hosting window needs a concrete minimum or
+  ideal height. `maxHeight` limits growth but does not promise visible content.
+
+### [COMPRESS-02] Cancellation must own the producer and its artifacts before work starts
+
+- **What was wrong:** video progress counted only completed files, so a one-file export displayed 0%
+  until the end. Closing the window did not own or cancel the unstructured AVFoundation export, and
+  each retry selected another collision-free output name while earlier partial fragments remained.
+- **Why:** the runner learned the output URL only after a producer succeeded and held no reference to
+  the active `AVAssetExportSession`. It therefore had nothing authoritative to cancel or clean up.
+- **Fix:** the runner now creates a hidden item-replacement directory on the destination volume before
+  each producer starts. All AVFoundation fragments stay inside that directory; only a completed file
+  is moved atomically to its final path. It owns the active export session, polls real AV progress,
+  cancels on the explicit button or window disappearance, awaits producer termination, then removes
+  every work directory and every completed final output from that exact run. Image encoding moved to a
+  detached task so its cancellation control remains responsive; an in-flight ImageIO encode finishes
+  safely and is discarded. Cleanup failures are surfaced instead of claiming success.
+- **Rule:** a cancellable file operation must reserve and track every path before writing, keep an
+  explicit cancellation handle, await the producer's terminal state, and only then delete artifacts.
+  Never glob a user directory; isolate intermediates and remove only paths owned by the current run.

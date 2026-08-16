@@ -57,7 +57,7 @@ struct TutorialStep {
               hint: "Try it now: press ⌃⌘V or ⌃⌘N."),
         .init(icon: "camera.viewfinder",
               title: "Screenshots → session",
-              body: "Turn on “Open new screenshots in a session” in Settings → Clipboard & Capture, and every ⇧⌘4 / ⇧⌘5 screenshot opens in Dragaway — instantly, or after the floating thumbnail; your choice.",
+              body: "Turn on “Open new screenshots in a session” in Settings → Capture Settings, and every ⇧⌘4 / ⇧⌘5 screenshot opens in Dragaway — instantly, or after the floating thumbnail; your choice.",
               trigger: nil, hint: ""),
         .init(icon: "clock.arrow.circlepath",
               title: "Sessions live on",

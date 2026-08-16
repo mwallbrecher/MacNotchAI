@@ -2930,3 +2930,70 @@ written to the trace/export; secure fields are a hard no-read boundary.
       coverage/rebinding, lifecycle cancellation, DOCX eligibility/fallback/throttling, CPU,
       responsiveness and actual passive translation execution before the 24-hour recording. Record
       fresh build/check results only after the final artefact has actually run them.
+
+## Last saved file → session hotkey (COMPLETE 2026-08-11)
+
+**Scope:** `⌃⌘L` opens the newest stable, supported user file from configured folders in a fresh
+Dragaway session. The feature is local, enabled by default, independently disableable, and uses no
+Accessibility API. It observes paths/metadata only; file content is not read until the user invokes the
+hotkey and the normal session pipeline takes over.
+
+- [x] Add one persisted observable configuration with Desktop, Documents, and Downloads as defaults;
+      allow watched folders and excluded subtrees to be added/removed in Settings. Normalize and dedupe
+      path ancestry, let exclusions always win, and restart the stream on every relevant change.
+- [x] Add a low-idle FSEvents stream with file-level events and a one-shot Spotlight bootstrap. Ignore
+      app/system/cache/temp/hidden paths, directories, packages, symlinks, unsupported types, and
+      Dragaway's internal storage; coalesce bursts and require stable size + modification date off-main.
+- [x] Keep a small newest-first in-memory candidate buffer so deleted atomic-save paths fall back safely.
+      The hotkey may briefly await a pending stability pass, then must reuse
+      `AppDelegate.openSessionWithFiles([url])` without copying or eagerly parsing the file.
+- [x] Register/unregister permission-free `⌃⌘L` through the existing Carbon `GlobalHotkey`, tied to the
+      master toggle. Add the shortcut, privacy/performance explanation, include/exclude controls, current
+      detected file, and reset-to-default action to Capture Settings and Help.
+- [x] Verify path/filter/config helpers, `git diff --check`, Debug then Release builds, and idle lifecycle
+      (start, stop, reconfigure). Leave final live Word export/download, protected-folder permission, and
+      Energy Log checks explicit for the owner.
+
+## Capture Settings as a top-level menu item (2026-08-12)
+
+- [x] Move “Capture Settings…” from the Clipboard History submenu into the status menu's primary
+      settings list.
+- [x] Rename the scoped settings destination and visible section from “Clipboard & Capture” to
+      “Capture Settings” without changing any capture defaults, hotkeys, or watcher behavior.
+- [x] Update the Help reference, run diff hygiene, and verify a Debug build.
+
+## Customize submenu (2026-08-12)
+
+- [x] Replace the separate “Custom Prompts” and “Favorite Tools” status-menu rows with one native
+      “Customize” submenu that links to both existing scoped settings windows.
+- [x] Verify menu wiring, diff hygiene, and a Debug build without changing either settings screen.
+
+## Release v1.1.6 (DONE 2026-08-12)
+
+- [x] Confirm `main`, inventory the complete `v1.1.5..main` plus working-tree delta, and verify no
+      credentials or test secrets are included.
+- [x] Finalize `RELEASE_NOTES_v1.1.6.md` from `RELEASE_NOTES_NEXT.md`, add the last-saved-file and
+      batch-compression work, omit menu-only reordering, and update README What's New.
+- [x] Bump app and extension to marketing version 1.1.6 / build 9; run diff hygiene and a Debug build.
+- [x] Stage exact release-source paths, review the staged diff, and commit the complete Main release
+      source without pushing or tagging.
+- [x] Run `scripts/release.sh`; verify Developer-ID signing, Apple notarization, stapling, DMG version,
+      and the Sparkle EdDSA signature. Leave publishing and the generated appcast commit for an explicit
+      follow-up request.
+
+## Fix — batch compression list, progress, and cancellation (2026-08-14)
+
+- [x] Give the shared image/video candidate list a deterministic non-zero fitting height derived from
+      its row count, capped at the existing 210 pt so larger batches still scroll.
+- [x] Report live per-video AVFoundation progress (including a visible Preparing state), rather than
+      counting only fully completed files and appearing stuck at 0% for an entire single-file export.
+- [x] Add a real Cancel action during image/video runs. Cancel the active AV export, keep the dialog in
+      a clear Cancelling state until the producer has stopped, and also cancel when the window closes.
+- [x] Make cancellation transactional for the current run: reserve and track each destination before
+      writing, then delete its partial output plus every completed output from that same run. Never
+      touch a pre-existing file or output from an earlier run, and report any cleanup failure honestly.
+- [x] Keep image encoding off the main actor so Cancel remains clickable; preserve all-selected default,
+      row deselection, ineligible-file explanations, and successful batch behavior.
+- [x] Verify diff hygiene and a Debug build; smoke-check small/overflowing candidate counts, live video
+      progress, successful batches, cancellation, window-close cancellation, and cleanup semantics.
+- [x] Capture the sizing and transactional-cancellation lessons in `tasks/lessons.md`.

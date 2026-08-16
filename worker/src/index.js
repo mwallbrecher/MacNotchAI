@@ -13,6 +13,8 @@
 //   POST /v1/complete  { system, messages: [{role,content}], max_tokens?,
 //                        image?: {mime, data(base64)} }
 //                      headers: X-Device-Id  → { text, usage }
+//   POST /v1/stream    same body → SSE: `data: {choices:[{delta:{content}}]}` …,
+//                      then one `data: {usage}` and `data: [DONE]`
 //   GET  /v1/usage     headers: X-Device-Id  → { usage }   (no quota consumed)
 //   GET  /v1/stats     headers: X-Admin-Token → { rows, totals }  (spend roll-up + est. USD)
 
@@ -33,6 +35,13 @@ export default {
       if (url.pathname === "/v1/complete" && request.method === "POST") {
         return cors(await handleComplete(request, env, ctx));
       }
+      // Same contract as /v1/complete, delivered as an event stream. Kept as a separate
+      // route rather than a flag on /v1/complete so an app build that predates this
+      // deploy — and one that postdates it talking to an older Worker — both keep
+      // working: the client falls back to /v1/complete on 404.
+      if (url.pathname === "/v1/stream" && request.method === "POST") {
+        return cors(await handleStream(request, env, ctx));
+      }
       if (url.pathname === "/v1/usage" && request.method === "GET") {
         return cors(await handleUsage(request, env));
       }
@@ -49,14 +58,18 @@ export default {
   },
 };
 
-// ── /v1/complete ────────────────────────────────────────────────────────────
-
-async function handleComplete(request, env, ctx) {
+// ── Shared request preparation (/v1/complete and /v1/stream) ─────────────────
+//
+// Validation, the per-request input ceiling, and BOTH quota gates. The two endpoints
+// MUST run this identically — a streaming path that skipped a gate would be a free
+// bypass of the entire metering scheme. Returns `{ error: Response }` to reject the
+// request outright, otherwise the context needed to run and then meter the completion.
+async function prepareCompletion(request, env) {
   const deviceId = request.headers.get("X-Device-Id");
-  if (!deviceId) return json({ error: "Missing X-Device-Id" }, 400);
+  if (!deviceId) return { error: json({ error: "Missing X-Device-Id" }, 400) };
 
   const body = await request.json().catch(() => null);
-  if (!body) return json({ error: "Invalid JSON" }, 400);
+  if (!body) return { error: json({ error: "Invalid JSON" }, 400) };
 
   // The app sends the WHOLE conversation as `messages` (multi-turn; the document is
   // folded into the first user turn). Accept a legacy single `content` string too,
@@ -69,7 +82,7 @@ async function handleComplete(request, env, ctx) {
     : (typeof body.content === "string"
         ? [{ role: "user", content: body.content }]
         : []);
-  if (messages.length === 0) return json({ error: "Missing messages" }, 400);
+  if (messages.length === 0) return { error: json({ error: "Missing messages" }, 400) };
 
   const totalChars = messages.reduce((n, m) => n + m.content.length, 0);
 
@@ -81,14 +94,14 @@ async function handleComplete(request, env, ctx) {
   const limits = readLimits(env);
   const isPro = await isProDevice(env, deviceId);
   const contentCap = isPro ? limits.maxContentCharsPro : limits.maxContentChars;
-  if (totalChars > contentCap) return json({ error: "Content too large" }, 413);
+  if (totalChars > contentCap) return { error: json({ error: "Content too large" }, 413) };
 
   // This device's daily TOKEN budget (actual tokens billed, debited after the call).
   const dailyTokenBudget = isPro ? limits.proDailyTokens : limits.freeDailyTokens;
 
   if (body.image && typeof body.image.data === "string" &&
       body.image.data.length > MAX_IMAGE_BASE64_BYTES) {
-    return json({ error: "Image too large for hosted tier — use your own key." }, 413);
+    return { error: json({ error: "Image too large for hosted tier — use your own key." }, 413) };
   }
 
   const system = typeof body.system === "string" && body.system.length
@@ -110,7 +123,9 @@ async function handleComplete(request, env, ctx) {
     env, "SELECT count FROM global_usage WHERE day = ?", [day]
   );
   if (globalCount >= limits.globalDailyCap) {
-    return json({ error: "Free tier is busy right now. Try again later or use your own key." }, 503);
+    return {
+      error: json({ error: "Free tier is busy right now. Try again later or use your own key." }, 503),
+    };
   }
 
   await env.DB.prepare(
@@ -131,21 +146,37 @@ async function handleComplete(request, env, ctx) {
     // Gate on the budget already consumed (the last request of the day may slightly
     // overshoot — a relief valve, not a hard ceiling; per-request cap bounds the spill).
     if (dailyTokens >= dailyTokenBudget) {
-      return json(
-        {
-          error: "Daily free limit reached.",
-          usage: usagePayload(limits, isPro, trialUsed, dailyTokens),
-        },
-        429
-      );
+      return {
+        error: json(
+          {
+            error: "Daily free limit reached.",
+            usage: usagePayload(limits, isPro, trialUsed, dailyTokens),
+          },
+          429
+        ),
+      };
     }
   }
+
+  return {
+    deviceId, day, limits, isPro, inTrial, trialUsed, dailyTokens,
+    completion, totalChars, tier: body.tier,
+  };
+}
+
+// ── /v1/complete ────────────────────────────────────────────────────────────
+
+async function handleComplete(request, env, ctx) {
+  const prep = await prepareCompletion(request, env);
+  if (prep.error) return prep.error;
+  const { isPro, totalChars } = prep;
 
   // Pick the model from the tier hint (missing/unknown → the capable default). Pro is
   // server-verified, so entitled devices resolve each tier to a more capable model
   // (funded by the subscription). Forward to Gemini; quota is only consumed on success.
   const strongModel = pickModel(env, "strong", isPro); // this user's capable default
-  const model = pickModel(env, body.tier, isPro);
+  const model = pickModel(env, prep.tier, isPro);
+  const completion = prep.completion;
   let usedModel = model;
   let result = await callGemini(env, completion, model);
   if (!result.ok && model !== strongModel) {
@@ -161,10 +192,30 @@ async function handleComplete(request, env, ctx) {
     return json({ error: result.error || "Upstream error" }, 502);
   }
 
+  const usage = await meterCompletion(env, ctx, {
+    ...prep,
+    usedModel,
+    tokens: result.tokens,
+    promptTokens: result.promptTokens,
+    completionTokens: result.completionTokens,
+    fallbackChars: totalChars,
+  });
+
+  return json({ text: result.text, usage });
+}
+
+// ── Shared metering (/v1/complete and /v1/stream) ────────────────────────────
+//
+// Debits a SUCCESSFUL completion and returns the fresh usage snapshot the app mirrors
+// into UsageStore. Split out so the streaming path books exactly the same way — the
+// only difference there is WHEN it runs (after the stream drains, via waitUntil).
+async function meterCompletion(env, ctx, p) {
+  const { deviceId, day, limits, isPro, inTrial, trialUsed, dailyTokens, usedModel } = p;
+
   // Tokens actually billed by Gemini (input + output). Falls back to a char estimate
   // only if the upstream usage block is missing, so a request never meters as free.
   const tokensUsed =
-    result.tokens && result.tokens > 0 ? result.tokens : Math.max(1, Math.ceil(totalChars / 4));
+    p.tokens && p.tokens > 0 ? p.tokens : Math.max(1, Math.ceil(p.fallbackChars / 4));
 
   // Weight the raw tokens by the model ACTUALLY billed (incl. the fallback model) so the
   // daily budget caps COST, not just count — a gemini-2.5-pro token drains it 4x faster,
@@ -197,9 +248,9 @@ async function handleComplete(request, env, ctx) {
   // the response is sent → zero user-facing latency. The consume/global writes above
   // stay awaited (they gate the next request's limits and must be race-free). Falls
   // back to a plain await if ctx is unavailable (e.g. a direct unit-test call).
-  const pt = Number.isInteger(result.promptTokens) ? result.promptTokens : tokensUsed;
-  const ct = Number.isInteger(result.completionTokens) ? result.completionTokens : 0;
-  const tierHint = ["fast", "strong", "extra"].includes(body.tier) ? body.tier : "other";
+  const pt = Number.isInteger(p.promptTokens) ? p.promptTokens : tokensUsed;
+  const ct = Number.isInteger(p.completionTokens) ? p.completionTokens : 0;
+  const tierHint = ["fast", "strong", "extra"].includes(p.tier) ? p.tier : "other";
   const spendWrite = env.DB.prepare(
     `INSERT INTO spend (day, model, tier, calls, prompt_tokens, completion_tokens)
      VALUES (?, ?, ?, 1, ?, ?)
@@ -213,10 +264,135 @@ async function handleComplete(request, env, ctx) {
 
   const newTrial = inTrial ? trialUsed + 1 : trialUsed;
   const newTokens = inTrial ? dailyTokens : dailyTokens + billedTokens;
-  return json({
-    text: result.text,
-    usage: usagePayload(limits, isPro, newTrial, newTokens),
+  return usagePayload(limits, isPro, newTrial, newTokens);
+}
+
+// ── /v1/stream ───────────────────────────────────────────────────────────────
+
+async function handleStream(request, env, ctx) {
+  const prep = await prepareCompletion(request, env);
+  if (prep.error) return prep.error;
+
+  const strongModel = pickModel(env, "strong", prep.isPro);
+  const model = pickModel(env, prep.tier, prep.isPro);
+  let usedModel = model;
+
+  // callGeminiStream only resolves once the FIRST content delta has arrived, so the
+  // tier fallback still works: both failure modes it exists for (an upstream 4xx and an
+  // empty completion) surface before a single byte has been committed to the client.
+  // After that point the 200 and its headers are gone and no retry is possible.
+  let stream = await callGeminiStream(env, prep.completion, model);
+  if (!stream.ok && model !== strongModel) {
+    console.warn(`tier-fallback ${model}->${strongModel}: ${stream.error || "unknown"}`);
+    usedModel = strongModel;
+    stream = await callGeminiStream(env, prep.completion, strongModel);
+  }
+  if (!stream.ok) return json({ error: stream.error || "Upstream error" }, 502);
+
+  const encoder = new TextEncoder();
+  let fullText = "";
+  let usage = stream.usage;
+  let metered = false;
+
+  // Exactly one metering pass, whether the stream drains normally OR the client
+  // disconnects halfway. Without the disconnect path, closing the shelf mid-answer
+  // would consume host tokens for free — the tokens are billed by Google either way.
+  const meter = async () => {
+    if (metered) return null;
+    metered = true;
+    return await meterCompletion(env, ctx, {
+      ...prep,
+      usedModel,
+      tokens: usage?.total_tokens,
+      promptTokens: usage?.prompt_tokens,
+      completionTokens: usage?.completion_tokens,
+      // Upstream usage is missing on an aborted stream; bill what was actually produced.
+      fallbackChars: prep.totalChars + fullText.length,
+    });
+  };
+  const meterInBackground = () => {
+    if (metered) return;
+    const p = meter().catch((err) => console.warn(`stream-meter failed: ${err}`));
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  };
+
+  const body = new ReadableStream({
+    async start(controller) {
+      const send = (obj) =>
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      try {
+        for (const text of stream.primed) {
+          fullText += text;
+          send(deltaEvent(text));
+        }
+        let rest = stream.rest;
+        for (;;) {
+          const { done, value } = await stream.reader.read();
+          if (done) break;
+          rest += stream.decoder.decode(value, { stream: true });
+          const drained = drainSSE(rest);
+          rest = drained.rest;
+          for (const payload of drained.payloads) {
+            if (payload === "[DONE]") continue;
+            let event;
+            try { event = JSON.parse(payload); } catch { continue; }
+            if (event.usage) usage = event.usage;
+            const text = event?.choices?.[0]?.delta?.content;
+            if (text) {
+              fullText += text;
+              send(deltaEvent(text));
+            }
+          }
+        }
+        // Terminal events: the usage snapshot the app mirrors into UsageStore (the
+        // streaming stand-in for /v1/complete's `usage` field), then [DONE].
+        const snapshot = await meter();
+        if (snapshot) send({ usage: snapshot });
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      } catch (err) {
+        // Past the 200 a failure can no longer be a status code — report it in-band and
+        // let the client decide (it keeps whatever text already arrived).
+        try {
+          send({ error: String(err) });
+          controller.close();
+        } catch { /* client already gone */ }
+      } finally {
+        meterInBackground();
+      }
+    },
+    cancel() {
+      // Client hung up. Stop pulling from Gemini, but still bill what it produced.
+      stream.reader.cancel().catch(() => {});
+      meterInBackground();
+    },
   });
+
+  return new Response(body, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      // no-transform is the load-bearing part: without it an edge compression pass can
+      // buffer the whole stream and deliver every token in one burst at the end.
+      "Cache-Control": "no-cache, no-transform",
+    },
+  });
+}
+
+function deltaEvent(text) {
+  return { choices: [{ delta: { content: text } }] };
+}
+
+// Pull complete `data:` payloads out of a rolling SSE buffer, returning the partial
+// tail that must stay buffered until the next network chunk completes it.
+function drainSSE(buffer) {
+  const payloads = [];
+  let idx;
+  while ((idx = buffer.indexOf("\n")) >= 0) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (line.startsWith("data:")) payloads.push(line.slice(5).trim());
+  }
+  return { payloads, rest: buffer };
 }
 
 // ── /v1/usage ─────────────────────────────────────────────────────────────────
@@ -332,6 +508,88 @@ function utcDayOffset(deltaDays) {
 // ── Gemini call ─────────────────────────────────────────────────────────────
 
 async function callGemini(env, req, model) {
+  const resp = await fetch(GEMINI_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.GEMINI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(geminiPayload(env, req, model)),
+  });
+
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    return { ok: false, error: data?.error?.message || `HTTP ${resp.status}` };
+  }
+  const text = data?.choices?.[0]?.message?.content;
+  if (!text) return { ok: false, error: "Empty response" };
+  // Capture actual token usage for metering (input + output, so image tokens count).
+  // Gemini's OpenAI-compat endpoint returns usage.{prompt,completion,total}_tokens;
+  // null if absent → the caller falls back to a char estimate.
+  const u = data?.usage || {};
+  const promptTokens = Number.isInteger(u.prompt_tokens) ? u.prompt_tokens : null;
+  const completionTokens = Number.isInteger(u.completion_tokens) ? u.completion_tokens : null;
+  const tokens = Number.isInteger(u.total_tokens)
+    ? u.total_tokens
+    : ((promptTokens || 0) + (completionTokens || 0)) || null;
+  return { ok: true, text, tokens, promptTokens, completionTokens };
+}
+
+// Streaming twin of callGemini. Resolves only AFTER the first content delta, so the
+// caller can still fall back to another model on failure; the caller then pumps the
+// returned reader for the rest.
+async function callGeminiStream(env, req, model) {
+  const resp = await fetch(GEMINI_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.GEMINI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      ...geminiPayload(env, req, model),
+      stream: true,
+      // Without this the OpenAI-compat stream omits usage entirely and every streamed
+      // request would meter on the char estimate instead of real tokens.
+      stream_options: { include_usage: true },
+    }),
+  });
+
+  if (!resp.ok || !resp.body) {
+    const data = await resp.json().catch(() => null);
+    return { ok: false, error: data?.error?.message || `HTTP ${resp.status}` };
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let rest = "";
+  let usage = null;
+  const primed = [];
+
+  while (primed.length === 0) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    rest += decoder.decode(value, { stream: true });
+    const drained = drainSSE(rest);
+    rest = drained.rest;
+    for (const payload of drained.payloads) {
+      if (payload === "[DONE]") continue;
+      let event;
+      try { event = JSON.parse(payload); } catch { continue; }
+      if (event.usage) usage = event.usage;
+      const text = event?.choices?.[0]?.delta?.content;
+      if (text) primed.push(text);
+    }
+  }
+
+  if (primed.length === 0) {
+    reader.cancel().catch(() => {});
+    return { ok: false, error: "Empty response" };
+  }
+  return { ok: true, reader, decoder, rest, primed, usage };
+}
+
+// Shared OpenAI-compat request body for both callGemini variants.
+function geminiPayload(env, req, model) {
   // Rebuild the OpenAI-compat messages array: system first, then the conversation.
   // The image (if any) is inlined into the FIRST user turn — same shape the BYOK
   // providers use.
@@ -353,39 +611,13 @@ async function callGemini(env, req, model) {
     }
   }
 
-  const payload = {
+  return {
     model: model || env.GEMINI_MODEL || "gemini-2.5-flash",
     messages,
     max_tokens: req.maxTokens,
     temperature: 0.3,
     reasoning_effort: "low",
   };
-
-  const resp = await fetch(GEMINI_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.GEMINI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => null);
-  if (!resp.ok) {
-    return { ok: false, error: data?.error?.message || `HTTP ${resp.status}` };
-  }
-  const text = data?.choices?.[0]?.message?.content;
-  if (!text) return { ok: false, error: "Empty response" };
-  // Capture actual token usage for metering (input + output, so image tokens count).
-  // Gemini's OpenAI-compat endpoint returns usage.{prompt,completion,total}_tokens;
-  // null if absent → the caller falls back to a char estimate.
-  const u = data?.usage || {};
-  const promptTokens = Number.isInteger(u.prompt_tokens) ? u.prompt_tokens : null;
-  const completionTokens = Number.isInteger(u.completion_tokens) ? u.completion_tokens : null;
-  const tokens = Number.isInteger(u.total_tokens)
-    ? u.total_tokens
-    : ((promptTokens || 0) + (completionTokens || 0)) || null;
-  return { ok: true, text, tokens, promptTokens, completionTokens };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
