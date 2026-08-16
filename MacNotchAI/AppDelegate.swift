@@ -151,15 +151,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // Auto-update (Sparkle). Instantiating starts the scheduled background check.
         _ = UpdaterController.shared
 
-        // Clipboard history persists raw content, so the research artefact must not
-        // start its poller or claim the picker hotkey. Keep the existing store and
-        // preference untouched so installing the normal product later restores them.
-#if !THESIS_STUDY_BUILD
+        // Clipboard History runs in the study build exactly as it does in the product,
+        // on the participant's own preference. It is a product feature, not a study
+        // instrument: the intent pipeline never reads this store (ClipboardSensor
+        // observes the pasteboard independently), the two live in different Application
+        // Support directories, the exporter only takes .jsonl from IntentTraces, and
+        // `verifyStaging` fails an export whose staged set differs from the manifest.
+        //
+        // Forcing it off was the larger risk: `isEnabled` defaults to true, so every
+        // participant would have run a configuration the product never ships — and one
+        // that changes copy behaviour, which is the behaviour under study.
         if ClipboardHistoryStore.isEnabled {
             ClipboardHistoryStore.shared.startMonitoring()
             registerClipboardHotkey()
         }
-#endif
 
         // First-run tour: once onboarding is done, show the interactive tutorial once.
         // Restartable anytime from Settings → Help (fresh installs get it right after

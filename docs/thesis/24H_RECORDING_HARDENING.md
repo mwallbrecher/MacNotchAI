@@ -46,9 +46,17 @@ The owner confirmed four study-design boundaries during review:
   the checked-out branch is exactly `main`. It also refuses a source plist carrying the Study marker.
 - The Study DMG is built and distributed manually. It is never uploaded as a GitHub release and never
   passed to Sparkle's `generate_appcast`.
-- The public product Clipboard History recorder is compiled into the shared app but forcibly remains
-  off in a Study build; its previous preferences/history are neither changed nor exported. This avoids
-  a second, raw-content clipboard store alongside the content-minimised Study sensor.
+- The public product Clipboard History recorder runs in a Study build exactly as it does in the
+  product, on the participant's own preference. It is a product feature rather than a study
+  instrument, so it needs no separate justification in the consent text — describing it there would
+  wrongly imply the study collects it. Isolation is structural on three independent levels: the
+  intent pipeline holds no reference to `ClipboardHistoryStore` (`ClipboardSensor` observes the
+  pasteboard independently and applies the same `PasteboardPrivacy` gate), the two stores live in
+  different Application Support directories, and the exporter both restricts itself to `.jsonl` under
+  `IntentTraces/` and fails via `verifyStaging` if the staged set ever differs from the manifest.
+- Forcing it off was the larger risk and was reverted: `ClipboardHistoryStore.isEnabled` defaults to
+  true, so every participant would otherwise have run a configuration the shipping product never
+  produces — and one that alters copy behaviour, which is the behaviour under study.
 
 This protects both directions: a Study build cannot consume a public Main update, and the repository's
 normal release path cannot advertise a Study build to public clients.
