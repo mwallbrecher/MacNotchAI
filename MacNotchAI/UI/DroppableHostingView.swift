@@ -248,8 +248,19 @@ final class DroppableHostingView: NSHostingView<OverlayView> {
             // Only the analysable files can be added to a session.
             let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
             guard !supported.isEmpty else { return false }
+            // A file that is already staged is not a new drop. The common case is
+            // dragging the pill out and releasing it back over the shelf: the session
+            // is unchanged, so the add/new prompt is pure noise. Same dedup the Mail
+            // promise path already does (see deliverMailPromiseURLs).
+            let occupied = Set((vm.sessionFileURLs + vm.pendingDroppedURLs).map {
+                $0.standardizedFileURL.path
+            })
+            let fresh = supported.filter { !occupied.contains($0.standardizedFileURL.path) }
+            // Return true, not false: the drop WAS for us and is simply a no-op.
+            // Returning false makes AppKit animate the item back to the source app.
+            guard !fresh.isEmpty else { return true }
             withAnimation(.spring(response: 0.36, dampingFraction: 1.0)) {
-                vm.pendingDroppedURLs = supported
+                vm.pendingDroppedURLs = fresh
             }
             grabFocusAfterDrop()
             return true

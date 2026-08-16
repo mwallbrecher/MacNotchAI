@@ -2776,3 +2776,20 @@ hotkey and the normal session pipeline takes over.
 - [x] Run `scripts/release.sh`; verify Developer-ID signing, Apple notarization, stapling, DMG version,
       and the Sparkle EdDSA signature. Leave publishing and the generated appcast commit for an explicit
       follow-up request.
+
+## Fix — batch compression list, progress, and cancellation (2026-08-14)
+
+- [x] Give the shared image/video candidate list a deterministic non-zero fitting height derived from
+      its row count, capped at the existing 210 pt so larger batches still scroll.
+- [x] Report live per-video AVFoundation progress (including a visible Preparing state), rather than
+      counting only fully completed files and appearing stuck at 0% for an entire single-file export.
+- [x] Add a real Cancel action during image/video runs. Cancel the active AV export, keep the dialog in
+      a clear Cancelling state until the producer has stopped, and also cancel when the window closes.
+- [x] Make cancellation transactional for the current run: reserve and track each destination before
+      writing, then delete its partial output plus every completed output from that same run. Never
+      touch a pre-existing file or output from an earlier run, and report any cleanup failure honestly.
+- [x] Keep image encoding off the main actor so Cancel remains clickable; preserve all-selected default,
+      row deselection, ineligible-file explanations, and successful batch behavior.
+- [x] Verify diff hygiene and a Debug build; smoke-check small/overflowing candidate counts, live video
+      progress, successful batches, cancellation, window-close cancellation, and cleanup semantics.
+- [x] Capture the sizing and transactional-cancellation lessons in `tasks/lessons.md`.

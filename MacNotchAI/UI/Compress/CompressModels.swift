@@ -38,8 +38,8 @@ struct CompressCandidate: Identifiable, Equatable {
 
 // MARK: - Image options
 
-struct ImageCompressOptions: Equatable {
-    enum Format: String, CaseIterable, Identifiable {
+struct ImageCompressOptions: Equatable, Sendable {
+    enum Format: String, CaseIterable, Identifiable, Sendable {
         case jpeg, png, keep
         var id: String { rawValue }
         var label: String {
@@ -68,10 +68,10 @@ struct ImageCompressOptions: Equatable {
 
 // MARK: - Video options
 
-struct VideoCompressOptions: Equatable {
+struct VideoCompressOptions: Equatable, Sendable {
     /// Explicit resolution choice. The old behaviour was AVAssetExportPreset1280x720
     /// HARD-CODED — a 4K clip was silently downscaled to 720p with no way to say otherwise.
-    enum Quality: String, CaseIterable, Identifiable {
+    enum Quality: String, CaseIterable, Identifiable, Sendable {
         case keepResolution, uhd4K, hd1080, hd720, medium
         var id: String { rawValue }
 
@@ -104,7 +104,7 @@ struct VideoCompressOptions: Equatable {
         }
     }
 
-    enum Container: String, CaseIterable, Identifiable {
+    enum Container: String, CaseIterable, Identifiable, Sendable {
         case mp4, mov
         var id: String { rawValue }
         var label: String { self == .mp4 ? "MP4" : "MOV" }

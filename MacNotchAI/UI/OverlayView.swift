@@ -1201,10 +1201,18 @@ private struct TwoColumnView: View {
 
                 if vm.isFollowupsExpanded {
                     VStack(alignment: .leading, spacing: 6 * scale) {
-                        ForEach(followUpActions) { action in
-                            MenuActionRow(title: action.rawValue, systemImage: action.icon) {
-                                runAction(action)
+                        ForEach(followUpChips) { chip in
+                            MenuActionRow(title: chip.title, systemImage: chip.icon) {
+                                if let action = chip.action {
+                                    runAction(action)
+                                } else {
+                                    sendTurn(provider: provider, fileURL: fileURL,
+                                             action: .freeform, typedPrompt: chip.title)
+                                }
                             }
+                            // Suggested prompts are free-form and can outrun the pill's
+                            // single truncated line — hover shows the whole thing.
+                            .help(chip.title)
                         }
                     }
                     .disabled(vm.isAITurnActive)
@@ -1323,6 +1331,15 @@ private struct TwoColumnView: View {
                         proxy.scrollTo(vm.conversation.last?.id, anchor: .bottom)
                     }
                 }
+                // A streaming reply grows the LAST bubble in place, so the message
+                // count never changes and the observer above never fires mid-stream.
+                // Tracking the live bubble's length keeps the newest tokens visible.
+                // Deliberately unanimated: a 0.2 s curve restarted on every delta
+                // never finishes, so the scroll would trail the text instead of
+                // following it.
+                .onChange(of: vm.conversation.last?.display.count ?? 0) { _, _ in
+                    proxy.scrollTo(vm.conversation.last?.id, anchor: .bottom)
+                }
                 .onChange(of: vm.isAwaitingReply) { _, awaiting in
                     if awaiting {
                         withAnimation(.easeOut(duration: 0.2)) {
@@ -1353,6 +1370,31 @@ private struct TwoColumnView: View {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /// One follow-up pill. Either a fixed `AIAction` (the static fallback) or a prompt
+    /// the model suggested, which runs as a freeform turn — exactly as if the user had
+    /// typed it.
+    private struct FollowUpChip: Identifiable {
+        let id: String
+        let title: String
+        let icon: String
+        let action: AIAction?
+    }
+
+    private var followUpChips: [FollowUpChip] {
+        // Prefer what the model proposed for THIS answer.
+        if let suggested = vm.conversation.last(where: { $0.role == .assistant })?.followUps,
+           !suggested.isEmpty {
+            return suggested.map {
+                FollowUpChip(id: $0, title: $0, icon: "sparkle", action: nil)
+            }
+        }
+        // Fallback — a BYOK model may ignore the instruction, a restored session carries
+        // no suggestions, and a failed turn never produced any.
+        return followUpActions.map {
+            FollowUpChip(id: $0.rawValue, title: $0.rawValue, icon: $0.icon, action: $0)
+        }
+    }
 
     private var followUpActions: [AIAction] {
         guard case .result(_, let action, _) = vm.stage else { return [] }
@@ -1935,13 +1977,6 @@ private struct SingleFilePill: View {
 
     var body: some View {
         ZStack {
-            NativeFileDragSurface(
-                tooltip: fileURL.lastPathComponent,
-                onClick: preview,
-                onPreview: preview,
-                dragURLs: beginDrag
-            )
-
             HStack(spacing: 11 * scale) {
                 Image(nsImage: fileIcon)
                     .resizable()
@@ -1976,6 +2011,22 @@ private struct SingleFilePill: View {
             .padding(.horizontal, 10 * scale)
         }
         .frame(maxWidth: .infinity, minHeight: 58 * scale, alignment: .leading)
+        // The drag surface is a BACKGROUND, not a ZStack sibling. NativeFileDragSurface
+        // is an NSViewRepresentable with no intrinsic height, so as a sibling it accepted
+        // whatever height the stack proposed and made the whole pill greedy — in the
+        // result stage, where the left column has vertical slack, that rendered this
+        // ~58 pt row several hundred points tall instead of leaving the space to the
+        // Spacer above ToolRow. A background fills the pill without ever influencing its
+        // size, and keeps the same z-order: below the (non-hit-testing) content, below
+        // the ShareButton that layers above it.
+        .background(
+            NativeFileDragSurface(
+                tooltip: fileURL.lastPathComponent,
+                onClick: preview,
+                onPreview: preview,
+                dragURLs: beginDrag
+            )
+        )
         .background(fileFieldBackground(scale: scale))
         .popover(isPresented: $isShowingFolderContents) {
             FolderContentsPopover(rootURL: fileURL)
@@ -2033,21 +2084,6 @@ private struct MultiFilePill: View {
 
     var body: some View {
         ZStack(alignment: usesStackedLayout ? .topTrailing : .trailing) {
-            // This native view covers the complete field. The Share button below is layered above
-            // it and keeps its own hit target; every other pixel begins the same multi-file drag.
-            NativeFileDragSurface(
-                tooltip: fileURLs.first?.lastPathComponent ?? "Files",
-                onClick: showSessionFiles,
-                onPreview: showSessionFiles,
-                dragURLs: beginDrag,
-                hoverFileCount: fileURLs.count,
-                hoverScale: scale,
-                hoverFileNames: fileURLs.map(\.lastPathComponent),
-                hoverFanIsTopAligned: usesStackedLayout,
-                onClickFileIndex: { previewFile(at: $0) },
-                onHoverFileIndex: { hoveredFileIndex = $0 }
-            )
-
             Group {
                 if usesStackedLayout {
                     VStack(alignment: .leading, spacing: 3 * scale) {
@@ -2081,6 +2117,25 @@ private struct MultiFilePill: View {
             maxWidth: .infinity,
             minHeight: (usesStackedLayout ? 78 : 58) * scale,
             alignment: .leading
+        )
+        // Background rather than a ZStack sibling — see SingleFilePill for why. It still
+        // covers the complete field: the Share button layers above it and keeps its own
+        // hit target; every other pixel begins the same multi-file drag. Note this stays
+        // a minHeight, so the stacked (≥6 files) layout can still grow past 78 pt for its
+        // second metadata line — a hard cap would clip it.
+        .background(
+            NativeFileDragSurface(
+                tooltip: fileURLs.first?.lastPathComponent ?? "Files",
+                onClick: showSessionFiles,
+                onPreview: showSessionFiles,
+                dragURLs: beginDrag,
+                hoverFileCount: fileURLs.count,
+                hoverScale: scale,
+                hoverFileNames: fileURLs.map(\.lastPathComponent),
+                hoverFanIsTopAligned: usesStackedLayout,
+                onClickFileIndex: { previewFile(at: $0) },
+                onHoverFileIndex: { hoveredFileIndex = $0 }
+            )
         )
         .background(fileFieldBackground(scale: scale))
         .popover(isPresented: $isShowingSessionFiles, arrowEdge: .top) {
@@ -2930,22 +2985,27 @@ private func sendTurn(provider: any AIProvider,
             guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
             vm.contentTruncated = base.truncated
             vm.isAwaitingReply  = false
+            // Split the model's suggested follow-ups off the end. `answer` is what the
+            // user sees, what gets persisted, and what is replayed to the model on the
+            // next turn — the marker must never leak into any of those.
+            let (answer, followUps) = FollowUpSuggestions.parse(text)
             // Swap the streamed bubble for the definitive text; if the provider
             // didn't stream (no bubble), append the reply as before.
-            if !vm.finalizeStreamedReply(text) {
-                vm.conversation.append(.init(role: .assistant, display: text, modelText: text))
+            if !vm.finalizeStreamedReply(answer, followUps: followUps) {
+                vm.conversation.append(.init(role: .assistant, display: answer,
+                                             modelText: answer, followUps: followUps))
             }
             // Regenerate replaces the visible reply for the same logical turn. Keep persisted
             // history in lockstep so reopen and Session Sharing cannot expose the stale answer.
             if regenerate {
-                SessionHistoryStore.shared.replaceActiveLastTurnResult(text)
+                SessionHistoryStore.shared.replaceActiveLastTurnResult(answer)
             } else {
                 SessionHistoryStore.shared.recordTurn(
                     primary: fileURL, additional: additionalURLs,
-                    action: action, prompt: typedPrompt, result: text)
+                    action: action, prompt: typedPrompt, result: answer)
             }
             applyStage(
-                .result(url: fileURL, action: action, text: text),
+                .result(url: fileURL, action: action, text: answer),
                 ifSession: sessionRevision,
                 turnID: turnID,
                 completesTurn: true
@@ -3007,7 +3067,8 @@ private func buildChatTurns(conversation: [OverlayViewModel.ChatMessage],
         ChatTurn(role: "system", content:
             "You are Dragaway, a concise assistant embedded in macOS. The user dropped a "
             + "document or image and asks about it. Answer directly and format replies "
-            + "in Markdown.")
+            + "in Markdown.\n\n"
+            + FollowUpSuggestions.instruction)
     ]
     var documentAttached = false
     for msg in conversation {

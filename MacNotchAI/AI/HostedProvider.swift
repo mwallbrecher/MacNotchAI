@@ -31,10 +31,13 @@ final class HostedProvider: AIProvider {
     /// Only usable once the Worker URL has been configured.
     var isAvailable: Bool { BackendConfig.proxyBaseURL != nil }
 
-    func reply(messages turns: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
+    /// Wire body + headers shared by `reply` and `replyStream` — the two endpoints take
+    /// an identical request and differ only in how the answer comes back.
+    private func makeRequest(path: String, turns: [ChatTurn],
+                             imageURL: URL?, plan: RoutingPlan) throws -> URLRequest {
         guard let base = BackendConfig.proxyBaseURL else { throw HostedError.backendNotConfigured }
 
-        var request = URLRequest(url: base.appendingPathComponent("v1/complete"))
+        var request = URLRequest(url: base.appendingPathComponent(path))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(DeviceIdentity.current, forHTTPHeaderField: "X-Device-Id")
@@ -65,6 +68,12 @@ final class HostedProvider: AIProvider {
             ]
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
+    }
+
+    func reply(messages turns: [ChatTurn], imageURL: URL?, plan: RoutingPlan) async throws -> String {
+        let request = try makeRequest(path: "v1/complete", turns: turns,
+                                      imageURL: imageURL, plan: plan)
 
         let (data, response) = try await URLSession.shared.data(for: request)
         let http = response as? HTTPURLResponse
@@ -87,6 +96,78 @@ final class HostedProvider: AIProvider {
         default:
             throw AIError.apiError(decoded?.error ?? "HTTP \(http?.statusCode ?? 0)")
         }
+    }
+
+    /// Set once a deployed Worker answers `/v1/stream` with 404/405, so a fleet that
+    /// hasn't been updated yet costs one probe per launch instead of one per turn.
+    private static var streamingUnavailable = false
+
+    /// Streaming variant. The Worker re-emits Gemini's OpenAI-compatible SSE and appends
+    /// one terminal `{"usage":…}` event carrying the same snapshot `/v1/complete` returns
+    /// in its JSON body, so the free-tier counter stays exact either way.
+    ///
+    /// The app and the Worker deploy independently, so an older Worker without the route
+    /// must not break the turn: 404/405 falls back to the one-shot endpoint.
+    func replyStream(messages turns: [ChatTurn], imageURL: URL?, plan: RoutingPlan,
+                     onDelta: @escaping (String) -> Void) async throws -> String {
+        guard !Self.streamingUnavailable else {
+            return try await reply(messages: turns, imageURL: imageURL, plan: plan)
+        }
+
+        var request = try makeRequest(path: "v1/stream", turns: turns,
+                                      imageURL: imageURL, plan: plan)
+        // See openAICompatSSE: URLSession's transparent gzip decoding buffers an event
+        // stream to completion, which turns streaming back into a one-shot reply.
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status != 200 {
+            var data = Data()
+            for try await b in bytes { data.append(b) }   // error bodies are small
+            if status == 404 || status == 405 {
+                Self.streamingUnavailable = true
+                return try await reply(messages: turns, imageURL: imageURL, plan: plan)
+            }
+            let decoded = try? JSONDecoder().decode(CompleteResponse.self, from: data)
+            if let usage = decoded?.usage { UsageStore.shared.apply(usage) }
+            switch status {
+            case 429: throw HostedError.limitReached(resetAt: decoded?.usage?.resetAt)
+            case 503: throw HostedError.serviceBusy
+            default:  throw AIError.apiError(decoded?.error ?? "HTTP \(status)")
+            }
+        }
+
+        struct Event: Decodable {
+            struct Choice: Decodable {
+                struct Delta: Decodable { let content: String? }
+                let delta: Delta?
+            }
+            let choices: [Choice]?
+            let usage: HostedUsage?
+            let error: String?
+        }
+
+        var full = ""
+        var streamError: String?
+        for try await line in bytes.lines {
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            if payload == "[DONE]" { break }
+            guard let d = payload.data(using: .utf8),
+                  let event = try? JSONDecoder().decode(Event.self, from: d) else { continue }
+            // Past the 200 the Worker can only report a failure in-band. Keep whatever
+            // text already arrived — a partial answer beats discarding a metered turn.
+            if let error = event.error { streamError = error; continue }
+            if let usage = event.usage { UsageStore.shared.apply(usage) }
+            if let delta = event.choices?.first?.delta?.content, !delta.isEmpty {
+                full += delta
+                onDelta(delta)
+            }
+        }
+        if full.isEmpty { throw AIError.apiError(streamError ?? "Empty response") }
+        return full
     }
 
     private struct CompleteResponse: Decodable {

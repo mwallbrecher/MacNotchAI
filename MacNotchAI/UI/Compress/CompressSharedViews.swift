@@ -4,6 +4,18 @@ import AppKit
 /// Pieces shared by the image and video compression sheets. The sheets stay separate
 /// because their options genuinely differ; only the chrome is common.
 
+enum CompressFileListLayout {
+    private static let rowHeight: CGFloat = 42
+    private static let maximumHeight: CGFloat = 210
+
+    /// `NSHostingController` asks its SwiftUI root for an ideal size when creating the native
+    /// window. A ScrollView with only `maxHeight` can report zero and collapse, so the list needs
+    /// a real fitting height while retaining the existing cap for larger batches.
+    static func height(for rowCount: Int) -> CGFloat {
+        min(maximumHeight, max(rowHeight, CGFloat(rowCount) * rowHeight))
+    }
+}
+
 struct CompressSheetHeader: View {
     let title: String
     let subtitle: String
@@ -90,11 +102,49 @@ struct CompressProgressView: View {
         VStack(alignment: .leading, spacing: 14) {
             if runner.running {
                 VStack(alignment: .leading, spacing: 8) {
-                    ProgressView(value: Double(runner.doneCount),
-                                 total: Double(max(runner.totalCount, 1)))
-                    Text("\(runner.doneCount) of \(runner.totalCount) · \(runner.currentName)")
-                        .font(.system(size: 11.5)).foregroundColor(.secondary)
-                        .lineLimit(1).truncationMode(.middle)
+                    ProgressView(value: runner.overallProgress, total: 1)
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(progressTitle)
+                                .font(.system(size: 11.5, weight: .medium))
+                            Text(runner.currentName)
+                                .font(.system(size: 10.5)).foregroundColor(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                        Spacer()
+                        Button(runner.isCancelling ? "Cancelling…" : "Cancel") {
+                            runner.cancel()
+                        }
+                        .buttonStyle(.bordered)
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(runner.isCancelling)
+                    }
+                }
+            } else if runner.wasCancelled {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: runner.cleanupFailures.isEmpty
+                          ? "xmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundColor(runner.cleanupFailures.isEmpty ? .secondary : .orange)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Compression cancelled")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(cancelledDetail)
+                            .font(.system(size: 11.5)).foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                HStack {
+                    if !runner.cleanupFailures.isEmpty {
+                        Button("Show leftovers in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting(runner.cleanupFailures)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    Spacer()
+                    Button("Done", action: onClose)
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
                 }
             } else {
                 HStack(spacing: 8) {
@@ -144,5 +194,21 @@ struct CompressProgressView: View {
             }
         }
         .frame(minHeight: 90, alignment: .top)
+    }
+
+    private var progressTitle: String {
+        if runner.isCancelling { return "Cancelling and removing this run’s outputs…" }
+        if runner.currentFraction <= 0.001 {
+            return "Preparing · \(runner.doneCount) of \(runner.totalCount) complete"
+        }
+        return "\(Int(runner.overallProgress * 100))% · \(runner.doneCount) of \(runner.totalCount) complete"
+    }
+
+    private var cancelledDetail: String {
+        if runner.cleanupFailures.isEmpty {
+            return "Partial files and completed outputs from this run were removed. Originals were not changed."
+        }
+        let count = runner.cleanupFailures.count
+        return "Could not remove \(count) item\(count == 1 ? "" : "s"). Originals were not changed."
     }
 }

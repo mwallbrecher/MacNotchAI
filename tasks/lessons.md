@@ -1413,3 +1413,33 @@
   are not subscribed at all.
 - **Rule:** keep discovery backfills subordinate to live data, and move all path resolution or metadata
   validation off the UI actor even when the query API itself must be driven from that actor.
+
+### [COMPRESS-01] A max height is not a fitting height in an auto-sized hosting window
+
+- **What was wrong:** the batch-compression header correctly reported all candidates as selected, but
+  the file selector itself appeared empty between two dividers.
+- **Why:** the native compression window is initially sized from an `NSHostingController`. A SwiftUI
+  `ScrollView` constrained only with `maxHeight` can report an ideal height of zero during that fitting
+  pass, so AppKit legitimately collapses it even though its rows exist.
+- **Fix:** derive one explicit nonzero list height from the candidate count and cap it at 210 pt. Small
+  batches now contribute their actual height to window fitting; large batches retain scrolling.
+- **Rule:** any scroll container inside an auto-sized AppKit hosting window needs a concrete minimum or
+  ideal height. `maxHeight` limits growth but does not promise visible content.
+
+### [COMPRESS-02] Cancellation must own the producer and its artifacts before work starts
+
+- **What was wrong:** video progress counted only completed files, so a one-file export displayed 0%
+  until the end. Closing the window did not own or cancel the unstructured AVFoundation export, and
+  each retry selected another collision-free output name while earlier partial fragments remained.
+- **Why:** the runner learned the output URL only after a producer succeeded and held no reference to
+  the active `AVAssetExportSession`. It therefore had nothing authoritative to cancel or clean up.
+- **Fix:** the runner now creates a hidden item-replacement directory on the destination volume before
+  each producer starts. All AVFoundation fragments stay inside that directory; only a completed file
+  is moved atomically to its final path. It owns the active export session, polls real AV progress,
+  cancels on the explicit button or window disappearance, awaits producer termination, then removes
+  every work directory and every completed final output from that exact run. Image encoding moved to a
+  detached task so its cancellation control remains responsive; an in-flight ImageIO encode finishes
+  safely and is discarded. Cleanup failures are surfaced instead of claiming success.
+- **Rule:** a cancellable file operation must reserve and track every path before writing, keep an
+  explicit cancellation handle, await the producer's terminal state, and only then delete artifacts.
+  Never glob a user directory; isolate intermediates and remove only paths owned by the current run.

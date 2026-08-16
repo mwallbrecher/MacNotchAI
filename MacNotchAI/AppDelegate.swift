@@ -21,6 +21,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// Active only while a file is staged on the chips stage (Pillar 1).
     private var toolHotkeyMonitor: Any?
     private var dragOutEndTimer: Timer?          // polls mouse state after a drag-out gesture
+    // Eased window growth while a reply streams — see growStreamHeight().
+    private var streamGrowthTimer: Timer?
+    private var streamGrowthTarget: CGFloat = 0
+    private var streamGrowthCurrent: CGFloat = 0
     /// System-wide ⌃⌘V hotkey (Carbon) that opens the clipboard-history picker. Consumes
     /// the keystroke so the combo never leaks into the frontmost app. Live only while
     /// clipboard tracking is enabled.
@@ -1302,6 +1306,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
                 }
             }
             .store(in: &cancellables)
+
+        // A streaming reply publishes `stage` exactly ONCE (the first delta flips to
+        // .result with an empty text); every token after that only mutates
+        // `conversation`. So the observer above fired while the transcript was still
+        // empty, the window kept its 410 pt floor for the whole stream, and only the
+        // definitive .result at the end unfolded it — the reply appeared to arrive in
+        // a window that resized after the fact. sizeForStage(.result) already derives
+        // its height from the transcript, so re-running it as the transcript grows is
+        // the whole fix.
+        OverlayViewModel.shared.$conversation
+            .sink { [weak self] _ in
+                // Same deferral rationale as the stage observer: never call setFrame
+                // from inside an active AppKit/SwiftUI layout pass.
+                DispatchQueue.main.async {
+                    // Only the result stage is transcript-sized; every other stage has
+                    // a fixed height that the stage observer already applied.
+                    guard case .result = OverlayViewModel.shared.stage else { return }
+                    // Note this only raises the target — the 60 fps animator does the
+                    // actual resizing, so token rate no longer drives frame changes and
+                    // no throttle is needed here.
+                    self?.growStreamHeight()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Tool launch hotkeys (Pillar 1)
@@ -1803,8 +1831,85 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // .waitingForDrop stage change that would otherwise instantly shrink a
         // chips/result-sized window while it's fading out — visible and wrong.
         guard let window = overlayWindow, window.isVisible, !isWindowDismissing else { return }
+        // Leaving the result stage ends any in-flight growth — the new stage's fixed
+        // height wins immediately.
+        if stage.tag != 3 { stopStreamGrowth() }
+        // While the transcript is growing, the eased animator below owns the height.
+        // Letting this path through would snap the frame to the target and undo it.
+        if streamGrowthTimer != nil, case .result = stage { return }
         let (size, anchorLeft) = sizeForStage(stage)
         window.animateTo(size: size, anchorAtNotchCenter: anchorLeft)
+    }
+
+    // MARK: - Eased growth while a reply streams
+    //
+    // animateTo() sets the frame INSTANTLY by design (see OverlayWindow: the animator
+    // proxy re-enters the constraint solver and aborts). The window is transparent, but
+    // the transcript card fills it via .frame(maxHeight: .infinity), so every frame step
+    // is visible on the black shape. Applying each new target directly therefore made a
+    // fast model tick the shelf open in ~20 pt jerks (the height quantum of
+    // sizeForStage's line estimate).
+    //
+    // So: keep the instant setFrame, but walk toward the target at display rate. Steps
+    // of a point or two read as one continuous motion instead of a stutter.
+
+    private func growStreamHeight() {
+        guard let window = overlayWindow, window.isVisible, !isWindowDismissing else { return }
+        let stage = OverlayViewModel.shared.stage
+        guard case .result = stage else { return }
+
+        // Monotonic: the transcript only ever grows during a turn, and a mid-answer
+        // shrink (a shorter re-render, a late clamp) would read as a glitch.
+        streamGrowthTarget = max(streamGrowthTarget, sizeForStage(stage).0.height)
+        if streamGrowthCurrent <= 0 { streamGrowthCurrent = window.frame.height }
+        guard streamGrowthTimer == nil else { return }
+
+        // .common mode so the growth keeps running while the user is dragging or a
+        // menu is tracking, exactly like the drag-out detector above.
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stepStreamGrowth() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        streamGrowthTimer = t
+    }
+
+    @MainActor
+    private func stepStreamGrowth() {
+        let stage = OverlayViewModel.shared.stage
+        guard let window = overlayWindow, window.isVisible, !isWindowDismissing,
+              case .result = stage else {
+            stopStreamGrowth()
+            return
+        }
+
+        let (size, anchorLeft) = sizeForStage(stage)
+        streamGrowthTarget = max(streamGrowthTarget, size.height)
+
+        let remaining = streamGrowthTarget - streamGrowthCurrent
+        // Exponential ease-out: quick while far from the target, gentle as it lands.
+        if abs(remaining) < 0.5 {
+            streamGrowthCurrent = streamGrowthTarget
+            window.animateTo(size: CGSize(width: size.width, height: streamGrowthCurrent),
+                             anchorAtNotchCenter: anchorLeft)
+            stopStreamGrowth()
+            return
+        }
+        // Clamp the per-frame travel. Token-by-token growth never reaches it (those
+        // steps measure 1–6 pt), but a target that jumps all at once — a follow-up turn
+        // appending a whole prompt bubble, or finalizeStreamedReply swapping in the full
+        // text — would otherwise open with a single 40 pt lurch, i.e. worse than the
+        // stutter this replaced. 6 pt/frame ≈ 360 pt/s: the full 410→600 range in ~0.5 s.
+        let step = min(abs(remaining) * 0.22, 6)
+        streamGrowthCurrent += remaining < 0 ? -step : step
+        window.animateTo(size: CGSize(width: size.width, height: streamGrowthCurrent.rounded()),
+                         anchorAtNotchCenter: anchorLeft)
+    }
+
+    private func stopStreamGrowth() {
+        streamGrowthTimer?.invalidate()
+        streamGrowthTimer = nil
+        streamGrowthTarget = 0
+        streamGrowthCurrent = 0
     }
 
     /// Fixed window size + notch anchor for a stage. Single source of truth shared by

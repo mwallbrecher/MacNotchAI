@@ -29,14 +29,14 @@ TRIAL_TOTAL = "10"        # one-time free interactions per device (still interac
 # Daily quota is metered in ACTUAL TOKENS billed by Gemini (input + output), captured
 # from each response — so images (and everything else) debit fairly, not just message
 # text. Tune freely server-side (no app update). Defaults ≈ today's generosity:
-# free ≈ 3 full requests' worth, pro ≈ 10. Pro bypasses the trial → straight to its budget.
+# free ≈ 6 full requests' worth, pro ≈ 20. Pro bypasses the trial → straight to its budget.
 # Rough conversion: ~4 chars/token, so 40k-char request ≈ 10k input tokens.
 # NOTE: tokens are debited MODEL-WEIGHTED (see BUDGET_WEIGHTS in index.js) so the budget
 # caps COST, not raw count: flash-lite ×0.5, flash ×1, gemini-2.5-pro ×4. So these budgets
 # are in "flash-equivalent" tokens — cheap-model use stretches further, the premium model
-# drains faster. Worst-case spend ≈ flat (~$4/mo at the pro budget) whatever model is used.
-FREE_DAILY_TOKENS = "30000"   # free daily budget, flash-equivalent (~3 full flash requests)
-PRO_DAILY_TOKENS  = "200000"  # pro  daily budget, flash-equivalent (~10 full flash requests)
+# drains faster. Worst-case spend ≈ flat (~$8/mo at the pro budget) whatever model is used.
+FREE_DAILY_TOKENS = "60000"   # free daily budget, flash-equivalent (~6 full flash requests)
+PRO_DAILY_TOKENS  = "400000"  # pro  daily budget, flash-equivalent (~20 full flash requests)
 GLOBAL_DAILY_CAP = "2000" # hard ceiling on TOTAL interactions/day (coarse budget guard)
 # Routing mode — squeezes the FREE tier's model ladder to control cost as traffic grows.
 # Pro is NEVER affected (always uses the generous ladder). Swap instantly with NO logic

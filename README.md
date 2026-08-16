@@ -10,6 +10,17 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 
 ---
 
+## What's New in v1.1.7
+
+- **Live streaming on Dragaway Free** — replies appear word by word on the hosted free tier, not just
+  with your own API key, and the shelf grows smoothly with the answer instead of after it.
+- **Double the daily free allowance** — 60,000 tokens per day on Free and 400,000 on Pro. Existing
+  installs pick this up automatically.
+- **Follow-up prompts suggested by the model** — each answer proposes up to six next prompts that fit
+  what you asked, instead of a fixed list. Clicking one sends it as if you had typed it.
+- **Batch compression you can cancel** — image and video runs show live progress and can be stopped,
+  cleaning up exactly the files that run produced and nothing else.
+
 ## What's New in v1.1.6
 
 - **Share sessions with colleagues** — expose the current session and let multiple colleagues open its

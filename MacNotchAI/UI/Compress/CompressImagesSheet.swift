@@ -34,11 +34,11 @@ struct CompressImagesSheet: View {
             CompressSheetHeader(
                 title: "Compress images",
                 subtitle: "\(chosen.count) of \(eligible.count) selected",
-                onClose: onClose)
+                onClose: closeOrCancel)
 
             Divider().padding(.vertical, 12)
 
-            if runner.running || !runner.outcomes.isEmpty {
+            if runner.running || runner.wasCancelled || !runner.outcomes.isEmpty {
                 CompressProgressView(runner: runner, onClose: onClose)
             } else {
                 fileList
@@ -50,6 +50,7 @@ struct CompressImagesSheet: View {
         }
         .padding(20)
         .frame(width: 560)
+        .onDisappear { runner.cancel() }
     }
 
     // MARK: Files
@@ -71,7 +72,7 @@ struct CompressImagesSheet: View {
                 }
             }
         }
-        .frame(maxHeight: 210)
+        .frame(height: CompressFileListLayout.height(for: candidates.count))
     }
 
     // MARK: Settings
@@ -166,5 +167,10 @@ struct CompressImagesSheet: View {
             .keyboardShortcut(.defaultAction)
             .disabled(chosen.isEmpty)
         }
+    }
+
+    private func closeOrCancel() {
+        if runner.running { runner.cancel() }
+        else { onClose() }
     }
 }
