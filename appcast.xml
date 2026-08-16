@@ -3,6 +3,14 @@
     <channel>
         <title>MacNotchAI</title>
         <item>
+            <title>1.1.7</title>
+            <pubDate>Sun, 16 Aug 2026 13:56:38 -0400</pubDate>
+            <sparkle:version>10</sparkle:version>
+            <sparkle:shortVersionString>1.1.7</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/mwallbrecher/Dragaway/releases/download/v1.1.7/Dragaway-1.1.7.dmg" length="5470333" type="application/octet-stream" sparkle:edSignature="noiYGlrabZh3bcyRWYguoiniZ2p1uTDN2eCjh78Z9WnYQeHmaVzh1mRyOMkcxYtOvPcgylwH8Fk03r3FI+phDw=="/>
+        </item>
+        <item>
             <title>1.1.6</title>
             <pubDate>Wed, 12 Aug 2026 11:07:08 -0400</pubDate>
             <sparkle:version>9</sparkle:version>
@@ -17,14 +25,6 @@
             <sparkle:shortVersionString>1.1.5</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <enclosure url="https://github.com/mwallbrecher/Dragaway/releases/download/v1.1.5/Dragaway-1.1.5.dmg" length="4550142" type="application/octet-stream" sparkle:edSignature="6OrdEco7+/NuVveHWfAHycTLDAmA8IFdU/lHKU56tK7KSoqicm+HBlVVeyTR/TfvQP9VZOYnBbl1RhbOmlcqCA=="/>
-        </item>
-        <item>
-            <title>1.1.4</title>
-            <pubDate>Mon, 20 Jul 2026 01:16:48 +0100</pubDate>
-            <sparkle:version>7</sparkle:version>
-            <sparkle:shortVersionString>1.1.4</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <enclosure url="https://github.com/mwallbrecher/Dragaway/releases/download/v1.1.4/Dragaway-1.1.4.dmg" length="4077660" type="application/octet-stream" sparkle:edSignature="RYEH0ZKU60C3rPGn9pe4kIR9NQKTjWuEEAxZDWbvJPmnAmmr84USuiGDToAWEJxO9wVo7/aYn3QMVyHQX2i8AA=="/>
         </item>
     </channel>
 </rss>
