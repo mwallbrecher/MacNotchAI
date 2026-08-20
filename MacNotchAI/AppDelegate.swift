@@ -81,6 +81,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             return
         }
 #endif
+        // Dragaway's surfaces are drawn dark-first: the Liquid Glass panels tint with
+        // black gradients over `.hudWindow`, and the content on top of them is white
+        // throughout. Following the system into Light Aqua therefore does not produce a
+        // light theme, it produces white text on bright glass. Pinning the appearance
+        // is the honest expression of that design — a preference here would only offer
+        // a mode the views cannot render legibly.
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+
         // Run the one-time hard-coded-model migration before onboarding can flip its
         // completion flag. That lets fresh installs use a current starting model while
         // existing installations keep their exact previous route.
