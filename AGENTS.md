@@ -64,13 +64,15 @@ open MacNotchAI.xcodeproj
 - **No test target exists.** There is nothing to run for unit/UI tests; "verification" means building
   and exercising the app manually (drag a file, drop, run an action).
 - The app is **non-sandboxed** (`ENABLE_APP_SANDBOX = NO`) so its global `NSEvent` *mouse*
-  monitors work. All core behavior remains permission-free: drag detection, hotkeys, and the radial
-  launcher use ungated APIs, and Esc dismissal rides the window responder chain
-  (`OverlayWindow.cancelOperation`). The sole Accessibility exception is **Enhanced Access**, an
-  explicit default-off setting that synthesizes one ⌘V after a Clipboard History selection; without
-  it the picker restores the previous app and waits for the user's own ⌘V. Do **not** use that grant
-  for global keyboard monitors, AX-tree access, or another feature without an explicit decision — see
-  `tasks/lessons.md`.
+  monitors work. Main/product core behavior remains permission-free: drag detection, hotkeys, and the
+  radial launcher use ungated APIs, and Esc dismissal rides the window responder chain
+  (`OverlayWindow.cancelOperation`). Main's sole Accessibility exception is **Enhanced Access**, an
+  explicit default-off setting that synthesizes one ⌘V after a Clipboard History selection. The
+  manually distributed **Thesis build has a separate, required and explicitly disclosed AX context
+  sensor** for focused role, selection, document language and coarse reading progress; it must never
+  be used as justification for changing Main. Do not conflate that research permission with Enhanced
+  Access or use either grant for global keyboard monitors without another explicit decision — see
+  `tasks/lessons.md` and `docs/thesis/ARCHITECTURE.md`.
 - `MACOSX_DEPLOYMENT_TARGET = 14.0`, Swift 5, hardened runtime on. The mic entitlement
   (`com.apple.security.device.audio-input`) in `MacNotchAI.entitlements` is mandatory for dictation.
 - Editing `project.pbxproj` programmatically: it is **tab-indented**. String edits with spaces will

@@ -9,7 +9,19 @@ struct MacNotchAIApp: App {
         // MenuBarExtra) so a left-click can RESTORE a minimized session instead of
         // always opening the menu. See AppDelegate.setupStatusItem().
         Settings {
+#if THESIS_STUDY_BUILD
+            // SwiftUI constructs the Settings scene before AppDelegate receives
+            // applicationDidFinishLaunching. Keep the built-artefact verification
+            // seam genuinely headless: SettingsView owns provider/keychain singletons
+            // that may block or prompt before the argument guard can terminate.
+            if ProcessInfo.processInfo.arguments.contains("--intent-golden-checks") {
+                EmptyView()
+            } else {
+                SettingsView()
+            }
+#else
             SettingsView()
+#endif
         }
     }
 }

@@ -22,6 +22,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Public releases are a Main-only operation. The thesis artefact is distributed
+# manually and must never be uploaded or written into the public Sparkle appcast.
+# Keep this guard before build/ is removed or any signing/notarisation begins.
+CURRENT_BRANCH="$(git branch --show-current)"
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+  echo "✗ public release blocked: current branch is '$CURRENT_BRANCH', not 'main'." >&2
+  echo "  Study DMGs must be built manually and must never update appcast.xml." >&2
+  exit 1
+fi
+if /usr/libexec/PlistBuddy -c 'Print :DragawayStudyBuild' \
+    "$REPO_ROOT/MacNotchAI/Info.plist" 2>/dev/null | grep -qx 'true'; then
+  echo "✗ public release blocked: this source tree is marked as a thesis study build." >&2
+  exit 1
+fi
+
 PROJECT="MacNotchAI.xcodeproj"
 SCHEME="MacNotchAI"
 APP_NAME="MacNotchAI"

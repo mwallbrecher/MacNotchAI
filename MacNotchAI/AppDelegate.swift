@@ -9,6 +9,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     private var hotkeyPickerWindow: NSWindow?
     private var sessionSearchWindow: NSWindow?
     private var feedbackWindow: NSWindow?
+    /// THESIS: the consent sheet shown once, at the onboarding meeting.
+    private var studyConsentWindow: NSWindow?
+    /// Participant-owned recent-trace deletion control (study build only).
+    private var studyTraceEraseWindow: NSWindow?
+    /// Typed confirmation for ending the active study (study build only).
+    private var studyWithdrawalWindow: NSWindow?
     private var exposeWindow: NSWindow?
     private var joinWindow: NSWindow?
     private var tutorialWindow: NSWindow?
@@ -65,17 +71,64 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+#if THESIS_STUDY_BUILD
+        // Headless verification seam for the exact built artefact. This exits before
+        // monitors, windows, updater, study state, or normal app services are touched.
+        if ProcessInfo.processInfo.arguments.contains("--intent-golden-checks") {
+            let report = IntentGoldenChecks.report()
+            FileHandle.standardOutput.write(Data((report + "\n").utf8))
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+            return
+        }
+#endif
+        // Dragaway's surfaces are drawn dark-first: the Liquid Glass panels tint with
+        // black gradients over `.hudWindow`, and the content on top of them is white
+        // throughout. Following the system into Light Aqua therefore does not produce a
+        // light theme, it produces white text on bright glass. Pinning the appearance
+        // is the honest expression of that design — a preference here would only offer
+        // a mode the views cannot render legibly.
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+
         // Run the one-time hard-coded-model migration before onboarding can flip its
         // completion flag. That lets fresh installs use a current starting model while
         // existing installations keep their exact previous route.
         _ = AIModelCatalogStore.shared
 
-        // Core Dragaway behavior requests no permissions. Drag detection, hotkeys,
-        // the radial launcher, and Esc all use ungated APIs. The sole exception is
-        // the default-off Enhanced Access setting: after explicit user intent it can
-        // request event-posting access for Clipboard History paste-on-pick. Never
-        // make any core path depend on that optional permission.
+        // Core product behavior remains permission-free. The default-off Enhanced
+        // Access feature is still only for Clipboard History paste-on-pick. Separately,
+        // a THESIS study deployment requires the explicitly disclosed Accessibility
+        // context sensor before its researcher-led recording can start.
         DragMonitor.shared.startMonitoring()
+
+        // Finish a crash-interrupted participant erasure before opening either live
+        // writer. A pending request is a privacy write-ahead journal, not an optional
+        // cleanup; capture/export remain stopped until it succeeds.
+        var studyRedactionStartupIssue: String?
+#if THESIS_STUDY_BUILD
+        do { try StudyTraceRedactor.resumePendingIfNeeded() }
+        catch { studyRedactionStartupIssue = error.localizedDescription }
+#endif
+
+        // THESIS (Computational Intent Pipeline): passive signal capture — inert
+        // unless the research flag is set (Debug menu → Intent Engine, or
+        // `defaults write com.wallbrecher.dragaway intentEngineEnabled -bool YES`).
+        // M1 uses zero permissions. See docs/thesis/ARCHITECTURE.md.
+        let intentEngine = IntentEngine.shared
+        intentEngine.affordances.configureSessionOpener { [weak self] urls in
+            self?.openSessionWithFiles(urls)
+        }
+        var studyAXStartupIssue: String?
+#if THESIS_STUDY_BUILD
+        if StudyMode.isActive, !intentEngine.isPaused,
+           (!intentEngine.axSensorEnabled || !AXIsProcessTrusted()) {
+            // Fail closed on relaunch: do not open a new trace or arm the
+            // permission-free sensors before the required AX context coverage exists.
+            studyAXStartupIssue = "Accessibility context is not ready; recording was not started"
+        }
+#endif
+        if studyRedactionStartupIssue == nil, studyAXStartupIssue == nil {
+            intentEngine.startIfEnabled()
+        }
         observeDragState()
         observeDragOutState()
         observeStageChanges()
@@ -84,6 +137,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         observeUserDragOffset()
         prewarmSwiftUI()
         setupStatusItem()
+#if THESIS_STUDY_BUILD
+        // Startup failures must be participant-visible without requiring them to
+        // inspect Console or happen to open the status menu.
+        if let issue = studyRedactionStartupIssue {
+            DispatchQueue.main.async { [weak self] in
+                self?.showStudyCaptureFailure("recent-trace erasure: \(issue)")
+            }
+        } else if let issue = studyAXStartupIssue {
+            DispatchQueue.main.async { [weak self] in self?.showStudyCaptureFailure(issue) }
+        } else if StudyMode.isActive, let issue = studyCaptureIssue(IntentEngine.shared) {
+            DispatchQueue.main.async { [weak self] in self?.showStudyCaptureFailure(issue) }
+        }
+#endif
 
         // Create the overlay window ONCE and keep it parked (invisible, inside the
         // notch housing). Drag sources snapshot eligible destinations when their drag
@@ -93,8 +159,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // Auto-update (Sparkle). Instantiating starts the scheduled background check.
         _ = UpdaterController.shared
 
-        // Clipboard history: poll the pasteboard + arm the ⌃⌘V picker hotkey (both gated
-        // on the "Track Clipboard" toggle, default on).
+        // Clipboard History runs in the study build exactly as it does in the product,
+        // on the participant's own preference. It is a product feature, not a study
+        // instrument: the intent pipeline never reads this store (ClipboardSensor
+        // observes the pasteboard independently), the two live in different Application
+        // Support directories, the exporter only takes .jsonl from IntentTraces, and
+        // `verifyStaging` fails an export whose staged set differs from the manifest.
+        //
+        // Forcing it off was the larger risk: `isEnabled` defaults to true, so every
+        // participant would have run a configuration the product never ships — and one
+        // that changes copy behaviour, which is the behaviour under study.
         if ClipboardHistoryStore.isEnabled {
             ClipboardHistoryStore.shared.startMonitoring()
             registerClipboardHotkey()
@@ -169,6 +243,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             self, selector: #selector(handleShowAIProvider),
             name: .showAIProvider, object: nil
         )
+#if THESIS_STUDY_BUILD
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(handleStudyCaptureFailed(_:)),
+            name: .intentStudyCaptureFailed, object: nil
+        )
+#endif
 
         // Finder "Add to Dragaway" Quick Action → opens Stage 2 with the selected files.
         NotificationCenter.default.addObserver(
@@ -215,6 +295,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // THESIS: invalidate event sources before flushing/closing the two JSONL
+        // streams. This also generation-cancels any AX request still in flight.
+        IntentEngine.shared.prepareForTermination()
+        // Unconditional: enhanced-accessibility flags may have been raised before the
+        // engine stopped, and no observed application may outlive Dragaway in a mode
+        // Dragaway put it into.
+        DocumentReader.releaseEnhancedAccessibility()
+    }
+
+#if THESIS_STUDY_BUILD
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // A fresh install normally returns here after Accessibility approval. Defer
+        // one turn so IntentEngine's own observer can attach SelectionSensor first.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.showPendingStudySummonHintIfReady()
+        }
+    }
+#endif
+
     @objc private func handleShowOnboarding()    { showOnboarding()    }
     @objc private func handleHideOverlay()       { hideOverlay()       }
     @objc private func handleMinimizeOverlay()   { minimizeOverlay()   }
@@ -256,10 +356,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// Open Stage 2 (chips) for files handed over by the Finder Quick Action. Mirrors
     /// restoreMinimizedSession()'s window bring-up: cancel any pending dismiss, reuse or
     /// build the overlay window, populate the session, size/place, and bring forward.
+    @discardableResult
     @MainActor
-    func openSessionWithFiles(_ urls: [URL]) {
+    func openSessionWithFiles(_ urls: [URL]) -> UUID? {
         let supported = urls.filter { !FileInspector.isUnsupportedFileType($0) }
-        guard !supported.isEmpty else { return }
+        guard !supported.isEmpty else { return nil }
 
         // Cancel any pending dismiss so a fading window isn't torn down under us.
         dismissToken       = UUID()
@@ -269,6 +370,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         // dismissal. Revive the shared view model explicitly so an early handoff
         // cannot inherit `isCollapsing == true` and open an invisible chips card.
         let vm = OverlayViewModel.shared
+        let priorRevision = vm.sessionRevision
         vm.isCollapsing = false
 
         if overlayWindow == nil {
@@ -294,6 +396,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         overlayWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         startDismissMonitors()
+        guard vm.sessionRevision != priorRevision,
+              !vm.sessionFileURLs.isEmpty else { return nil }
+        return vm.sessionRevision
     }
 
     /// Called by macOS whenever the user switches Mission Control spaces.
@@ -421,7 +526,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
 
         // ── Clipboard history (last 20; ⌃⌘V opens the 10-item picker) ───────────
         let clipItem = NSMenuItem(title: "Clipboard History", action: nil, keyEquivalent: "")
+#if THESIS_STUDY_BUILD
+        clipItem.title = "Clipboard History (off in Study Build)"
+        clipItem.isEnabled = false
+#else
         clipItem.submenu = buildClipboardSubmenu()
+#endif
         menu.addItem(clipItem)
 
         menu.addItem(.separator())
@@ -455,8 +565,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             : "Add Hotkey…"
         addItem(to: menu, title: hotkeyTitle, action: #selector(menuHotkey))
 
+#if !THESIS_STUDY_BUILD
         let updateItem = addItem(to: menu, title: "Check for Updates…", action: #selector(menuCheckUpdates))
         updateItem.isEnabled = UpdaterController.shared.canCheckForUpdates
+#endif
 
         // ── Session sharing ────────────────────────────────────────────────────
         // Active sender-owned shares remain manageable even if the user changes (or temporarily
@@ -485,6 +597,100 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
 
         addItem(to: menu, title: "Help & Tutorial…", action: #selector(menuHelp))
         addItem(to: menu, title: "Send Feedback…", action: #selector(menuFeedback))
+
+#if THESIS_STUDY_BUILD
+        // ── THESIS: Intent Engine controls (manual study artefact only) ──────────
+        // Menu open is also a reconcile moment: for a menu-bar app it's the likeliest
+        // "user came back from System Settings after granting AX" trigger.
+        IntentEngine.shared.reconcileSensors()
+        // Same moment, same reason: a study whose recorder stopped while the engine
+        // kept running is mute but still armed. The capture gate refuses affordances
+        // until this succeeds, so recovering here is what ends the silence.
+        IntentEngine.shared.reconcileStudyRecorder()
+        menu.addItem(.separator())
+        let intentItem = NSMenuItem(title: "Intent Engine (Thesis)", action: nil, keyEquivalent: "")
+        let intentSub = NSMenu()
+        let engineRunning = IntentEngine.shared.isRunning
+
+        if !StudyBuild.isSafeForStudyDistribution || !UpdaterController.shared.isPermanentlyDisabled {
+            addInfoItem(to: intentSub, title: "⛔︎ UNSAFE BUILD · updater invariant failed")
+        }
+
+        // ── Study mode ───────────────────────────────────────────────────────────
+        // A visible, honest status line. On a 13-day unattended deployment BOTH sides
+        // need to be able to tell at a glance that capture is actually alive: a
+        // participant who reboots on day 3 and silently stops recording costs the
+        // study eleven days, discovered at the exit session.
+        if StudyMode.isActive {
+            let day = StudyMode.dayIndex.map { "day \($0)" } ?? "running"
+            let engine = IntentEngine.shared
+            let events = engine.recorder.eventCount
+            let paused = engine.isPaused
+            let issue = studyCaptureIssue(engine)
+            addInfoItem(to: intentSub,
+                        title: paused && issue == nil
+                            ? "Ⅱ Paused · \(StudyMode.participantID ?? "?") · \(day)"
+                            : (issue == nil
+                                ? "● Recording · \(StudyMode.participantID ?? "?") · \(day) · \(events) events"
+                                : "⛔︎ INCOMPLETE RECORDING · \(StudyMode.participantID ?? "?")"))
+            let axTrusted = AXIsProcessTrusted()
+            let axReady = axTrusted && engine.axSensorEnabled
+            addInfoItem(to: intentSub,
+                        title: axReady
+                            ? "✓ Accessibility · Granted"
+                            : (axTrusted
+                                ? "⚠︎ Accessibility · Granted, sensor disabled"
+                                : "⚠︎ Accessibility · Required"))
+            if !axReady {
+                addItem(to: intentSub,
+                        title: axTrusted ? "Enable Context Sensor" : "Grant Accessibility…",
+                        action: #selector(menuStudyFixAccessibility))
+            }
+            if let issue {
+                addInfoItem(to: intentSub, title: "⚠︎ \(issue)")
+                addItem(to: intentSub, title: "Retry Study Capture",
+                        action: #selector(menuStudyRetryCapture))
+            }
+            if StudyLaunchManager.state != .enabled {
+                addInfoItem(to: intentSub, title: "⚠︎ \(StudyLaunchManager.state.label)")
+                addItem(to: intentSub, title: "Fix Launch at Login…",
+                        action: #selector(menuStudyFixLoginLaunch))
+            }
+            let pauseItem = addItem(to: intentSub,
+                                    title: paused ? "Resume Recording" : "Pause Recording",
+                                    action: #selector(menuStudyTogglePause))
+            pauseItem.state = paused ? .on : .off
+            addItem(to: intentSub, title: "Erase Recent Traces…",
+                    action: #selector(menuStudyEraseRecentTraces))
+            addItem(to: intentSub, title: "Show Summon Hint", action: #selector(menuStudyShowHint))
+            addItem(to: intentSub, title: "Export Study Data…", action: #selector(menuStudyExport))
+            // Next to the export on purpose: when an export is refused it names a file,
+            // and the folder holding it has to be one click away rather than a path to
+            // be typed out.
+            addItem(to: intentSub, title: "Open Traces Folder",
+                    action: #selector(menuIntentOpenTraces))
+            addItem(to: intentSub, title: "Stop Taking Part…", action: #selector(menuStudyWithdraw))
+        } else {
+            if StudyMode.participantID != nil {
+                addItem(to: intentSub, title: "Export Existing Study Data…",
+                        action: #selector(menuStudyExport))
+                addItem(to: intentSub, title: "Open Traces Folder",
+                        action: #selector(menuIntentOpenTraces))
+                addItem(to: intentSub, title: "Erase Recent Traces…",
+                        action: #selector(menuStudyEraseRecentTraces))
+                intentSub.addItem(.separator())
+            }
+
+            // Operator-only mutators stay unavailable throughout an active deployment:
+            // stopping only one layer creates an unmarked, unrecoverable data gap and
+            // the persisted Engine switch would otherwise survive the next reboot.
+            let debugging = NSMenuItem(title: "Debugging", action: nil, keyEquivalent: "")
+            debugging.submenu = buildIntentDebuggingMenu(engineRunning: engineRunning)
+            intentSub.addItem(debugging)
+        }
+        intentItem.submenu = intentSub
+        menu.addItem(intentItem)
+#endif
 
         menu.addItem(.separator())
 
@@ -1108,6 +1314,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
 
     /// Flip clipboard capture on/off — keeps the poll timer and the ⌃⌘V hotkey in lockstep.
     @objc private func menuToggleClipboard() {
+#if THESIS_STUDY_BUILD
+        return
+#else
         let enabled = !ClipboardHistoryStore.isEnabled
         ClipboardHistoryStore.isEnabled = enabled
         if enabled {
@@ -1117,6 +1326,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             ClipboardHistoryStore.shared.stopMonitoring()
             unregisterClipboardHotkey()
         }
+#endif
     }
 
     /// Detach the menu once it closes so the next plain left-click reaches
@@ -1483,7 +1693,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// ⌃⌘N: open a session from whatever the clipboard holds — copied files directly,
     /// anything else (text / link / image) through the same materializer the
     /// drag-anything pipeline uses. Beeps when the clipboard has nothing usable.
-    private func openSessionFromClipboard() {
+    // Internal (not private) so session-opening callers receive the exact revision.
+    // The THESIS accept path verifies and materialises its fingerprinted text itself,
+    // then uses the explicitly configured `openSessionWithFiles` handoff.
+    @discardableResult
+    func openSessionFromClipboard() -> UUID? {
         let pb = NSPasteboard.general
         var urls = (pb.readObjects(forClasses: [NSURL.self],
                                    options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
@@ -1492,9 +1706,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
            let materialized = DropMaterializer.materialize(payload) {
             urls = [materialized]
         }
-        guard !urls.isEmpty else { NSSound.beep(); return }
+        guard !urls.isEmpty else { NSSound.beep(); return nil }
         NotificationCenter.default.post(name: .tutorialEvent, object: "clipboard")
-        openSessionWithFiles(urls)
+        return openSessionWithFiles(urls)
     }
 
     @objc private func menuCaptureSettings() { showSettings(section: .capture) }
@@ -1528,11 +1742,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     }
 
     private func registerClipboardHotkey() {
+#if THESIS_STUDY_BUILD
+        return
+#else
         clipboardHotkey.register(keyCode: UInt32(kVK_ANSI_V),
                                  modifiers: UInt32(cmdKey | controlKey)) {
             NotificationCenter.default.post(name: .tutorialEvent, object: "clipboard")
             ClipboardPicker.shared.toggle()
         }
+#endif
     }
 
     private func unregisterClipboardHotkey() { clipboardHotkey.unregister() }
@@ -2191,6 +2409,662 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         NSApp.activate(ignoringOtherApps: true)
     }
 
+#if THESIS_STUDY_BUILD
+    // MARK: - THESIS: Intent Engine study controls (docs/thesis/ARCHITECTURE.md)
+
+    @objc private func menuIntentToggle() {
+        IntentEngine.shared.isEnabled.toggle()   // setter starts/stops the live engine
+    }
+
+    @objc private func menuIntentReadOnly() {
+        IntentEngine.shared.isReadOnly.toggle()  // attaches/detaches affordances live
+    }
+
+    @objc private func menuIntentRecord() {
+        let engine = IntentEngine.shared
+        if engine.recorder.isRecording {
+            engine.recorder.stop()
+        } else {
+            if !engine.isRunning { engine.isEnabled = true }
+            engine.recorder.start(bus: engine.bus)
+        }
+    }
+
+    @objc private func menuIntentReplay() {
+        let panel = NSOpenPanel()
+        panel.directoryURL = TraceRecorder.tracesDirectory()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // Quiesce the live pipeline first — live and replayed timelines must not mix.
+        let wasRunning = IntentEngine.shared.isRunning
+        IntentEngine.shared.stop()
+        IntentEngine.shared.resetPipeline()   // clean slate: score the trace alone
+        defer { if wasRunning { IntentEngine.shared.start() } }
+
+        let alert = NSAlert()
+        do {
+            let summary = try TraceReplayer.replay(url, into: IntentEngine.shared.bus)
+            alert.messageText = "Trace replayed"
+            // Golden-trace check in one glance: what would the scorer say at the
+            // end of this recorded session? (Scored at EVENT time, not wall clock.)
+            let scores = summary.lastEventTime.map {
+                "\n\nScores at trace end:\n" + IntentEngine.shared.scoresDescription(at: $0)
+            } ?? ""
+            alert.informativeText = summary.description + scores
+        } catch {
+            alert.messageText = "Replay failed"
+            alert.informativeText = error.localizedDescription
+        }
+        alert.runModal()
+    }
+
+    @objc private func menuIntentOpenTraces() {
+        NSWorkspace.shared.open(TraceRecorder.tracesDirectory())
+    }
+
+    @objc private func menuIntentScores() {
+        let alert = NSAlert()
+        alert.messageText = "Intent scores (live)"
+        // The language source is shown here on purpose: before a study session the
+        // operator must be able to see whose languages "foreign" is judged against.
+        alert.informativeText = IntentEngine.shared.scoresDescription()
+            + "\n\n— foreign-language reference —\n"
+            + IntentEngine.shared.languageSourceDescription
+        alert.runModal()
+    }
+
+    @objc private func menuIntentAXSensor() {
+        let engine = IntentEngine.shared
+        if engine.axSensorEnabled, !AXIsProcessTrusted() {
+            engine.requestAXPermission()      // enabled but not yet granted → (re)ask
+        } else if engine.axSensorEnabled {
+            engine.axSensorEnabled = false    // granted + on → turn off
+        } else {
+            engine.axSensorEnabled = true     // off → on (and ask if needed)
+            if !AXIsProcessTrusted() { engine.requestAXPermission() }
+        }
+    }
+
+    @objc private func menuIntentTicker() {
+        IntentEngine.shared.affordances.toggleTicker()
+    }
+
+    /// Researcher/developer controls are deliberately one level below the
+    /// participant surface. This submenu is created only while no study is active;
+    /// nesting must never weaken the active-deployment mutation guard.
+    private func buildIntentDebuggingMenu(engineRunning: Bool) -> NSMenu {
+        let menu = NSMenu()
+
+        addItem(to: menu, title: "Study Setup…", action: #selector(menuStudySetup))
+        menu.addItem(.separator())
+
+        let toggle = addItem(to: menu,
+                             title: engineRunning ? "Stop Signal Capture" : "Start Signal Capture",
+                             action: #selector(menuIntentToggle))
+        toggle.state = engineRunning ? .on : .off
+        let readOnly = addItem(to: menu, title: "Read-Only Capture (no affordances)",
+                               action: #selector(menuIntentReadOnly))
+        readOnly.state = IntentEngine.shared.isReadOnly ? .on : .off
+        let recording = IntentEngine.shared.recorder.isRecording
+        let record = addItem(to: menu,
+                             title: recording
+                                ? "Stop Recording (\(IntentEngine.shared.recorder.eventCount) events)"
+                                : "Record Trace",
+                             action: #selector(menuIntentRecord))
+        record.state = recording ? .on : .off
+        addItem(to: menu, title: "Replay Trace…", action: #selector(menuIntentReplay))
+        addItem(to: menu, title: "Open Traces Folder", action: #selector(menuIntentOpenTraces))
+        menu.addItem(.separator())
+
+        addItem(to: menu, title: "Show Intent Scores", action: #selector(menuIntentScores))
+        addItem(to: menu, title: "Summon Intent Ticker (⌃⌥⌘I)",
+                action: #selector(menuIntentTicker))
+        let axOn = IntentEngine.shared.axSensorEnabled
+        let axTrusted = AXIsProcessTrusted()
+        let ax = addItem(to: menu,
+                         title: axOn && !axTrusted
+                            ? "Context Sensor (grant Accessibility…)"
+                            : "Context Sensor (Accessibility)",
+                         action: #selector(menuIntentAXSensor))
+        ax.state = (axOn && axTrusted) ? .on : .off
+        menu.addItem(.separator())
+
+        let langItem = NSMenuItem(title: "Participant Languages…", action: nil,
+                                  keyEquivalent: "")
+        langItem.submenu = buildParticipantLanguagesMenu()
+        menu.addItem(langItem)
+        menu.addItem(.separator())
+
+        addItem(to: menu, title: "Run Golden Checks",
+                action: #selector(menuIntentGoldenChecks))
+        addItem(to: menu, title: "Probe Document Reader (2 s delay)",
+                action: #selector(menuIntentProbeDocument))
+        addItem(to: menu, title: "Show AX Probe Results",
+                action: #selector(menuIntentShowProbeResults))
+        addItem(to: menu, title: "Open Intent Config",
+                action: #selector(menuIntentOpenConfig))
+        addItem(to: menu, title: "Reload Intent Config",
+                action: #selector(menuIntentReloadConfig))
+        return menu
+    }
+
+    /// THESIS: the participant's language repertoire — what `foreign_language_clip` is
+    /// judged against. Sessions run on the RESEARCHER's Mac, so the machine locale is
+    /// always the wrong answer; this menu is the per-participant setup step.
+    private func buildParticipantLanguagesMenu() -> NSMenu {
+        let menu = NSMenu()
+        let engine = IntentEngine.shared
+
+        addInfoItem(to: menu, title: engine.languageSourceDescription)
+        if let warning = engine.languageConfigWarning { addInfoItem(to: menu, title: warning) }
+        menu.addItem(.separator())
+
+        for lang in IntentEngine.commonLanguages {
+            let item = addItem(to: menu, title: "\(lang.name) (\(lang.code))",
+                               action: #selector(menuIntentToggleLanguage(_:)),
+                               represented: lang.code)
+            item.state = engine.isLanguageSelected(lang.code) ? .on : .off
+        }
+
+        // "Indian" is not a detectable language — the recognizer distinguishes these
+        // individually, so the operator picks the specific one(s) the participant reads.
+        let indian = NSMenuItem(title: "Indian languages…", action: nil, keyEquivalent: "")
+        let indianSub = NSMenu()
+        for lang in IntentEngine.indianLanguages {
+            let item = addItem(to: indianSub, title: "\(lang.name) (\(lang.code))",
+                               action: #selector(menuIntentToggleLanguage(_:)),
+                               represented: lang.code)
+            item.state = engine.isLanguageSelected(lang.code) ? .on : .off
+        }
+        indian.submenu = indianSub
+        menu.addItem(indian)
+
+        menu.addItem(.separator())
+        let englishOnly = addItem(to: menu, title: "None — native English only",
+                                  action: #selector(menuIntentLanguagesEnglishOnly))
+        englishOnly.state = (engine.hasExplicitLanguages
+                             && IntentText.userLanguages == ["en"]) ? .on : .off
+        let locale = addItem(to: menu, title: "Use this Mac's locale (⚠︎ not for sessions)",
+                             action: #selector(menuIntentLanguagesUseLocale))
+        locale.state = engine.hasExplicitLanguages ? .off : .on
+        return menu
+    }
+
+    @objc private func menuIntentToggleLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String else { return }
+        IntentEngine.shared.toggleLanguage(code)
+    }
+
+    @objc private func menuIntentLanguagesEnglishOnly() {
+        IntentEngine.shared.setUserLanguages(["en"])
+    }
+
+    @objc private func menuIntentLanguagesUseLocale() {
+        IntentEngine.shared.clearUserLanguages()
+    }
+
+    @objc private func menuIntentGoldenChecks() {
+        let alert = NSAlert()
+        alert.messageText = "Intent golden checks"
+        alert.informativeText = IntentGoldenChecks.report()
+        alert.runModal()
+    }
+
+    /// THESIS — AX coverage spot check for the quiet-reader path.
+    ///
+    /// Whether `DocumentReader` can see anything is an EMPIRICAL question per
+    /// application, not something the code can promise: native text views and Chromium
+    /// generally expose their content, some Electron apps do not, and secure fields
+    /// never do. The quiet reader only gets served in apps that cooperate, so the
+    /// coverage has to be measured before the deployment and reported as a limitation.
+    ///
+    /// Deliberately delayed: the check runs against whatever is frontmost, so it must
+    /// fire AFTER this menu closes and the target app is focused.
+    ///
+    /// The result is APPENDED TO A FILE, never shown in a modal. `NSAlert.runModal()`
+    /// fired while this app is in the background puts the process into a modal run
+    /// loop the user can neither see nor dismiss — which is what made the menu look
+    /// permanently deactivated until a restart. A file also suits the actual task:
+    /// probe six applications in a row, then read the results together.
+    @objc private func menuIntentProbeDocument() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            let d = DocumentReader.diagnose()
+            DocumentReader.appendProbeResult(d)
+            // Two beeps = readable, one = not. Enough feedback to keep testing without
+            // switching away from the app under test.
+            NSSound.beep()
+            if d.charCount >= 400 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { NSSound.beep() }
+            }
+        }
+    }
+
+    @objc private func menuIntentShowProbeResults() {
+        NSWorkspace.shared.open(DocumentReader.probeLogURL())
+    }
+
+    // MARK: - THESIS: study mode (consent, status, export)
+
+    /// Opens the consent sheet. Run once at the onboarding meeting, with the
+    /// researcher present — never triggered silently.
+    @objc private func menuStudySetup() {
+        if studyConsentWindow == nil {
+            // Keep the disclosure window outside every recording boundary. An
+            // operator may have left the non-study debug engine running; quiesce it
+            // before an Accessibility round-trip can attach the context sensor.
+            if !StudyMode.isActive {
+                // Clear the persisted debug toggle too: leaving `isEnabled == true`
+                // after stop would silently restart capture on relaunch and make the
+                // menu's next toggle move in the wrong direction after Cancel.
+                IntentEngine.shared.isEnabled = false
+                IntentEngine.shared.resetPipeline()
+            }
+            let currentLanguages = IntentEngine.shared.hasExplicitLanguages
+                ? Array(IntentText.userLanguages) : ["en"]
+            let hosting = NSHostingController(rootView: StudyConsentView(
+                initialLanguages: currentLanguages,
+                onAccept: { [weak self] id, languages in
+                    // This is the authoritative setup boundary. The SwiftUI button is
+                    // also disabled, but trust is checked again in case macOS revoked
+                    // it between the last readiness refresh and this callback.
+                    guard AXIsProcessTrusted() else {
+                        self?.requestStudyAccessibility()
+                        return
+                    }
+                    let engine = IntentEngine.shared
+                    // Setup may be opened after an operator used the non-study debug
+                    // controls. Stop and wipe inference state BEFORE recording consent
+                    // so the participant always starts with fresh, correctly stamped
+                    // trace/log sessions and no pre-study evidence.
+                    engine.stop()
+                    engine.resetPipeline()
+                    guard engine.affordances.preflightSummonHotkey() else {
+                        self?.showStudyCaptureFailure(
+                            "summon hotkey could not be registered; another app may own ⌃⌥⌘I")
+                        return
+                    }
+                    do {
+                        // A debug/pilot run may have written perfectly valid but
+                        // study=false JSONL. Archive it locally before consent so the
+                        // participant export contains exactly one provenance cohort.
+                        try TraceRecorder.prepareForNewStudy()
+                    } catch {
+                        self?.showStudyCaptureFailure(error.localizedDescription)
+                        return
+                    }
+                    engine.configureNewStudy(userLanguages: languages)
+                    do {
+                        try StudyMode.acceptConsent(participantID: id,
+                                                    configuration: engine.scorer.config)
+                    } catch {
+                        self?.showStudyCaptureFailure(error.localizedDescription)
+                        return
+                    }
+                    // Arm the instrument in the state the study needs: engine running,
+                    // affordances live, recording to disk.
+                    engine.axSensorEnabled = true
+                    engine.isReadOnly = false
+                    // Clear a persisted pause while the engine is stopped so a reused
+                    // test install cannot write a spurious old-session resume marker.
+                    engine.isPaused = false
+                    engine.isEnabled = true
+                    self?.studyConsentWindow?.close()
+                    self?.studyConsentWindow = nil
+                    if let issue = self?.studyCaptureIssue(engine) {
+                        self?.showStudyCaptureFailure(issue)
+                    }
+                    self?.finishStudyLaunchSetup()
+                    // The persisted pending flag survives the expected round-trip to
+                    // Accessibility settings. Show once only after capture is healthy.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                        self?.showPendingStudySummonHintIfReady()
+                    }
+                },
+                onCancel: { [weak self] in
+                    self?.studyConsentWindow?.close()
+                    self?.studyConsentWindow = nil
+                },
+                onRequestAccessibility: { [weak self] in
+                    self?.requestStudyAccessibility()
+                },
+                onFixLoginLaunch: { [weak self] in
+                    self?.finishStudyLaunchSetup()
+                }))
+            let win = NSWindow(contentViewController: hosting)
+            win.title = "Research participation"
+            win.styleMask = [.titled, .closable]
+            // Above the notch overlay (OverlayWindow is .floating).
+            win.level = .floating + 1
+            win.isReleasedWhenClosed = false
+            win.center()
+            studyConsentWindow = win
+        }
+        studyConsentWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Registers login launch while the researcher is still present. macOS may require
+    /// one explicit approval in System Settings; surface that immediately because a
+    /// study must never claim reboot survival while the service is merely registered.
+    private func finishStudyLaunchSetup() {
+        do {
+            let state = try StudyLaunchManager.ensureRegistered()
+            guard state != .enabled else { return }
+            let alert = NSAlert()
+            alert.messageText = "Enable Dragaway at login"
+            alert.informativeText = "The 24-hour recorder cannot resume after a restart until Dragaway is enabled under Login Items. Current status: \(state.label)."
+            alert.addButton(withTitle: "Open Login Items")
+            alert.addButton(withTitle: "Later")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn {
+                StudyLaunchManager.openApprovalSettings()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not enable launch at login"
+            alert.informativeText = error.localizedDescription
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
+
+    @objc private func menuStudyFixLoginLaunch() {
+        finishStudyLaunchSetup()
+    }
+
+    /// Study Accessibility is separate from the product's optional Enhanced Access.
+    /// The setup flow keeps the intent engine quiescent while this registers/opens the
+    /// macOS permission pane; the sensor is armed by the accepted deployment.
+    private func requestStudyAccessibility() {
+        IntentEngine.shared.requestAXPermission()
+    }
+
+    @objc private func menuStudyFixAccessibility() {
+        let engine = IntentEngine.shared
+        engine.axSensorEnabled = true
+        if AXIsProcessTrusted() {
+            engine.reconcileSensors()
+            if StudyMode.isActive, !engine.isPaused, !engine.isRunning {
+                menuStudyRetryCapture()
+            }
+        } else {
+            requestStudyAccessibility()
+        }
+    }
+
+    /// Restarts both JSONL streams as one capture unit. A partial retry is unsafe:
+    /// keeping sensors live while only one writer recovers creates another unmarked
+    /// interval in the other stream.
+    @objc private func menuStudyRetryCapture() {
+        let engine = IntentEngine.shared
+        engine.stop()
+        engine.resetPipeline()
+        do { try StudyTraceRedactor.resumePendingIfNeeded() }
+        catch {
+            showStudyCaptureFailure("recent-trace erasure: \(error.localizedDescription)")
+            return
+        }
+        if !engine.isPaused {
+            engine.axSensorEnabled = true
+            guard AXIsProcessTrusted() else {
+                requestStudyAccessibility()
+                showStudyCaptureFailure(
+                    "Accessibility context is not ready; recording remains stopped")
+                return
+            }
+        }
+        engine.isEnabled = true
+        if let issue = studyCaptureIssue(engine) {
+            showStudyCaptureFailure(issue)
+        }
+    }
+
+    @objc private func handleStudyCaptureFailed(_ note: Notification) {
+        guard StudyMode.isActive else { return }
+        let issue = note.userInfo?["issue"] as? String ?? "unknown study capture error"
+        showStudyCaptureFailure(issue)
+    }
+
+    private func studyCaptureIssue(_ engine: IntentEngine) -> String? {
+        guard engine.isRunning else {
+            return engine.recorder.lastError.map { "trace recorder: \($0)" }
+                ?? "intent engine is stopped"
+        }
+        guard engine.recorder.isRecording, engine.recorder.health == .recording else {
+            return engine.recorder.lastError.map { "trace recorder: \($0)" }
+                ?? "trace recorder is stopped"
+        }
+        if engine.affordances.logHealth.state == .failed {
+            return engine.affordances.logHealth.error.map { "affordance log: \($0)" }
+                ?? "affordance log failed"
+        }
+        if !engine.isPaused {
+            guard engine.axSensorEnabled && AXIsProcessTrusted() else {
+                return "Accessibility is unavailable; focused role, selection, document context, and reading-progress data are incomplete"
+            }
+            guard engine.hasExplicitLanguages,
+                  IntentText.userLanguages.contains("en") else {
+                return "participant languages are not explicitly configured with English"
+            }
+            guard !engine.isReadOnly else { return "affordance capture is in read-only mode" }
+            guard engine.affordances.logHealth.isHealthy else {
+                return engine.affordances.logHealth.error.map { "affordance log: \($0)" }
+                    ?? "affordance log is stopped"
+            }
+        }
+        return nil
+    }
+
+    private func showStudyCaptureFailure(_ issue: String) {
+        let alert = NSAlert()
+        alert.messageText = "Study recording is incomplete"
+        alert.informativeText = issue + "\n\nNo participant session should begin while this warning is shown. Resolve the reported permission, hotkey, login-item, or storage problem, then choose Retry Study Capture."
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    /// Creates the archive and reveals it in Finder. Deliberately manual and
+    /// deliberately visible: the participant sends it, or does not.
+    @objc private func menuStudyExport() {
+        do {
+            let archive = try StudyExporter.exportToDesktop()
+            NSWorkspace.shared.activateFileViewerSelecting([archive])
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not export study data"
+            alert.informativeText = error.localizedDescription
+            NSApp.activate(ignoringOtherApps: true)   // never runModal from the background
+            alert.runModal()
+        }
+    }
+
+    /// The pause the consent text promises. A privacy control, not a data control:
+    /// capture is on by default and the participant may switch it off — never the
+    /// other way round, which would let people record only what they think is
+    /// interesting and quietly exclude the quiet reader.
+    @objc private func menuStudyTogglePause() {
+        let engine = IntentEngine.shared
+        if engine.isPaused {
+            guard engine.isRunning else {
+                showStudyCaptureFailure("intent engine is stopped; choose Retry Study Capture first")
+                return
+            }
+            engine.axSensorEnabled = true
+            guard AXIsProcessTrusted() else {
+                requestStudyAccessibility()
+                showStudyCaptureFailure(
+                    "Accessibility context is not ready; recording remains paused")
+                return
+            }
+            engine.isPaused = false
+            if let issue = studyCaptureIssue(engine) { showStudyCaptureFailure(issue) }
+        } else {
+            engine.isPaused = true
+        }
+    }
+
+    /// Opens only the deliberately bounded relative-duration control. There is no
+    /// hidden calendar picker, content query, file matching, or provider-backed parser.
+    @objc private func menuStudyEraseRecentTraces() {
+        guard StudyMode.deploymentSnapshot != nil else {
+            showStudyCaptureFailure("no study deployment exists for trace erasure")
+            return
+        }
+        if studyTraceEraseWindow == nil {
+            let scale = UIScale.current.multiplier
+            let root = StudyTraceEraseView(
+                onErase: { [weak self] duration in
+                    self?.performStudyTraceErase(duration: duration)
+                },
+                onCancel: { [weak self] in
+                    self?.studyTraceEraseWindow?.close()
+                    self?.studyTraceEraseWindow = nil
+                })
+                .environment(\.uiScale, scale)
+            let hosting = NSHostingController(rootView: root)
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Erase recent traces"
+            window.styleMask = [.titled, .closable]
+            window.level = .floating + 1
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            studyTraceEraseWindow = window
+        }
+        studyTraceEraseWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func performStudyTraceErase(duration: TimeInterval) {
+        studyTraceEraseWindow?.close()
+        studyTraceEraseWindow = nil
+
+        let engine = IntentEngine.shared
+        let shouldRestart = StudyMode.isActive && engine.isRunning
+        let wasPaused = engine.isPaused
+        // stop() writes and synchronizes final lifecycle rows before closing both
+        // handles. They fall inside the selected suffix and are removed transactionally.
+        engine.stop()
+        engine.resetPipeline()
+
+        do {
+            let summary = try StudyTraceRedactor.eraseRecent(durationSeconds: duration)
+            if shouldRestart {
+                if !wasPaused {
+                    engine.axSensorEnabled = true
+                    guard AXIsProcessTrusted() else {
+                        requestStudyAccessibility()
+                        showStudyCaptureFailure(
+                            "Recent traces were erased, but Accessibility context is not ready; recording remains stopped")
+                        return
+                    }
+                }
+                engine.start()
+                if let issue = studyCaptureIssue(engine) {
+                    showStudyCaptureFailure(
+                        "Recent traces were erased, but capture could not restart: \(issue)")
+                    return
+                }
+            }
+            let alert = NSAlert()
+            alert.messageText = "Recent traces erased"
+            alert.informativeText = "The last \(studyDurationLabel(summary.durationSeconds)) of recorded activity will not appear in future study exports."
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not finish trace erasure"
+            alert.informativeText = error.localizedDescription
+                + "\n\nRecording and export remain stopped while the pending erasure is retried."
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
+    }
+
+    private func studyDurationLabel(_ seconds: TimeInterval) -> String {
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes) minutes" }
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        if remainder == 0 { return hours == 1 ? "1 hour" : "\(hours) hours" }
+        return "\(hours) h \(remainder) min"
+    }
+
+    /// Re-shows the hotkey card on request. Deliberately participant- or
+    /// researcher-initiated: the system never nudges by itself, because summon rate is
+    /// an outcome measure and a reminder would measure the reminder.
+    @objc private func menuStudyShowHint() {
+        IntentEngine.shared.affordances.showSummonHint()
+        if IntentEngine.shared.affordances.logHealth.isHealthy {
+            StudyMode.markSummonHintShown()
+        }
+    }
+
+    private func showPendingStudySummonHintIfReady() {
+        let engine = IntentEngine.shared
+        guard StudyMode.isActive, StudyMode.summonHintPending,
+              studyCaptureIssue(engine) == nil else { return }
+        engine.affordances.showSummonHint()
+        guard engine.affordances.logHealth.isHealthy else { return }
+        StudyMode.markSummonHintShown()
+    }
+
+    /// Opens a truthful, typed confirmation before ending participation. Withdrawal
+    /// does not delete the retained cohort; erasure remains a separate participant act.
+    @objc private func menuStudyWithdraw() {
+        if studyWithdrawalWindow == nil {
+            let scale = UIScale.current.multiplier
+            let root = StudyWithdrawalConfirmationView(
+                onConfirm: { [weak self] in self?.performStudyWithdrawal() },
+                onCancel: { [weak self] in
+                    self?.studyWithdrawalWindow?.close()
+                    self?.studyWithdrawalWindow = nil
+                })
+                .environment(\.uiScale, scale)
+            let hosting = NSHostingController(rootView: root)
+            let window = NSWindow(contentViewController: hosting)
+            window.title = "Stop taking part"
+            window.styleMask = [.titled, .closable]
+            window.level = .floating + 1
+            window.isReleasedWhenClosed = false
+            window.delegate = self
+            window.center()
+            studyWithdrawalWindow = window
+        }
+        studyWithdrawalWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func performStudyWithdrawal() {
+        studyWithdrawalWindow?.close()
+        studyWithdrawalWindow = nil
+
+        // Stop and flush while the terminal records still carry study=true; only then
+        // clear the study state. This cleanly distinguishes withdrawal from a crash.
+        IntentEngine.shared.prepareForWithdrawal()
+        IntentEngine.shared.isEnabled = false
+        StudyMode.withdraw()
+        do {
+            try StudyLaunchManager.unregister()
+        } catch {
+            let warning = NSAlert()
+            warning.messageText = "Recording stopped, but login launch remains enabled"
+            warning.informativeText = error.localizedDescription
+            warning.runModal()
+        }
+    }
+
+    @objc private func menuIntentOpenConfig() {
+        NSWorkspace.shared.open(IntentConfig.fileURL())
+    }
+
+    @objc private func menuIntentReloadConfig() {
+        IntentEngine.shared.reloadConfig()
+    }
+#endif
+
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
         if window === exposeWindow {
@@ -2198,14 +3072,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             exposeWindow = nil
         } else if window === joinWindow {
             joinWindow = nil
+        } else if window === studyTraceEraseWindow {
+            studyTraceEraseWindow = nil
+        } else if window === studyWithdrawalWindow {
+            studyWithdrawalWindow = nil
         }
     }
-
 }
 
 // MARK: - Notification names
 
 extension Notification.Name {
+    static let intentStudyCaptureFailed = Notification.Name(
+        "com.aidrop.thesis.intentStudyCaptureFailed"
+    )
     static let showOnboarding   = Notification.Name("com.aidrop.showOnboarding")
     static let hideOverlay      = Notification.Name("com.aidrop.hideOverlay")
     static let minimizeOverlay  = Notification.Name("com.aidrop.minimizeOverlay")

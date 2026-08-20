@@ -420,6 +420,20 @@ private struct ChipsColumnView: View {
         }
         .padding(18 * scale)
         .frame(width: 280 * scale, alignment: .topLeading)
+        // THESIS hook (Intent Pipeline M3): a whisper accept opens this session via
+        // the clipboard path and then asks for the resolved action to run — the same
+        // code path as tapping the chip (docs/thesis/ARCHITECTURE.md §7). BOTH the
+        // notification (live case) and .onAppear (chips subview re-insert on the
+        // stage transition) drain the SAME IntentAutoRun latch — a take for the exact
+        // current session revision clears it, so the action runs exactly once whichever
+        // path wins the race. The notification payload is only a nudge; the latch is
+        // the source of truth.
+        .onReceive(NotificationCenter.default.publisher(for: .intentAutoRunAction)) { _ in
+            consumeIntentAutoRun()
+        }
+        .onAppear {
+            consumeIntentAutoRun()
+        }
     }
 
     /// Video/audio: no hosted-AI actions apply. The chips stage shows only file
@@ -427,8 +441,22 @@ private struct ChipsColumnView: View {
     /// model is never invoked for media (zero operator token cost).
     private var isMediaSession: Bool { FileInspector.isMediaFile(fileURL) }
 
-    private func runAction(_ action: AIAction) {
-        sendTurn(provider: provider, fileURL: fileURL, action: action, typedPrompt: nil)
+    private func consumeIntentAutoRun() {
+        let revision = vm.sessionRevision
+        // A synchronous notification can still reach the old ChipsColumnView before
+        // SwiftUI has rendered the just-opened stage. Never use this view's captured
+        // URL for the handoff: the revision-bound latch authorises only the current
+        // model session, whose primary URL is read atomically here.
+        guard case .chips(let currentFileURL, _) = vm.stage,
+              let suggestion = IntentAutoRun.shared.take(expectedRevision: revision) else { return }
+        sendTurn(provider: provider, fileURL: currentFileURL,
+                 action: suggestion.action, typedPrompt: nil,
+                 studySuggestion: suggestion)
+    }
+
+    private func runAction(_ action: AIAction, studySuggestion: IntentSuggestion? = nil) {
+        sendTurn(provider: provider, fileURL: fileURL, action: action, typedPrompt: nil,
+                 studySuggestion: studySuggestion)
     }
 
     private func runCustomPrompt() { runCustomPromptText(vm.customPrompt) }
@@ -2884,10 +2912,16 @@ private func sendTurn(provider: any AIProvider,
                       action: AIAction,
                       typedPrompt: String?,
                       forceTier: AITier? = nil,
-                      regenerate: Bool = false) {
+                      regenerate: Bool = false,
+                      studySuggestion: IntentSuggestion? = nil) {
     let vm = OverlayViewModel.shared
     guard let turnID = vm.beginAITurn() else { return }
     let sessionRevision = vm.sessionRevision
+    let studyActionStartedAt = MonotonicClock.now
+    if let studySuggestion {
+        IntentEngine.shared.affordances.recordActionStarted(studySuggestion,
+                                                            at: studyActionStartedAt)
+    }
 
     // What the user's bubble shows vs. what the model receives as this turn's text.
     let display     = typedPrompt ?? action.rawValue
@@ -2937,6 +2971,14 @@ private func sendTurn(provider: any AIProvider,
     let liveProvider = resolveProvider()
 
     let turnTask = Task {
+        var studyActionTerminated = false
+        defer {
+            if let studySuggestion, !studyActionTerminated {
+                IntentEngine.shared.affordances.recordActionCancelled(
+                    studySuggestion,
+                    latency: max(0, MonotonicClock.now - studyActionStartedAt))
+            }
+        }
         do {
             // Extract the document ONCE per session; reuse for every turn.
             let base: OverlayViewModel.BaseContext
@@ -3004,16 +3046,31 @@ private func sendTurn(provider: any AIProvider,
                     primary: fileURL, additional: additionalURLs,
                     action: action, prompt: typedPrompt, result: answer)
             }
+            if let studySuggestion {
+                studyActionTerminated = true
+                IntentEngine.shared.affordances.recordActionCompleted(
+                    studySuggestion,
+                    latency: max(0, MonotonicClock.now - studyActionStartedAt))
+            }
             applyStage(
                 .result(url: fileURL, action: action, text: answer),
                 ifSession: sessionRevision,
                 turnID: turnID,
                 completesTurn: true
             )
+        } catch is CancellationError {
+            // The defer above records a content-free cancellation even if navigation,
+            // pause, or session replacement invalidated the optimistic provider turn.
         } catch {
             guard vm.isCurrentAITurn(turnID, sessionRevision: sessionRevision) else { return }
             vm.isAwaitingReply = false
             let msg = error.localizedDescription
+            if let studySuggestion {
+                studyActionTerminated = true
+                IntentEngine.shared.affordances.recordActionFailed(
+                    studySuggestion,
+                    latency: max(0, MonotonicClock.now - studyActionStartedAt))
+            }
             if priorTurns > 0 {
                 // Keep one definitive assistant result. If streaming already produced text, fold
                 // the warning into that same bubble so UI, History, reopen, and Share stay exact.

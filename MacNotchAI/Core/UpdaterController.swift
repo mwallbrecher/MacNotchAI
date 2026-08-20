@@ -1,5 +1,5 @@
 import AppKit
-#if canImport(Sparkle)
+#if canImport(Sparkle) && !THESIS_STUDY_BUILD
 import Sparkle
 #endif
 
@@ -21,11 +21,10 @@ import Sparkle
 final class UpdaterController {
     static let shared = UpdaterController()
 
-#if canImport(Sparkle)
+#if canImport(Sparkle) && !THESIS_STUDY_BUILD
     private let controller: SPUStandardUpdaterController
 
     private init() {
-        // startingUpdater: true → begins the scheduled background check immediately.
         controller = SPUStandardUpdaterController(startingUpdater: true,
                                                   updaterDelegate: nil,
                                                   userDriverDelegate: nil)
@@ -43,10 +42,16 @@ final class UpdaterController {
 
     /// Whether a manual check can run right now (drives the menu item's enabled state).
     var canCheckForUpdates: Bool { controller.updater.canCheckForUpdates }
+
+    /// Verification seam for the study status UI and the release checklist.
+    var isPermanentlyDisabled: Bool { false }
 #else
-    // Sparkle package not added yet — no-op stub keeps every call site compiling.
+    // A thesis build always compiles this stub even if a future merge reintroduces
+    // the package. There is therefore no Sparkle symbol reference, controller, feed
+    // request, or UI path in the research artefact.
     private init() {}
     func checkForUpdates() {}
     var canCheckForUpdates: Bool { false }
+    var isPermanentlyDisabled: Bool { true }
 #endif
 }

@@ -1376,6 +1376,279 @@
   responder. Keep the responder local, consume only named keys, and never add an app-wide monitor or
   Accessibility dependency for a window-local shortcut.
 
+### [STUDY-01] A research build needs compile-time distribution isolation
+
+- **What was wrong:** disabling updater checks from mutable study state still left Sparkle linked and
+  the ordinary release script capable of packaging the thesis checkout.
+- **Why:** runtime state can be unset on first launch, while linkage and release automation operate
+  before participant setup.
+- **Fix:** the thesis configurations define `THESIS_STUDY_BUILD`, compile the updater to a stub, remove
+  Sparkle from the target, mark the bundle, and make the release script require `main` and reject that
+  marker before any build/sign/notarise step.
+- **Rule:** isolate experimental distribution at compile, bundle and release-script boundaries; never
+  rely on a preference or on the promise not to publish.
+
+### [STUDY-02] Codable validation does not reject undeclared private fields
+
+- **What was wrong:** strict typed decoding appeared to validate JSONL, but `JSONDecoder` silently
+  ignored an injected `rawText`, path or other unknown key while export copied the original bytes.
+- **Why:** type safety covers decoded fields, not the complete serialized object.
+- **Fix:** validate semantics, then canonical-decode/re-encode every exported row and stage only those
+  canonical bytes.
+- **Rule:** at a privacy export boundary, either reject exact key-set deviations recursively or export
+  a typed canonical encoding; never validate one byte stream and ship another.
+
+### [STUDY-03] Audit a recovery before mutating the damaged evidence
+
+- **What was wrong:** crash-tail repair could truncate/complete a JSONL file before a new header or log
+  row successfully preserved what changed.
+- **Why:** repair followed by another disk/open failure loses the only forensic record of the repair.
+- **Fix:** synchronize a dedicated recovery journal first, mutate only the final fragment, fold the
+  journal into the next healthy stream, synchronize that record, then clear the journal. Writer
+  failure uses the same durable-gap pattern.
+- **Rule:** recovery metadata is a write-ahead journal: durable audit first, mutation second, clear only
+  after the canonical record is durable.
+
+### [STUDY-04] Reentrant subjects do not guarantee one global observer order
+
+- **What was wrong:** a subscriber could publish a lifecycle/failure event while the bus was still
+  delivering the outer event, allowing later subscribers to see a different order.
+- **Why:** synchronous subject reentrancy is per call stack, not a shared FIFO transaction.
+- **Fix:** `SignalBus` enqueues nested publications and drains them non-reentrantly after every
+  subscriber has received the current event.
+- **Rule:** when event order is research data, own an explicit FIFO dispatch boundary and regression
+  test nested publication.
+
+### [STUDY-05] Product-local storage can violate a study recorder's privacy claim
+
+- **What was wrong:** the content-minimised Clipboard sensor coexisted with the product Clipboard
+  History feature, which could persist raw copied text locally even though it was not exported.
+- **Why:** participants judge the installed research artefact, not just the chosen export folder.
+- **Fix:** Study builds forcibly keep product Clipboard History monitoring and its hotkey off without
+  deleting the user's existing history or preference.
+- **Rule:** audit every parallel producer in the installed build, not only files named by the research
+  exporter; disable unrelated raw-content capture for the study cohort.
+
+### [STUDY-06] Interaction acceptance and task outcome are different events
+
+- **What was wrong:** `accepted` originally meant only that an overlay opened, while analysis/UI copy
+  could read it as a completed or helpful AI action; posting AutoRun synchronously could also log the
+  action start before acceptance.
+- **Why:** UI handoff, provider completion and perceived usefulness are separate causal stages.
+- **Fix:** log ordered `accepted → action_started → action_completed|action_failed|action_cancelled`;
+  ask result usefulness only after completion, and suggestion relevance after dismissal/failure.
+- **Rule:** give each causal transition its own linked record and write the prerequisite before
+  triggering synchronous downstream work.
+
+### [STUDY-07] A new cohort must reset hidden model and policy state
+
+- **What was wrong:** archived evidence/logs did not reset hand-edited weights, priors, tier, mutes,
+  rate-limit slots or cooldowns on a reused pilot installation.
+- **Why:** identical method claims require identical runtime parameters and fresh state, not merely an
+  exported config snapshot that reveals the divergence later.
+- **Fix:** researcher setup rebuilds a canonical compiled study config (participant languages only),
+  persists those languages separately, resets policy/prompt quota, and export fails if config drifted.
+- **Rule:** define a cohort boundary that resets data, inference parameters and behavioral policy state
+  together; then enforce the frozen configuration on relaunch and export.
+
+### [STUDY-08] Independent notification observers do not define research-event order
+
+- **What was wrong:** Clipboard, dwell and app-focus sensors independently observed the same
+  `NSWorkspace.didActivateApplicationNotification`; a rapid copy→translator switch could publish the
+  focus row before the pending clipboard row depending on callback order.
+- **Why:** registration order is not a semantic transaction contract, yet the feature extractor needs
+  copy before focus to recognise the strongest translation sequence.
+- **Fix:** AppFocus owns the single activation observer and synchronously asks Clipboard to reconcile
+  its pending change and Dwell to close its old-app interval before publishing the focus transition.
+- **Rule:** when two observations form one causal sequence, centralise their ordering in one callback;
+  never infer a research timeline from independent observer delivery order.
+
+### [STUDY-09] Deferred UI work must be bound to the exact session identity
+
+- **What was wrong:** the one-shot accepted-action latch originally expired by time only, so an action
+  left unconsumed during pause/sleep/session replacement could later run against another file session.
+- **Why:** a TTL bounds age but does not prove ownership; an immortal/reused SwiftUI view can consume a
+  notification much later than the controller that created it.
+- **Fix:** bind the latch to the opened `sessionRevision` and originating affordance-log session,
+  require an exact revision at take, and clear it at controller stop or log failure.
+- **Rule:** delayed work that touches session data needs an immutable session token, not just a timeout.
+
+### [STUDY-10] Persist the method configuration before capture, not only at export
+
+- **What was wrong:** after withdrawal, export could snapshot a mutable current scorer configuration
+  rather than the exact frozen configuration that generated the completed cohort's scores.
+- **Why:** stopping capture does not freeze later preferences or debug edits, so provenance rebuilt at
+  export time can silently relabel historical data.
+- **Fix:** researcher setup atomically persists a full deployment snapshot (identity, consent times,
+  start time and `IntentConfig`) before arming Study mode; active export verifies against it and
+  post-withdraw export uses it directly.
+- **Rule:** persist experimental configuration at the cohort boundary and treat it as immutable
+  provenance; never reconstruct it from current runtime state after data collection.
+
+### [STUDY-11] Participant deletion needs a durable suffix transaction
+
+- **What was wrong:** deleting timestamp-matching rows in place could leave a half-applied multi-file
+  erasure after a crash and could retain the beginning of an interaction whose outcome was erased.
+- **Why:** several trace, affordance and recovery artefacts form one logical record, but the filesystem
+  offers no directory-wide atomic replacement; interaction meaning also spans multiple JSONL rows.
+- **Fix:** stop both writers, validate the cohort, persist the exact pending request first, remove the
+  physical suffix and every crossing interaction, atomically verify each replacement, append one
+  idempotent content-free receipt, and clear the request only after final validation.
+- **Rule:** privacy deletion across append-only research logs is a write-ahead, idempotent transaction;
+  preserve neither a partial operation nor a partial causal interaction.
+
+### [STUDY-12] A delegate argument guard does not make a SwiftUI app headless
+
+- **What was wrong:** the built Golden-check process could hang in Keychain access even though
+  `applicationDidFinishLaunching` exited immediately for `--intent-golden-checks`.
+- **Why:** SwiftUI constructs scene roots before the application delegate launch callback;
+  `SettingsView` therefore initialized provider/keychain singletons before the guard ran.
+- **Fix:** the Thesis app scene substitutes `EmptyView` for `SettingsView` when the headless check
+  argument is present, eliminating UI-owned dependencies before delegate startup.
+- **Rule:** headless built-artefact verification must gate scene-root construction, not only work in
+  the application delegate.
+
+### [STUDY-13] A shared panel needs generation-bound animation completions
+
+- **What was wrong:** after the first manual summon was closed, later `⌃⌥⌘I` events reached the
+  controller and resolved rows but stayed invisible; the next press then closed that invisible ticker.
+- **Why:** every summon started an unnecessary 140 ms hide on the reusable panel before its async AX
+  probe. A warm probe returned first, showed new content, and the older hide completion then called
+  `orderOut` while `tickerVisible` still described the new surface.
+- **Fix:** advance a presentation generation on every show/hide, let a fade completion order out only
+  its still-current hidden generation, and hide an already ordered-out panel synchronously.
+- **Rule:** any async completion that mutates reusable UI must prove it still owns the latest
+  presentation; semantic visibility state alone does not invalidate an old AppKit animation.
+
+### [STUDY-14] Critical cross-owner UI handoffs must be explicit and acknowledged
+
+- **What was wrong:** selecting a valid summoned action reached `accept` but stopped at the coarse
+  `session_start_failed` outcome before `accepted` or `action_started`.
+- **Why:** the affordance layer discovered `AppDelegate` dynamically through `NSApp.delegate` and the
+  void clipboard/session APIs could not acknowledge which revision, if any, actually opened.
+- **Fix:** AppDelegate installs a weak main-actor session opener before the engine starts; opening now
+  returns its exact `sessionRevision`, and accept independently verifies that revision, session stage
+  and materialised file before arming Auto-Run. The click-time revision is rechecked after asynchronous
+  source resolution so a delayed accept cannot replace a newer explicit session. Failure categories
+  stay content-free but specific, and the exporter validates them from one tested allowlist so a
+  legitimate failure cannot poison a study export.
+- **Rule:** a user action crossing controller ownership needs an injected/registered handoff with a
+  typed success identity; do not treat runtime delegate lookup plus post-hoc guessing as a transaction.
+  Any new categorical log outcome must be added to the export contract and its fixture in the same edit.
+
+### [STUDY-15] An Accessibility grant is capability, not permission to collect broadly
+
+- **What was wrong:** the old thesis sensor treated AX access as one coarse opt-in and periodically
+  fetched selection/document values without a field-level export contract or a secure-role-first read
+  order.
+- **Why:** macOS grants access to a very broad foreign UI tree. That technical capability says nothing
+  about which content the study disclosed, needs, or may persist.
+- **Fix:** make the thesis permission required and explicit at researcher setup, drive reads from the
+  focused object, reject secure roles before every content-bearing read, bound/rate-limit the transient
+  sample paths, and let only allowlisted derived scalars cross the sensor queue into trace v5.
+- **Rule:** define the representable data contract and no-read boundaries before adding AX calls; an OS
+  grant never substitutes for purpose limitation, minimisation, or participant-facing disclosure.
+
+### [STUDY-16] Composite evidence must tolerate sensor-delivery inversion without double counting
+
+- **What was wrong:** target-language inference initially assumed the clipboard row would always arrive
+  before the AX target row and could stack the same weight again when the target classifier changed.
+- **Why:** the clipboard is polled while AX is notification-driven, so either delivery order is normal;
+  callback order is not causal order. Treating every target update as new evidence also turns one copy
+  into several artificial observations.
+- **Fix:** accept the reverse order only inside a three-second window bound to the current focused app
+  and a different copy source; bind routing to the exact copy hash/time, expire target metadata after
+  15 seconds, scale by the weaker language confidence, and deduplicate the composite evidence by copy.
+- **Rule:** cross-sensor features need an explicit temporal/object/focus join plus one evidence identity;
+  never infer causality or multiplicity from delivery order alone.
+
+### [STUDY-17] Required study readiness must gate every route back into capture
+
+- **What was wrong:** checking Accessibility only in fresh onboarding still allowed an active study to
+  re-enter recording through relaunch, retry, resume, or post-erasure restart without the required
+  context sensor.
+- **Why:** long-running deployments have many lifecycle entry points, and a single unguarded one creates
+  a silent coverage condition that looks like participant behaviour in the final data.
+- **Fix:** fail closed at active unpaused startup, retry, participant resume and destructive-operation
+  restart; keep a persisted pause event-free; expose grant and sensor readiness separately in the live
+  menu and require an explicit repair/retry after a missing grant.
+- **Rule:** model required permission/readiness as an invariant over every state transition into live
+  capture, not as a one-time onboarding check.
+
+### [STUDY-18] Foreign AX metadata is untrusted input even after permission is granted
+
+- **What was wrong:** range endpoints used ordinary integer addition, unknown-length `AXValue` could pull
+  an arbitrarily large foreign string before truncation, and failed text sampling discarded otherwise
+  valid coarse progress ranges.
+- **Why:** AX clients are separate processes with incomplete and occasionally malformed implementations;
+  their offsets, lengths and attribute support cannot be treated like in-process model invariants.
+- **Fix:** reject overflowing ranges, prefer fixed `AXStringForRange` requests, allow whole `AXValue` only
+  for a reported small text-bearing target, preflight DOCX expansion, and encode progress-only success as
+  `range_metadata` with zero language/sample fields.
+- **Rule:** validate arithmetic before use, bound work before IPC/decompression where the API permits it,
+  fail closed where it does not, and represent partial coverage explicitly instead of converting it to
+  false negative evidence.
+
+### [STUDY-19] Object-bound evidence needs a recorded replacement boundary
+
+- **What was wrong:** a target-language mismatch was removed live when the pasteboard changed, but a
+  sensitive or unsupported replacement emitted no event, so replay could keep using the old copy.
+- **Why:** a RAM-only cancellation makes the research instrument non-deterministic; putting privacy
+  classification before lifecycle invalidation can also preserve state about an object that no longer
+  exists.
+- **Fix:** emit one v5 content-free `contextBoundary` for every pasteboard ownership revision before
+  classification. It records only scope/timing, retracts exact evidence and bound UI in live/replay,
+  and sensitive/unsupported replacements still emit no type, source, hash or content signal.
+- **Rule:** if evidence names mutable external state, replacement must be part of the replay contract;
+  minimise that boundary rather than hiding it in a live-only callback.
+
+### [STUDY-20] Missing Accessibility data is not counterevidence
+
+- **What was wrong:** an unavailable editability/subrole/language result could be interpreted like an
+  explicit read-only or same-language target and either erase a valid unchanged-target join or permit
+  further reads after an uncertain secure-field check.
+- **Why:** unsupported attributes and transport errors say nothing about the user's semantic target.
+- **Fix:** retain tri-state editability, treat only explicit `AXEditable` false as authoritative false,
+  map AXValue-settable false to unknown, preserve unknown data only for an unchanged bound target, and
+  fail closed before content reads when role/subrole status is uncertain.
+- **Rule:** preserve “unknown” through the pipeline; only conclusive values may become positive or
+  negative behavioural evidence, while uncertain privacy boundaries stop reading.
+
+### [STUDY-21] PID and document hashes are not complete identity boundaries
+
+- **What was wrong:** a late AX result could survive a selection/value/layout change within one process,
+  a clipboard poll could bind Word A's copy to Word B, and title-derived doc hashes could collide across
+  applications.
+- **Why:** one PID owns many changing AX objects, copy time precedes polling time, and a short document
+  key is meaningful only inside the application/segment that produced it.
+- **Fix:** bind reads to an observation revision advanced by every mutating trigger; on supported AX
+  window/title changes flush pending Clipboard A before recording the new segment boundary; bind copies
+  to that replayable revision and key longitudinal document evidence by `(app, docID)`.
+- **Rule:** compose identity from every namespace and lifecycle boundary that can independently change;
+  process equality or hash equality alone does not establish object continuity.
+
+### [STUDY-22] Prefer the narrowest target-local sample over a whole-document fallback
+
+- **What was wrong:** an available DOCX import could take precedence over the focused range, increasing
+  work and classifying the document's dominant language instead of the actual insertion context.
+- **Why:** a whole file is broader and often semantically less local than visible or near-caret AX text.
+- **Fix:** try bounded `AXStringForRange` first, a preflighted small text-role `AXValue` second, and the
+  eligible/rate-limited DOCX importer only if both target-local paths fail.
+- **Rule:** order fallbacks from smallest and most task-local to broadest; a convenient file path is not
+  a reason to bypass more relevant bounded evidence.
+
+### [STUDY-23] A privacy boundary must cover every reader of the same foreign object
+
+- **What was wrong:** the continuous AX sensor rejected secure targets before content reads, while the
+  separate `DocumentReader` used for Summon and accept-time verification could still request selected
+  text, document identity or values and traverse a window rooted at that target.
+- **Why:** protecting the recording producer alone does not protect an explicit action path that reads
+  the same foreign UI object. A recursive walk can also re-enter a secure descendant even when its root
+  was safe.
+- **Fix:** make role/subrole classification fail closed before any content-bearing read in both paths,
+  and make the explicit walk reject each secure or ambiguous node before its value or children.
+- **Rule:** enumerate all readers behind a data-source permission and enforce the same no-read boundary
+  at every entry and recursion point; never infer end-to-end privacy from one sensor's output schema.
 ### [CAPTURE-01] `NSMetadataQuery` accepts only Spotlight's restricted predicate dialect
 
 - **What was wrong:** the recent-file bootstrap used a general Foundation predicate that compared the
