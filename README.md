@@ -10,6 +10,15 @@ Dragaway (fka AI-Drop) is a native macOS menu-bar app that turns your physical n
 
 ---
 
+## What's New in v1.7.5
+
+- **Open the current selection with `⌃⌘G`** — with optional Enhanced Access enabled, select text, a
+  link, an image, or files in the current app and launch them directly into a Dragaway session.
+- **Clipboard-safe selection capture** — Dragaway restores the previous clipboard immediately and
+  keeps the temporary Copy round trip out of its own Clipboard History.
+- **Consistent appearance in Light Mode** — the purpose-built dark interface remains dark and
+  readable regardless of the macOS appearance setting.
+
 ## What's New in v1.1.7
 
 - **Live streaming on Dragaway Free** — replies appear word by word on the hosted free tier, not just
