@@ -1,14 +1,14 @@
 # AI Drop — App Store Roadmap & Review
 
-## Release v1.7.5 (IN PROGRESS 2026-08-27)
+## Release v1.7.5 (DONE 2026-08-27)
 
 - [x] Set `MARKETING_VERSION` to 1.7.5 and increment the Sparkle build number to 11.
 - [x] Add `RELEASE_NOTES_v1.7.5.md` and refresh README “What's New”.
 - [x] Run the unsigned Debug sanity build.
-- [ ] Review, commit, push, and create/push the annotated `v1.7.5` tag.
-- [ ] Build, sign, notarize, staple, and verify `Dragaway-1.7.5.dmg` plus its signed appcast.
-- [ ] Publish the GitHub release with the notarized DMG attached.
-- [ ] Commit and push `appcast.xml` last, then verify the GitHub release and clean repository state.
+- [x] Review, commit, push, and create/push the annotated `v1.7.5` tag.
+- [x] Build, sign, notarize, staple, and verify `Dragaway-1.7.5.dmg` plus its signed appcast.
+- [x] Publish the GitHub release with the notarized DMG attached.
+- [x] Commit and push `appcast.xml` last, then verify the GitHub release and clean repository state.
 
 ## Website — Pricing page (DONE 2026-07-08)
 
