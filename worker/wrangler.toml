@@ -1,7 +1,8 @@
 # Cloudflare Worker — AI Drop hosted free tier (metering proxy).
 #
 # This Worker holds the host Gemini key as a SECRET (never in the app) and meters
-# usage per device: a one-time 10-call trial, then a per-day TOKEN budget — the actual
+# usage per device on a per-day TOKEN budget (the legacy one-time trial is disabled via
+# TRIAL_TOTAL=0) — the actual
 # tokens Gemini bills (input + output), so text, PDFs and IMAGES all debit fairly.
 # A global daily circuit-breaker caps total interactions so abuse can't drain the
 # budget.
@@ -25,11 +26,16 @@ compatibility_date = "2025-01-01"
 
 # Tunable limits (no code change / no app release needed to adjust).
 [vars]
-TRIAL_TOTAL = "10"        # one-time free interactions per device (still interaction-based)
+# Disabled (0): new devices go straight to the daily TOKEN budget. The separate
+# interaction-based trial was a second, differently-counted allowance sitting in front
+# of the token budget, which read as confusing rather than generous — doubling the
+# budget covers it. MUST stay present and "0": readLimits() defaults a MISSING
+# TRIAL_TOTAL to 30, so deleting this line would re-enable a bigger trial.
+TRIAL_TOTAL = "0"         # one-time free interactions per device — 0 = no trial
 # Daily quota is metered in ACTUAL TOKENS billed by Gemini (input + output), captured
 # from each response — so images (and everything else) debit fairly, not just message
 # text. Tune freely server-side (no app update). Defaults ≈ today's generosity:
-# free ≈ 6 full requests' worth, pro ≈ 20. Pro bypasses the trial → straight to its budget.
+# free ≈ 6 full requests' worth, pro ≈ 20.
 # Rough conversion: ~4 chars/token, so 40k-char request ≈ 10k input tokens.
 # NOTE: tokens are debited MODEL-WEIGHTED (see BUDGET_WEIGHTS in index.js) so the budget
 # caps COST, not raw count: flash-lite ×0.5, flash ×1, gemini-2.5-pro ×4. So these budgets

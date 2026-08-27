@@ -71,6 +71,10 @@ final class ClipboardHistoryStore: ObservableObject {
     private var lastChangeCount = NSPasteboard.general.changeCount
     /// changeCount of OUR OWN pasteboard write (copyToPasteboard) — skipped by the poll.
     private var ignoreChangeCount = -1
+    /// Nesting depth of programmatic pasteboard round-trips (PasteboardCapture).
+    /// A capture produces TWO writes — the foreign app's ⌘C and our restore — so the
+    /// single `ignoreChangeCount` slot cannot cover it; neither may be recorded.
+    private var suppressionDepth = 0
 
     private let dir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory,
@@ -108,11 +112,23 @@ final class ClipboardHistoryStore: ObservableObject {
         timer = nil
     }
 
+    /// Bracket a programmatic pasteboard round-trip so nothing it produces is recorded.
+    /// Nested so overlapping captures cannot end suppression early.
+    func beginSuppression() { suppressionDepth += 1 }
+
+    func endSuppression() {
+        suppressionDepth = max(0, suppressionDepth - 1)
+        // Re-baseline: the restore bumped changeCount while we were suppressed, and a
+        // poll that has not run yet would otherwise treat it as a fresh user copy.
+        if suppressionDepth == 0 { lastChangeCount = NSPasteboard.general.changeCount }
+    }
+
     private func poll() {
         let pb = NSPasteboard.general
         let cc = pb.changeCount
         guard cc != lastChangeCount else { return }
         lastChangeCount = cc
+        guard suppressionDepth == 0 else { return }     // programmatic round-trip
         guard cc != ignoreChangeCount else { return }   // ignore our own write
         capture(from: pb)
     }

@@ -1,10 +1,11 @@
 // AI Drop — hosted free-tier metering proxy (Cloudflare Worker).
 //
 // Holds the host Gemini key as a secret and forwards completions, metering each
-// device: a one-time TRIAL_TOTAL-call trial, then a per-day TOKEN budget — the actual
+// device on a per-day TOKEN budget (TRIAL_TOTAL=0 disables the legacy one-time
+// interaction trial, which still works if ever re-enabled) — the actual
 // tokens Gemini bills (input + output), captured from each response, so text, PDFs and
-// IMAGES all debit fairly (a char count would miss the image bytes). Pro skips the
-// trial and gets a far larger budget. A GLOBAL_DAILY_CAP circuit-breaker bounds total
+// IMAGES all debit fairly (a char count would miss the image bytes). Pro gets a far
+// larger budget. A GLOBAL_DAILY_CAP circuit-breaker bounds total
 // daily interactions regardless of abuse.
 //
 // The macOS app never sees GEMINI_API_KEY — it only knows this Worker's URL.

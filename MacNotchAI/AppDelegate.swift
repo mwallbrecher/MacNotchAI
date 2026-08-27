@@ -39,6 +39,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     /// ⌃⌘L — open the newest stable supported file from the user's watched folders.
     /// Registered only while the feature is enabled so disabling it releases the chord globally.
     private let recentFileHotkey = GlobalHotkey()
+    /// ⌃⌘G — "grab": open a session from the frontmost app's SELECTION, replacing the
+    /// drag gesture. Registered only while EnhancedAccess is on, since it works by
+    /// synthesizing ⌘C there; disabling the permission releases the chord globally.
+    private let grabSelectionHotkey = GlobalHotkey()
+    /// Serializes captures — the pasteboard round-trip must not interleave with itself.
+    private var grabSelectionTask: Task<Void, Never>?
     /// At most one latest-file resolution may run at a time. The generation prevents a cancelled
     /// task's deferred cleanup from clearing a newer task installed after a settings change.
     private var recentFileOpenTask: Task<Void, Never>?
@@ -65,6 +71,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     // MARK: - Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Dragaway's surfaces are drawn dark-first: the Liquid Glass panels tint with
+        // black gradients over `.hudWindow`, and the content on top of them is white
+        // throughout. Following the system into Light Aqua therefore does not produce a
+        // light theme, it produces white text on bright glass. Pinning the appearance
+        // is the honest expression of that design — a preference here would only offer
+        // a mode the views cannot render legibly.
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+
         // Run the one-time hard-coded-model migration before onboarding can flip its
         // completion flag. That lets fresh installs use a current starting model while
         // existing installations keep their exact previous route.
@@ -1415,10 +1429,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             sessionHotkey.unregister()
         }
 
+        // ⌃⌘G rides on EnhancedAccess: without permission to post ⌘C into the frontmost
+        // app it cannot work, so the chord is not claimed globally either. Re-armed
+        // whenever that toggle changes.
+        if EnhancedAccess.canPostEvents {
+            grabSelectionHotkey.register(keyCode: UInt32(kVK_ANSI_G),
+                                         modifiers: UInt32(cmdKey | controlKey)) { [weak self] in
+                self?.openSessionFromSelection()
+            }
+        } else {
+            grabSelectionHotkey.unregister()
+        }
+
         if ScreenshotWatcher.isEnabled {
             ScreenshotWatcher.shared.start()
         } else {
             ScreenshotWatcher.shared.stop()
+        }
+    }
+
+    /// ⌃⌘G: lift the frontmost app's selection onto the pasteboard, open a session from
+    /// it, and put the user's clipboard back. See PasteboardCapture for the hygiene
+    /// rules — this method only decides what to do with the outcome.
+    private func openSessionFromSelection() {
+        guard grabSelectionTask == nil else { return }
+        grabSelectionTask = Task { @MainActor [weak self] in
+            defer { self?.grabSelectionTask = nil }
+            switch await PasteboardCapture.captureSelection() {
+            case .captured(let urls):
+                self?.openSessionWithFiles(urls)
+            case .nothingCopied:
+                // Nothing was selected, or the app ignored ⌘C. The clipboard was never
+                // written in this case, so there is nothing to undo.
+                NSSound.beep()
+            case .notPermitted:
+                // Permission was revoked between arming and pressing.
+                NSSound.beep()
+                self?.armCaptureFeatures()
+            }
         }
     }
 

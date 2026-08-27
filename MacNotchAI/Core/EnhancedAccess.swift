@@ -35,16 +35,29 @@ enum EnhancedAccess {
     /// before event creation so revoking access falls back to copy-only behavior.
     @discardableResult
     static func postPasteShortcut() -> Bool {
+        postCommandChord(virtualKey: CGKeyCode(kVK_ANSI_V))
+    }
+
+    /// Post one Command-C chord — used to lift the frontmost app's selection onto the
+    /// pasteboard (see PasteboardCapture, which restores the clipboard afterwards).
+    @discardableResult
+    static func postCopyShortcut() -> Bool {
+        postCommandChord(virtualKey: CGKeyCode(kVK_ANSI_C))
+    }
+
+    /// The gate is re-checked immediately before event creation so revoking access
+    /// mid-session degrades instead of posting into another app regardless.
+    private static func postCommandChord(virtualKey: CGKeyCode) -> Bool {
         guard canPostEvents,
               let source = CGEventSource(stateID: .combinedSessionState),
               let keyDown = CGEvent(
                 keyboardEventSource: source,
-                virtualKey: CGKeyCode(kVK_ANSI_V),
+                virtualKey: virtualKey,
                 keyDown: true
               ),
               let keyUp = CGEvent(
                 keyboardEventSource: source,
-                virtualKey: CGKeyCode(kVK_ANSI_V),
+                virtualKey: virtualKey,
                 keyDown: false
               ) else { return false }
 

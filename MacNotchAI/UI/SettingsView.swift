@@ -271,6 +271,9 @@ struct SettingsView: View {
                     } else {
                         refreshEnhancedAccessStatus()
                     }
+                    // ⌃⌘G is only claimed while this permission is live — re-arm so the
+                    // chord is released globally the moment the user switches it off.
+                    NotificationCenter.default.post(name: .captureSettingsChanged, object: nil)
                 }
             }
             }
