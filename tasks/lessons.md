@@ -1443,3 +1443,24 @@
 - **Rule:** a cancellable file operation must reserve and track every path before writing, keep an
   explicit cancellation handle, await the producer's terminal state, and only then delete artifacts.
   Never glob a user directory; isolate intermediates and remove only paths owned by the current run.
+
+### [GIT-03] A commit's scope is the staged diff, not the message, and it is fixable only before it is pushed
+
+- **What was wrong:** `f71e7fd` is titled "onboarding beats for exposing and joining a session" and
+  carries `ShareController.swift | 387 +++---`, the whole v2 share rewrite, because two
+  `NotificationCenter.post` lines in that file were staged by adding the file rather than the hunks.
+  The message even describes the rewrite in passing, which made the mis-scoping easy to overlook: it
+  reads as an honest note about *where* the events are posted rather than as a declaration that the
+  commit contains someone else's architecture.
+- **Why:** staging by path captures whatever else the working tree holds in that file. On a shared
+  branch that is routinely another person's or another agent's in-flight work.
+- **Fix:** none available. The commit was pushed, then built upon by six further commits, and it is
+  now contained in three tags — `v1.1.6`, `v1.1.7`, and `thesis-participant-test-2026-08-20`, two of
+  them shipped to users. Rewriting it would invalidate all three and every clone. A `git notes`
+  annotation records the real scope on the commit without touching history; the content itself is
+  correct and shipped, so nothing is broken but the record of who wrote what.
+- **Rule:** stage hunks, not files, whenever the file is already dirty — `git add -p`, or commit the
+  other party's work separately first. And the remedy window closes at `git push`: an offer to
+  `reset --soft` is only real while nothing downstream exists, so verify with
+  `git branch -r --contains <sha>` and `git tag --contains <sha>` before offering one, rather than
+  repeating an offer that expired.
